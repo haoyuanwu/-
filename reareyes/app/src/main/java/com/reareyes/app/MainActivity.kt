@@ -21,6 +21,8 @@ import android.os.SystemClock
 import android.text.method.ScrollingMovementMethod
 import android.view.Display
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -47,6 +49,8 @@ class MainActivity : Activity() {
         internal fun hasRearSurface(): Boolean {
             val eyes = rearSurface?.get() ?: return false
             return eyes.isAttachedToWindow && eyes.display?.displayId == REAR_DISPLAY_ID &&
+                eyes.display?.state == Display.STATE_ON &&
+                eyes.windowVisibility == android.view.View.VISIBLE &&
                 eyes.isShown && eyes.width > 0 && eyes.height > 0
         }
 
@@ -91,18 +95,18 @@ class MainActivity : Activity() {
         if (states == displayedAgentStates) return
         displayedAgentStates = states
         agentStatusRows.removeAllViews()
-        fun addRow(label: String, state: EyeState?) {
-            agentStatusRows.addView(text(label, 13f, color = if (state == null) CyberColors.muted else CyberColors.text).apply {
+        agentStatusRows.visibility = if (states.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+        if (states.isEmpty()) return
+        agentStatusRows.addView(sectionTitle("AI 工具状态"))
+        states.forEach { (name, state) ->
+            agentStatusRows.addView(text("$name · ${state.label}", 13f).apply {
                 setPadding(dp(12), dp(6), dp(12), dp(6))
-                if (state != null) {
-                    val icon = StatusIcon(state).apply { setBounds(0, 0, dp(14), dp(14)) }
-                    compoundDrawablePadding = dp(8)
-                    setCompoundDrawablesRelative(icon, null, null, null)
-                }
+                val icon = StatusIcon(state).apply { setBounds(0, 0, dp(14), dp(14)) }
+                compoundDrawablePadding = dp(8)
+                setCompoundDrawablesRelative(icon, null, null, null)
             })
         }
-        if (states.isEmpty()) addRow("暂无 AI 工具状态", null)
-        states.forEach { (name, state) -> addRow("$name · ${state.label}", state) }
+        agentStatusRows.addView(space(18))
     }
 
     private var pendingSync: String? = null
@@ -123,9 +127,33 @@ class MainActivity : Activity() {
     private val rearLaunchTimeout = Runnable {
         if (waitingForRear && !isOnRearDisplay()) finishAndRemoveTask()
     }
+    private val rearDisplayPreDraw = android.view.ViewTreeObserver.OnPreDrawListener {
+        val decor = window.decorView
+        val onRear = decor.display?.displayId == REAR_DISPLAY_ID
+        // The ViewRoot can move even when the Activity gets no configuration change.
+        if (onRear != showingRear) {
+            decor.post {
+                if (!isFinishing && !isDestroyed && isOnRearDisplay() != showingRear) {
+                    renderDisplay()
+                }
+            }
+        }
+        // This task has no content to draw on the main display.
+        onRear && showingRear
+    }
     private var rearRoot: FrameLayout? = null
     private var rearEyes: EyesView? = null
     private var calibrationPanel: ViewGroup? = null
+    private data class RearTouch(val x: Float, val y: Float, val time: Long) {
+        fun isNear(otherX: Float, otherY: Float, slop: Float): Boolean {
+            val dx = x - otherX
+            val dy = y - otherY
+            return dx * dx + dy * dy <= slop * slop
+        }
+    }
+    private val rearTouchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop.toFloat() }
+    private var rearPress: RearTouch? = null
+    private var lastRearTap: RearTouch? = null
     private val calibrationListener: () -> Unit = {
         mainHandler.post {
             if (rearRoot != null) {
@@ -151,6 +179,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         enteredRear = savedInstanceState?.getBoolean("enteredRear") ?: false
         stageRearLaunch(intent)
+        if (rearOnly) window.decorView.viewTreeObserver.addOnPreDrawListener(rearDisplayPreDraw)
         calibrateAfterPermission = savedInstanceState?.getString("shizukuAction")?.toBooleanStrictOrNull()
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         startService(Intent(this, EyesService::class.java))
@@ -200,6 +229,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(syncTimeout)
         mainHandler.removeCallbacks(rearLaunchTimeout)
+        if (rearOnly) window.decorView.viewTreeObserver.removeOnPreDrawListener(rearDisplayPreDraw)
         if (rearSurface?.get() === rearEyes) rearSurface = null
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
         super.onDestroy()
@@ -239,16 +269,60 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        rearPress = null
+        lastRearTap = null
         if (EyesBus.onLog === logListener) EyesBus.onLog = null
         if (EyesBus.onCalibrate === calibrationListener) EyesBus.onCalibrate = null
         super.onPause()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (!showingRear || !isOnRearDisplay()) return super.dispatchTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> rearPress = RearTouch(event.x, event.y, event.eventTime)
+            MotionEvent.ACTION_MOVE -> {
+                if (rearPress?.isNear(event.x, event.y, rearTouchSlop) == false) {
+                    rearPress = null
+                    lastRearTap = null
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> {
+                rearPress = null
+                lastRearTap = null
+            }
+            MotionEvent.ACTION_UP -> {
+                val press = rearPress
+                rearPress = null
+                val previous = lastRearTap
+                val tap = press != null && press.isNear(event.x, event.y, rearTouchSlop) &&
+                    event.eventTime - press.time < ViewConfiguration.getLongPressTimeout()
+                lastRearTap = if (tap) RearTouch(event.x, event.y, event.eventTime) else null
+                if (tap && previous != null &&
+                    press.time - previous.time in 0..ViewConfiguration.getDoubleTapTimeout().toLong() &&
+                    previous.isNear(press.x, press.y, rearTouchSlop * 2)
+                ) {
+                    // Cancel the second click for both the eyes and any calibration control.
+                    val cancel = MotionEvent.obtain(event)
+                    cancel.action = MotionEvent.ACTION_CANCEL
+                    try {
+                        super.dispatchTouchEvent(cancel)
+                    } finally {
+                        cancel.recycle()
+                    }
+                    return true
+                }
+            }
+        }
+        super.dispatchTouchEvent(event)
+        return true
     }
 
     private fun launchesNativeHome() =
         packageManager.getLaunchIntentForPackage(packageName)?.component?.className == javaClass.name
 
     @Suppress("DEPRECATION")
-    private fun isOnRearDisplay() = windowManager.defaultDisplay.displayId == REAR_DISPLAY_ID
+    private fun isOnRearDisplay() =
+        (window.decorView.display ?: windowManager.defaultDisplay).displayId == REAR_DISPLAY_ID
 
     private fun openRequestedCalibration() {
         val root = rearRoot ?: return
@@ -310,7 +384,11 @@ class MainActivity : Activity() {
         }
         val keepOn = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         window.setFlags(if (onRearDisplay) keepOn else 0, keepOn)
-        if (Build.VERSION.SDK_INT >= 27) setTurnScreenOn(onRearDisplay)
+        if (Build.VERSION.SDK_INT >= 27) {
+            // Only the dedicated rear window may remain visible when the main display locks.
+            setShowWhenLocked(onRearDisplay)
+            setTurnScreenOn(onRearDisplay)
+        }
     }
 
     private fun renderDisplay() {
@@ -318,7 +396,10 @@ class MainActivity : Activity() {
         showingRear = isOnRearDisplay()
         applyRearDisplayPower(showingRear)
         if (!showingRear && rearOnly) {
-            if (!waitingForRear || enteredRear) finishAndRemoveTask()
+            if (!waitingForRear || enteredRear) {
+                if (rearSurface?.get() === rearEyes) rearSurface = null
+                finishAndRemoveTask()
+            }
             return
         }
         if (showingRear) {
@@ -349,17 +430,9 @@ class MainActivity : Activity() {
                 android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                 android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             val eyes = EyesView(this, EyesView.Presentation.REAR)
-            val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-            if (rearOnly) {
-                root.viewTreeObserver.addOnPreDrawListener {
-                    // A move to display 0 can precede the Activity's configuration callback.
-                    val onRear = root.display?.displayId == REAR_DISPLAY_ID
-                    if (!onRear && root.isAttachedToWindow && !isFinishing) {
-                        applyRearDisplayPower(false)
-                        finishAndRemoveTask()
-                    }
-                    onRear
-                }
+            val root = FrameLayout(this).apply {
+                setBackgroundColor(Color.BLACK)
+                keepScreenOn = true
             }
             root.addView(eyes, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
@@ -388,27 +461,32 @@ class MainActivity : Activity() {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = surface(CyberColors.alpha(CyberColors.surface, 248), CyberColors.line, 16)
-            isClickable = true
         }
-        panel.addView(text("镜头圆环校准", 16f, bold = true, color = Color.WHITE))
+        val panelScroll = ScrollView(this).apply {
+            background = surface(CyberColors.alpha(CyberColors.surface, 248), CyberColors.line, 16)
+            clipToOutline = true
+            isClickable = true
+            addView(panel, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        panel.addView(text("镜头圆环校准", 17f, bold = true, color = Color.WHITE))
         val selectors = LinearLayout(this).also(panel::addView)
         val directions = LinearLayout(this).also(panel::addView)
-        val radius = LinearLayout(this).also(panel::addView)
         val actions = LinearLayout(this).also(panel::addView)
 
         fun button(row: LinearLayout, label: String, action: () -> Unit): Button {
             return Button(this).apply {
                 text = label
-                textSize = 13f
+                textSize = 14f
                 setAllCaps(false)
                 minWidth = 0
                 minimumWidth = 0
+                minHeight = dp(50)
+                minimumHeight = dp(50)
                 setPadding(0, 0, 0, 0)
                 styleButton(this, CyberColors.text)
                 setOnClickListener { action() }
-                row.addView(this, LinearLayout.LayoutParams(0, dp(46), 1f).apply {
-                    setMargins(dp(2), dp(3), dp(2), dp(3))
+                row.addView(this, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(dp(4), dp(2), dp(4), dp(2))
                 })
             }
         }
@@ -435,29 +513,30 @@ class MainActivity : Activity() {
             refresh()
         }
 
-        button(directions, "左移") { adjust(dx = -4) }
-        button(directions, "右移") { adjust(dx = 4) }
-        button(directions, "上移") { adjust(dy = -4) }
-        button(directions, "下移") { adjust(dy = 4) }
-        button(radius, "缩小") { adjust(dr = -4) }
-        button(radius, "放大") { adjust(dr = 4) }
-        button(actions, "恢复默认") { draft = LensAlignment.defaults; refresh() }
+        button(directions, "左移") { adjust(dx = -1) }
+        button(directions, "右移") { adjust(dx = 1) }
+        button(directions, "上移") { adjust(dy = -1) }
+        button(directions, "下移") { adjust(dy = 1) }
+        button(selectors, "恢复默认") { draft = LensAlignment.defaults; refresh() }
+        button(actions, "缩小") { adjust(dr = -4) }
+        button(actions, "放大") { adjust(dr = 4) }
 
         fun close(save: Boolean) {
             if (save) draft.save(this)
             eyes.lensAlignment = if (save) draft else original
             eyes.calibrationLens = null
-            root.removeView(panel)
+            root.removeView(panelScroll)
             calibrationPanel = null
             eyes.invalidate()
         }
 
         button(actions, "取消") { close(false) }
         button(actions, "保存") { close(true) }
-        calibrationPanel = panel
-        val panelWidth = minOf(dp(276), root.width * 57 / 100).coerceAtLeast(dp(230))
-        root.addView(panel, FrameLayout.LayoutParams(panelWidth, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(10) })
+        calibrationPanel = panelScroll
+        val availableWidth = root.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val panelWidth = minOf(dp(300), availableWidth * 69 / 100)
+        root.addView(panelScroll, FrameLayout.LayoutParams(panelWidth, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(4) })
         refresh()
     }
 
@@ -550,12 +629,10 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)))
         col.addView(space(18))
 
-        col.addView(sectionTitle("AI 工具状态"))
         agentStatusRows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         displayedAgentStates = null
         col.addView(agentStatusRows)
         updateAgentStatuses()
-        col.addView(space(18))
 
         col.addView(sectionTitle("自动睡眠"))
         col.addView(space(8))
@@ -858,12 +935,8 @@ class MainActivity : Activity() {
             pendingSync = null
             mainHandler.removeCallbacks(syncTimeout)
             syncButton.isEnabled = true
-            val now = System.currentTimeMillis() / 1000L
-            val five = EyesBus.usage.fiveHour?.remainingPercent(now)?.let { "$it%" } ?: "暂无"
-            val week = EyesBus.usage.week?.remainingPercent(now)?.let { "$it%" } ?: "暂无"
             val source = EyesBus.connectedTransports().firstOrNull()?.label
-            val prefix = if (source == null) "已同步" else "$source 已同步"
-            syncFeedback.text = "$prefix · 5 小时剩余 $five · 周剩余 $week"
+            syncFeedback.text = if (source == null) "已同步" else "$source 已同步"
         }
         logView.text = EyesBus.dumpLog(40).joinToString("\n")
     }

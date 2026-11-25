@@ -6,11 +6,11 @@ Flutter 桌面应用和 Dart HTTP 服务。macOS 与 Windows 使用同一套状�
 
 在 Flutter Manager 导入本目录，选择 macOS 或 Windows 设备运行。终端也可以从本目录运行 `flutter pub get`，再使用 `flutter run -d macos` 或 `flutter run -d windows`。Windows 的原生构建需在 Windows 环境执行。
 
-应用启动时会监听 `127.0.0.1:18792`。最小化或关闭主窗口时，服务继续在后台运行。点击 macOS 菜单栏或 Windows 通知区域的眼睛图标，可以查看服务状态、启动或停止服务、复制手机配对或桌面 MCP 配置，以及重新打开主窗口。「退出」会关闭应用和服务。需要登录后自动启动时，可将应用加入 macOS 登录项或 Windows 启动应用。
+应用启动时会监听 `127.0.0.1:18792`。最小化或关闭主窗口时，服务继续在后台运行。点击 macOS 菜单栏或 Windows 通知区域的眼睛图标，可以查看服务状态、启动或停止服务、复制手机配对或 AI 配置，以及重新打开主窗口。「退出」会关闭应用和服务。需要登录后自动启动时，可将应用加入 macOS 登录项或 Windows 启动应用。
 
 ## 配对
 
-1. 电脑加入 Tailscale，并在终端运行 `tailscale serve --bg --https=8443 18792`。
+1. 在 Windows 或 macOS 上连接 Tailscale。在桌面端「Tailscale 连接」点「重新检测」。若显示「已连接，待配置 Serve」，复制面板里的命令，在 Windows PowerShell 或 macOS 终端运行，然后重新检测。Windows 的命令可使用 Tailscale 安装路径，无需先把它加入 PATH。
 2. 用 USB 连接安卓手机并授权调试。桌面端会检测已配置的 Serve 地址并自动更新手机上的远程配对。
 3. 手机加入同一 tailnet。手动配对时，在桌面端点「重新检测」和「复制配对配置」，再粘贴到手机的「远程连接」。请把配对配置当作密码保管。
 4. 如需关闭此转发，在电脑运行 `tailscale serve --https=8443 off`。
@@ -22,12 +22,9 @@ Flutter 桌面应用和 Dart HTTP 服务。macOS 与 Windows 使用同一套状�
 
 ## 桌面 AI MCP
 
-- 在「桌面 AI MCP」选择 WorkBuddy、OpenCode、OpenClaw 或通用格式，复制配置并合并到相应工具的 MCP 设置，再启用连接器。地址是 `http://127.0.0.1:18793/mcp`，传输选择 Streamable HTTP，使用配置自带的 `Authorization` 请求头。OpenCode 示例适用于使用 `mcp.servers` 的版本。
-- 桌面「AI 工具连接」按名称合并已初始化的本机 MCP 会话，显示会话数和最近通信时间。客户端主动关闭会话，或连续 2 小时没有请求时，会从列表移除。
-- 手机主屏「AI 工具状态」按名称显示已接入的工具。专用配置会带上工具名称，通用配置使用 MCP 客户端申报的名称。USB、局域网和 Tailscale 都会同步这个列表。
-- 连接后工具显示待机。要随任务切换状态，点击「复制上报规则」并将指令加入 AI 工具的规则。停掉任务后如果工具未发送状态，Robot Eyes 无法从 MCP 连接推断停止原因。集成时请从工具的停止或失败事件调用上报，将状态保持约 30 秒。
-
-> 任务开始或恢复时调用 Robot Eyes 的 `set_eye_state`，传入 `state: "THINKING"`。等待确认时用 `QUESTION`，完成时用 `DONE`，失败退出时用 `ERROR`，手动取消时用 `STOPPED`。同一个任务的开始、等待、完成、停止和失败应使用同一个 `session`。并行任务请分别使用稳定的 `session`。结束单个任务的展示可传入 `IDLE`。
+- 在「桌面 AI MCP」点「复制给 AI 配置」，或从 Windows 托盘、macOS 菜单栏的「复制配置」菜单复制。将整段内容粘贴到同一台电脑上的 AI 对话。AI 会按当前客户端格式配置本机 Streamable HTTP MCP，安装 [状态上报 Skill](skills/robot-eyes-reporting/SKILL.md)，并验证 `set_eye_state`。复制内容包含本机访问密钥，请粘贴到你信任的 AI 对话。
+- 「查看配置详情」会显示通用 MCP 配置和上报 Skill，访问密钥以掩码显示。「AI 工具连接」按名称合并已初始化的本机 MCP 会话，显示工具名称和当前状态。配置面板会保留本次应用运行期间最近验证的客户端和时间。客户端关闭会话，或连续 2 小时没有请求时，会从连接列表移除。
+- 手机主屏「AI 工具状态」按 MCP 客户端申报的名称显示已接入的工具。USB、局域网和 Tailscale 都会同步这个列表。
 
 ## Codex 用量和消息
 

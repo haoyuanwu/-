@@ -13,14 +13,14 @@ internal object RearDisplayBridge {
     private val handler = Handler(Looper.getMainLooper())
     private val args = Shizuku.UserServiceArgs(
         ComponentName("com.reareyes.app", RearDisplayService::class.java.name)
-    ).processNameSuffix("rear_display").daemon(false).version(3)
+    ).processNameSuffix("rear_display").daemon(false).version(4)
     private var active: ServiceConnection? = null
 
     fun show(taskId: Int, onComplete: (String?) -> Unit) =
         execute({ it.showRearDisplay(taskId) }, onComplete)
 
-    fun launch(onComplete: (String?) -> Unit) =
-        execute({ it.launchRearDisplay() }, onComplete)
+    fun launch(reuseVisibleTask: Boolean, onComplete: (String?) -> Unit) =
+        execute({ it.launchRearDisplay(reuseVisibleTask) }, onComplete)
 
     private fun execute(
         action: (IRearDisplayService) -> String?,

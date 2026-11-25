@@ -15,6 +15,11 @@ class UsbLanConfigProvider : ContentProvider() {
         // Only the Android ADB shell may exchange pairing credentials.
         if (Binder.getCallingUid() != 2000) throw SecurityException("ADB shell required")
         val app = requireNotNull(context)
+        if (method == "getLinkStatus") {
+            val connected = EyesBus.Transport.TAILSCALE in EyesBus.connectedTransports() &&
+                RemoteConnection.feedback.error == null
+            return Bundle().apply { putBoolean("tailscale_connected", connected) }
+        }
         if (method == "setRemotePairing") {
             val pairing = arg?.takeIf { it.length <= 1024 }?.let {
                 runCatching { RemoteConnection.parse(it) }.getOrNull()

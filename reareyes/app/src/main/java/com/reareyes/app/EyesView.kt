@@ -104,7 +104,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     )
 
     private enum class Gesture {
-        NORMAL, LOOK, TAP_LOOK, FRONT, FRONT_PUZZLED, TRACK, PUZZLED, TAP_GREETING, RELEASE_BLINK, SLEEP_TOUCH
+        NORMAL, LOOK, TAP_LOOK, TRACK, PUZZLED, RELEASE, SLEEP_TOUCH
     }
 
     private data class SleepTap(
@@ -144,10 +144,11 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     private var puzzledAtAnchor = false
     private var stillAnchor = Point(0f, 0f)
     private var touch = Point(0f, 0f)
+    private var touchVelocity = Point(0f, 0f)
+    private var touchEventAt = 0L
+    private var touchMovedAt = 0L
     private var tapOrigin = touch
     private var tapMoved = false
-    private var lastRearTap: Pair<Long, Point>? = null
-    private var repeatedRearTap = false
     private val tapParticles = ArrayDeque<TapParticle>()
     private val particlePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val particlePath = Path()
@@ -162,12 +163,15 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     private var nextGlanceAt = 0L
     private var glanceUntil = 0L
     private var lastStatus = EyesBus.state
+    private var presentedDoneRevision = Long.MIN_VALUE
+    private var donePresentedAt = 0L
     private var thinkingLook: ThinkingLook? = null
     private var lastFrameAt = 0L
     private var headTilt = 0f
     private var tapStartedAt: Long? = null
-    private var tapWillGreet = false
+    private var tapWinks = false
     private var sleepingPress: EyesBus.SleepSession? = null
+    private var interactivePress = false
     private var sleepTap: SleepTap? = null
     private var queuedWakeTap: SleepTap? = null
     private var firstDeepSleepTap: SleepTap? = null
@@ -175,7 +179,6 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     private var held = false
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val holdDelay = ViewConfiguration.getLongPressTimeout().toLong()
-    private val doubleTapSlop = ViewConfiguration.get(context).scaledDoubleTapSlop.toFloat()
     private var nextBlinkAt = 0L
     private var blinkStarted = 0L
     private var doubleBlink = false
@@ -237,13 +240,13 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         gesture = Gesture.NORMAL
         pointerId = MotionEvent.INVALID_POINTER_ID
         tapStartedAt = null
-        lastRearTap = null
-        repeatedRearTap = false
+        interactivePress = false
         sleepingPress = null
         sleepTap = null
         queuedWakeTap = null
         firstDeepSleepTap = null
         releasedAt = 0L
+        touchVelocity = Point(0f, 0f)
         gaze = Point(0f, 0f)
         eyeSpacing = EYE_SPACING
         pupilGaze = Point(0f, 0f)
@@ -271,27 +274,32 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                 parent?.requestDisallowInterceptTouchEvent(true)
                 pointerId = event.getPointerId(0)
                 touch = Point(event.x, event.y)
+                touchVelocity = Point(0f, 0f)
+                touchEventAt = event.eventTime
+                touchMovedAt = now
                 stillAnchor = touch
                 tapOrigin = touch
-                val previous = lastRearTap
-                repeatedRearTap = display == Presentation.REAR && calibrationLens == null &&
-                    previous != null &&
-                    event.eventTime - previous.first in 0..ViewConfiguration.getDoubleTapTimeout().toLong() &&
-                    hypot(touch.x - previous.second.x, touch.y - previous.second.y) <= doubleTapSlop
                 tapMoved = false
                 pressedAt = now
                 stillSince = now
                 puzzledUntil = 0L
                 puzzledAtAnchor = false
-                if (!repeatedRearTap) tapStartedAt = null
+                tapStartedAt = null
                 sleepingPress = EyesBus.sleepSession()
+                interactivePress = sleepingPress == null && allowsTouchReaction()
                 releasedAt = 0L
                 held = false
             }
             MotionEvent.ACTION_MOVE -> {
                 val index = event.findPointerIndex(pointerId)
                 if (index >= 0) {
-                    touch = Point(event.getX(index), event.getY(index))
+                    val next = Point(event.getX(index), event.getY(index))
+                    val delta = (event.eventTime - touchEventAt).coerceAtLeast(1L)
+                    val velocity = Point((next.x - touch.x) / delta, (next.y - touch.y) / delta)
+                    touchVelocity = touchVelocity.mix(velocity, 1f - exp(-delta / 36f))
+                    touch = next
+                    touchEventAt = event.eventTime
+                    touchMovedAt = now
                     if (!tapMoved) tapMoved = movedBeyondTapSlop()
                     val dx = touch.x - stillAnchor.x
                     val dy = touch.y - stillAnchor.y
@@ -314,23 +322,22 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                         if (EyesBus.isSleeping(sleep.revision) && !tapMoved && !movedBeyondTapSlop() &&
                             now - pressedAt < holdDelay
                         ) {
-                            completeTap(event.eventTime, now)
+                            completeTap(now)
                         }
-                    } else if (held || now - pressedAt >= holdDelay) {
+                    } else if (interactivePress &&
+                        (held || tapMoved || movedBeyondTapSlop() || now - pressedAt >= holdDelay)
+                    ) {
                         releasedAt = now
-                    } else {
-                        if (!tapMoved && !movedBeyondTapSlop()) {
-                            completeTap(event.eventTime, now)
-                        } else {
-                            performClick()
-                        }
+                    } else if (interactivePress) {
+                        completeTap(now)
                     }
+                    interactivePress = false
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
                 pointerId = MotionEvent.INVALID_POINTER_ID
-                repeatedRearTap = false
                 sleepingPress = null
+                interactivePress = false
                 parent?.requestDisallowInterceptTouchEvent(false)
             }
         }
@@ -338,14 +345,22 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         return true
     }
 
-    private fun completeTap(eventTime: Long, now: Long) {
-        if (display == Presentation.REAR && calibrationLens == null) {
-            // A quick second tap consumed here does not replay the interaction or advance deep sleep.
-            lastRearTap = eventTime to touch
-            if (repeatedRearTap) return
-        }
+    private fun completeTap(now: Long) {
         emitTapParticles(now)
-        performClick()
+        if (interactivePress) {
+            super.performClick()
+            startTapReaction(now)
+        } else {
+            performClick()
+        }
+    }
+
+    private fun allowsTouchReaction() =
+        EyesBus.state != EyeState.QUESTION && EyesBus.state != EyeState.ERROR
+
+    private fun startTapReaction(time: Long) {
+        tapStartedAt = time
+        tapWinks = Random.nextInt(4) == 0
     }
 
     private fun movedBeyondTapSlop(): Boolean {
@@ -415,12 +430,11 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
 
     override fun performClick(): Boolean {
         super.performClick()
-        if (EyesBus.state == EyeState.QUESTION) return true
+        if (!allowsTouchReaction()) return true
         val time = SystemClock.elapsedRealtime()
         val sleep = EyesBus.sleepSession()
         if (sleep == null) {
-            tapStartedAt = time
-            tapWillGreet = Random.nextBoolean()
+            startTapReaction(time)
         } else if (sleepTap?.let { it.revision == sleep.revision && it.wakeAfterPeek } != true &&
             queuedWakeTap?.revision != sleep.revision
         ) {
@@ -443,11 +457,6 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     }
 
     private fun gestureAt(time: Long): Gesture {
-        if (EyesBus.state == EyeState.QUESTION) {
-            tapStartedAt = null
-            releasedAt = 0L
-            return Gesture.NORMAL
-        }
         queuedWakeTap?.let { tap ->
             if (!EyesBus.isSleeping(tap.revision)) {
                 queuedWakeTap = null
@@ -468,20 +477,13 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             }
             sleepTap = null
         }
-        if (EyesBus.state == EyeState.SLEEP) {
-            tapStartedAt = null
-            return Gesture.NORMAL
-        }
-        if (sleepingPress != null) return Gesture.NORMAL
-        if (pointerId != MotionEvent.INVALID_POINTER_ID &&
-            (!repeatedRearTap || tapMoved || time - pressedAt >= holdDelay)
-        ) {
+        if (pointerId != MotionEvent.INVALID_POINTER_ID && interactivePress) {
             if (!held && time - pressedAt >= holdDelay) {
                 held = true
                 stillSince = time
                 stillAnchor = touch
             }
-            if (!held) return Gesture.LOOK
+            if (!held) return if (tapMoved) Gesture.TRACK else Gesture.LOOK
             if (time < puzzledUntil) return Gesture.PUZZLED
             if (!puzzledAtAnchor && time - stillSince >= STILL_LOOK_DELAY) {
                 puzzledAtAnchor = true
@@ -490,16 +492,11 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             }
             return Gesture.TRACK
         }
-        if (releasedAt > 0 && time - releasedAt < RELEASE_DURATION) return Gesture.RELEASE_BLINK
+        if (motionEnabled && releasedAt > 0 &&
+            time - releasedAt < RELEASE_DURATION
+        ) return Gesture.RELEASE
         val tap = tapStartedAt ?: return Gesture.NORMAL
-        val elapsed = time - tap
-        if (elapsed < TAP_FIRST_LOOK_DURATION) return Gesture.TAP_LOOK
-        val aftermath = elapsed - TAP_FIRST_LOOK_DURATION
-        if (aftermath < TAP_PHASE_DURATION) return Gesture.FRONT
-        if (aftermath < 2 * TAP_PHASE_DURATION) return Gesture.TAP_LOOK
-        val puzzledEnd = 2 * TAP_PHASE_DURATION + TAP_PUZZLED_DURATION
-        if (aftermath < puzzledEnd) return Gesture.FRONT_PUZZLED
-        if (tapWillGreet && aftermath < puzzledEnd + GREETING_DURATION) return Gesture.TAP_GREETING
+        if (time - tap < TAP_DURATION) return Gesture.TAP_LOOK
 
         tapStartedAt = null
         return Gesture.NORMAL
@@ -514,6 +511,10 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     override fun onDraw(canvas: Canvas) {
         val time = SystemClock.elapsedRealtime()
         val desk = display == Presentation.DESK
+        val usage = if (desk || display == Presentation.REAR) EyesBus.connectedUsage else null
+        val now = System.currentTimeMillis() / 1000L
+        val five = usage?.fiveHour?.remainingPercent(now)
+        val week = usage?.week?.remainingPercent(now)
         val h = if (desk) min(height.toFloat(), width / (REAR_FACE_ASPECT + 0.72f)) else height.toFloat()
         val faceTop = (height - h) / 2f
         val lensLane = if (display == Presentation.REAR && width >= h * 1.35f) {
@@ -556,24 +557,33 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                 idleMood != null -> idleMood
                 else -> expressionFor(status)
             }
-            Gesture.TAP_GREETING -> Expression.HELLO
-            Gesture.PUZZLED, Gesture.FRONT_PUZZLED -> Expression.QUESTION
-            Gesture.TAP_LOOK, Gesture.FRONT -> Expression.IDLE
-            Gesture.TRACK, Gesture.RELEASE_BLINK -> Expression.FOCUS
-            Gesture.LOOK -> Expression.IDLE
+            Gesture.PUZZLED -> Expression.QUESTION
+            Gesture.TRACK, Gesture.RELEASE -> Expression.FOCUS
+            Gesture.LOOK, Gesture.TAP_LOOK -> Expression.IDLE
             Gesture.SLEEP_TOUCH -> Expression.SLEEP
+        }
+        if (expression == Expression.DONE && status == EyeState.DONE &&
+            presentedDoneRevision != EyesBus.stateSince
+        ) {
+            val doneRevision = EyesBus.stateSince
+            val deferredByTouch = when (previousGesture) {
+                Gesture.LOOK, Gesture.TRACK, Gesture.PUZZLED, Gesture.RELEASE, Gesture.TAP_LOOK -> true
+                else -> false
+            }
+            donePresentedAt = if (deferredByTouch) time else doneRevision
+            presentedDoneRevision = doneRevision
         }
         if (gesture != previousGesture) {
             if (gesture == Gesture.TRACK && previousGesture != Gesture.PUZZLED) {
                 scheduleBlink(time, Random.nextLong(950L, 1300L))
             }
         }
-        if (target != expression || (gesture != previousGesture && gesture != Gesture.RELEASE_BLINK)) {
+        if (target != expression) {
             beginMorph(expression, time)
         }
 
         val lookingAtTouch = when (gesture) {
-            Gesture.LOOK, Gesture.TAP_LOOK, Gesture.TRACK, Gesture.PUZZLED, Gesture.RELEASE_BLINK -> true
+            Gesture.LOOK, Gesture.TAP_LOOK, Gesture.TRACK, Gesture.PUZZLED, Gesture.RELEASE -> true
             else -> false
         }
         val focused = expression == Expression.FOCUS
@@ -581,6 +591,19 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         // 瞳光瞄在指尖稍上方，眼睛整体移动的幅度比瞳光小。
         val touchY = ((touch.y - faceTop - if (focused) h * 0.075f else 0f) / h - EYE_CENTER_Y)
             .coerceIn(-0.55f, 0.65f)
+        val tapAge = tapStartedAt?.let { time - it } ?: 0L
+        val attention = when (gesture) {
+            Gesture.TAP_LOOK -> if (motionEnabled) 1f - smoothStep((tapAge - 330L) / 520f) else 1f
+            Gesture.RELEASE -> {
+                val phase = (time - releasedAt) / RELEASE_DURATION.toFloat()
+                cos(phase * PI * 1.35).toFloat() * (1f - phase) * (1f - phase)
+            }
+            else -> 1f
+        }
+        val velocityAge = (time - touchMovedAt).coerceAtLeast(0L)
+        val lead = if (motionEnabled && focused) 78f * exp(-velocityAge / 110f) else 0f
+        val leadX = (touchVelocity.x * lead / w).coerceIn(-0.18f, 0.18f)
+        val leadY = (touchVelocity.y * lead / h).coerceIn(-0.15f, 0.15f)
         val idleLook = if (idleActive) idleGlanceAt(time) else Point(0f, 0f)
         val thought = if (motionEnabled && expression == Expression.THINKING) {
             val current = thinkingLook
@@ -589,11 +612,11 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         thinkingLook = thought
         val gazeTarget = if (lookingAtTouch) {
             val strength = if (focused || gesture == Gesture.PUZZLED) 0.90f else 0.68f
-            Point((touchX * 0.36f).coerceIn(-0.159f, 0.159f) * strength,
-                (touchY * 0.40f).coerceIn(-0.080f, 0.19f) * strength)
+            Point((touchX * 0.36f).coerceIn(-0.159f, 0.159f) * strength * attention,
+                (touchY * 0.40f).coerceIn(-0.080f, 0.19f) * strength * attention)
         } else Point(idleLook.x * 0.082f, idleLook.y * 0.063f)
         val pupilTarget = when {
-            lookingAtTouch -> Point(touchX * 1.58f, touchY * 1.7f)
+            lookingAtTouch -> Point((touchX + leadX) * 1.58f * attention, (touchY + leadY) * 1.7f * attention)
             !motionEnabled -> Point(0f, 0f)
             idleActive -> idleLook
             expression == Expression.IDEA -> Point(0f, -0.18f)
@@ -608,8 +631,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             gaze = thought.fromEyes.mix(Point(direction.x * 0.105f, direction.y * 0.083f), eased)
             pupilGaze = thought.fromPupils.mix(direction, eased)
         } else if (motionEnabled) {
-            val eyeSpeed = if (idleActive) 220.0 else 76.0
-            val pupilSpeed = if (gesture != Gesture.NORMAL) 82.0 else 155.0
+            val eyeSpeed = if (idleActive) 220.0 else if (lookingAtTouch) 105.0 else 76.0
+            val pupilSpeed = if (lookingAtTouch) 38.0 else 155.0
             gaze = gaze.mix(gazeTarget, (1 - exp(-elapsed / eyeSpeed)).toFloat())
             pupilGaze = pupilGaze.mix(pupilTarget, (1 - exp(-elapsed / pupilSpeed)).toFloat())
         } else {
@@ -617,7 +640,6 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             pupilGaze = pupilTarget
         }
         val blink = when (gesture) {
-            Gesture.RELEASE_BLINK -> releaseBlink(time - releasedAt)
             Gesture.TRACK -> if (motionEnabled) blink(time) else 1f
             Gesture.NORMAL -> when {
                 thought != null -> thinkingBlink(time, thought)
@@ -628,14 +650,25 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             else -> 1f
         }
         val desiredSpacing = when (gesture) {
-            Gesture.TAP_LOOK, Gesture.TRACK, Gesture.PUZZLED, Gesture.RELEASE_BLINK ->
-                interactionEyeSpacing(faceLeft + w * 0.5f, faceTop + h * EYE_CENTER_Y, lensLane)
+            Gesture.LOOK, Gesture.TAP_LOOK, Gesture.TRACK, Gesture.PUZZLED, Gesture.RELEASE ->
+                blend(EYE_SPACING, interactionEyeSpacing(faceLeft + w * 0.5f,
+                    faceTop + h * EYE_CENTER_Y, lensLane), attention.coerceAtLeast(0f))
             else -> EYE_SPACING
         }
         eyeSpacing = if (motionEnabled) blend(eyeSpacing, desiredSpacing, (1 - exp(-elapsed / 100.0)).toFloat())
             else desiredSpacing
-        val destination = faceFor(expression, time, blink, w / h, eyeSpacing)
-        val progress = if (motionEnabled) ((time - morphStart) / 320f).coerceIn(0f, 1f) else 1f
+        var destination = faceFor(expression, time, blink, w / h, eyeSpacing)
+        if (gesture == Gesture.TAP_LOOK && motionEnabled) {
+            val near = smoothStep((abs(touchX) - 0.08f) / 0.37f)
+            val wink = if (tapWinks) 0.54f * pulse(tapAge - 420L, 260L) else 0f
+            val squint = max(near * 0.28f * pulse(tapAge, 530L), wink)
+            val eye = if (touchX < 0f) destination.left else destination.right
+            val narrowed = eye.copy(halfHeight = eye.halfHeight * (1f - squint),
+                pupil = eye.pupil * (1f - squint))
+            destination = if (touchX < 0f) destination.copy(left = narrowed) else destination.copy(right = narrowed)
+        }
+        val morphDuration = if (expression == Expression.DONE || lookingAtTouch) 145f else 275f
+        val progress = if (motionEnabled) ((time - morphStart) / morphDuration).coerceIn(0f, 1f) else 1f
         val origin = morphFrom
         val tap = sleepTap
         val face = if (gesture == Gesture.SLEEP_TOUCH && tap != null) {
@@ -662,12 +695,18 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         }
         displayedFace = face
 
-        if (lensLane > 0f) drawUsage(canvas, h)
-        if (desk) drawDeskUsage(canvas, h)
+        if (lensLane > 0f && (five != null || week != null || calibrationLens != null)) {
+            drawUsage(canvas, h, five, week)
+        }
+        if (desk && (five != null || week != null)) drawDeskUsage(canvas, h, five, week)
         val frame = canvas.save()
         canvas.translate(faceLeft, faceTop)
         val pose = canvas.save()
-        val nextTilt = headAngle(expression, time - morphStart)
+        val touchTilt = if (motionEnabled && lookingAtTouch) {
+            touchX * 8f * attention + leadX * 14f * attention
+        } else 0f
+        val expressionAge = time - if (status == EyeState.DONE) donePresentedAt else morphStart
+        val nextTilt = headAngle(expression, expressionAge) + touchTilt
         headTilt = blend(headTilt, nextTilt, (1 - exp(-elapsed / 54.0)).toFloat())
         canvas.rotate(headTilt, w * 0.5f, h * 0.46f)
         updateEyeShaders(face.palette)
@@ -682,25 +721,26 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val badgeLeft = if (display == Presentation.REAR) usageWidth else 0f
         val badgeWidth = width - badgeLeft
         val badges = statusBadges.layout(status, time, badgeWidth, h, desk)
-        if (badgeDescription != badges.description) {
-            badgeDescription = badges.description
-            contentDescription = "电子眼。${badges.description}。轻点让眼睛看过来，长按拖动让视线跟随手指"
+        val description = badges?.description
+        if (badgeDescription != description) {
+            badgeDescription = description
+            val statusDescription = description?.let { "$it。" }.orEmpty()
+            contentDescription = "电子眼。${statusDescription}轻点让眼睛看过来，长按拖动让视线跟随手指"
         }
         val badgeY = if (desk) height - 40f * resources.displayMetrics.density else faceTop + h * 0.9f
-        if (expression == Expression.THINKING) {
+        if (display == Presentation.REAR && expression == Expression.THINKING) {
             val normalY = if (desk) badgeY else faceTop + h * 0.765f
-            val loadingY = if (badges.named) min(normalY, badges.top(badgeY) - h * 0.04f) else normalY
+            val loadingY = if (badges?.named == true) min(normalY, badges.top(badgeY) - h * 0.04f) else normalY
             drawLoading(canvas, faceLeft + w / 2f, loadingY, w * (if (desk) 0.042f else 0.065f),
                 h * (if (desk) 0.62f else 1f), face.palette.top, time)
         }
-        statusBadges.draw(canvas, badges, badgeLeft, badgeWidth, badgeY, desk, time, motionEnabled)
+        if (badges != null) statusBadges.draw(canvas, badges, badgeLeft, badgeWidth, badgeY, desk, time, motionEnabled,
+            loadingInIcon = display != Presentation.REAR)
         drawTapParticles(canvas, time)
         postInvalidateOnAnimation()
     }
 
-    private fun drawUsage(canvas: Canvas, h: Float) {
-        val usage = EyesBus.usage
-        val now = System.currentTimeMillis() / 1000L
+    private fun drawUsage(canvas: Canvas, h: Float, five: Int?, week: Int?) {
         val sx = width.toFloat() / LensAlignment.WIDTH
         val sy = h / LensAlignment.HEIGHT
         val scale = min(sx, sy)
@@ -709,6 +749,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             val y = geometry.y * sy
             val radius = geometry.radius * scale
             val editing = calibrationLens
+            if (editing == null && percent == null) return
             val displayPercent = if (editing != null) 100 else percent
             usagePaint.style = Paint.Style.STROKE
             usagePaint.strokeWidth = radius * 0.137f
@@ -720,6 +761,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                 canvas.drawArc(x - radius, y - radius, x + radius, y + radius,
                     -90f, displayPercent * 3.6f, false, usagePaint)
             }
+            if (editing != null || percent == null) return
 
             // 文字沿每个圆环的右下弧摆放，并随镜头校准移动。
             usagePaint.style = Paint.Style.FILL
@@ -728,29 +770,27 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             usagePaint.color = 0xF4EDF7FF.toInt()
             val labelX = x + radius * 0.83f + h * 0.010f
             val valueY = (y + radius * 0.91f).coerceAtMost(h * 0.95f)
-            canvas.drawText(if (percent == null) "—" else "$percent%", labelX, valueY, usagePaint)
+            canvas.drawText("$percent%", labelX, valueY, usagePaint)
             usagePaint.textSize = h * 0.027f
             usagePaint.color = 0xBBD3E6F7.toInt()
             canvas.drawText(label, labelX, valueY + h * 0.038f, usagePaint)
         }
-        ring(0, lensAlignment.upper, "5 小时剩余", usage.fiveHour?.remainingPercent(now), 0xFF70DFF1.toInt())
-        ring(1, lensAlignment.lower, "周剩余", usage.week?.remainingPercent(now), 0xFF9EACFF.toInt())
+        ring(0, lensAlignment.upper, "5 小时剩余", five, 0xFF70DFF1.toInt())
+        ring(1, lensAlignment.lower, "周剩余", week, 0xFF9EACFF.toInt())
     }
 
-    private fun drawDeskUsage(canvas: Canvas, h: Float) {
-        val usage = EyesBus.usage
-        val now = System.currentTimeMillis() / 1000L
+    private fun drawDeskUsage(canvas: Canvas, h: Float, five: Int?, week: Int?) {
         val density = resources.displayMetrics.density
         val radius = min(18f * density, h * 0.054f)
         val y = 16f * density + radius
         val alpha = (deskUsageOpacity * 255).toInt()
 
-        fun ring(x: Float, label: String, percent: Int?, accent: Int) {
+        fun ring(x: Float, label: String, percent: Int, accent: Int) {
             usagePaint.style = Paint.Style.STROKE
             usagePaint.strokeWidth = radius * 0.075f
             usagePaint.color = CyberColors.alpha(CyberColors.line, alpha)
             canvas.drawCircle(x, y, radius, usagePaint)
-            if (percent != null && percent > 0) {
+            if (percent > 0) {
                 usagePaint.color = CyberColors.alpha(accent, alpha)
                 canvas.drawArc(x - radius, y - radius, x + radius, y + radius,
                     -90f, percent * 3.6f, false, usagePaint)
@@ -760,14 +800,17 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             usagePaint.textSize = radius * 0.59f
             usagePaint.color = CyberColors.alpha(CyberColors.text, alpha)
             val baseline = y - (usagePaint.ascent() + usagePaint.descent()) / 2f
-            canvas.drawText(percent?.let { "$it%" } ?: "—", x, baseline, usagePaint)
+            canvas.drawText("$percent%", x, baseline, usagePaint)
             usagePaint.textSize = min(11f * resources.displayMetrics.scaledDensity, radius * 0.63f)
             usagePaint.color = CyberColors.alpha(CyberColors.muted, alpha)
             canvas.drawText(label, x, y + radius + usagePaint.textSize * 1.55f, usagePaint)
         }
         val x = 16f * density + radius
-        ring(x, "5 小时", usage.fiveHour?.remainingPercent(now), CyberColors.cyan)
-        ring(x + radius * 2f + 12f * density, "本周", usage.week?.remainingPercent(now), CyberColors.violet)
+        if (five != null) ring(x, "5 小时", five, CyberColors.cyan)
+        if (week != null) {
+            val weekX = if (five == null) x else x + radius * 2f + 12f * density
+            ring(weekX, "本周", week, CyberColors.violet)
+        }
     }
 
     private fun idleExpressionAt(time: Long, active: Boolean): Expression? {
@@ -809,9 +852,9 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         if (!motionEnabled) return 0f
         return when (expression) {
             Expression.DONE -> {
-                val sway = age - 270L
-                if (sway in 0L..1800L) {
-                    sin(sway / 860.0 * 2 * PI).toFloat() * 6.4f * pulse(sway, 1800L)
+                val sway = age - 190L
+                if (sway in 0L..620L) {
+                    sin(sway / 620.0 * 2 * PI).toFloat() * 5.3f * pulse(sway, 620L)
                 } else 0f
             }
             Expression.SLEEP -> {
@@ -878,11 +921,18 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                         0.245f, tilt, 0.042f, lowerInset = 0.019f, cheekLift = side * 0.025f)
                     large.mix(small, smallHere)
                 }
-                Expression.DONE -> Eye(
-                    Point(x, y + 0.07f - swell * 0.037f),
-                    0.148f + swell * 0.007f, 0.051f, 0.286f + swell * 0.028f, 0f, 1f, 0f, 0f,
-                    brow(x, 0.153f, 0f, 0.092f, 0f), crescent = 1f
-                )
+                Expression.DONE -> {
+                    val crescent = Eye(
+                        Point(x, y + 0.07f - swell * 0.037f),
+                        0.148f + swell * 0.007f, 0.051f, 0.286f + swell * 0.028f, 0f, 1f, 0f, 0f,
+                        brow(x, 0.153f, 0f, 0.092f, 0f), crescent = 1f
+                    )
+                    val doneAge = time - donePresentedAt
+                    val pop = if (motionEnabled && EyesBus.state == EyeState.DONE) smoothStep(doneAge / 105f) *
+                        (1f - smoothStep((doneAge - 150L) / 290f)) else 0f
+                    crescent.mix(openEye(x, y - 0.016f, 0.32f, 0.49f, 1f,
+                        0.15f, 0f, 0f, showBrow = false), pop)
+                }
                 Expression.ERROR -> {
                     val shake = if (motionEnabled) sin(age / 26.0).toFloat() *
                         (1f - age / 410f).coerceIn(0f, 1f) * 0.021f else 0f
@@ -1222,7 +1272,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
 
     private fun drawDetails(canvas: Canvas, expression: Expression, status: EyeState, color: Palette,
                             time: Long, w: Float, h: Float, progress: Float) {
-        val celebrationAge = if (status == EyeState.IDLE) time - morphStart else time - EyesBus.stateSince
+        val celebrationAge = time - if (status == EyeState.DONE) donePresentedAt else morphStart
         when {
             expression == Expression.DONE && motionEnabled && celebrationAge in 0..720 -> {
                 val travel = (celebrationAge / 720f).coerceIn(0f, 1f)
@@ -1359,9 +1409,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         private const val EYE_CENTER_Y = 0.445f
         // 沿用追踪表情的小瞳孔比例，随当前帧的眼睛轮廓缩放。
         private const val PUPIL_SCALE = 0.76f * 0.86f
-        private const val TAP_FIRST_LOOK_DURATION = 2_000L
-        private const val TAP_PHASE_DURATION = 500L
-        private const val TAP_PUZZLED_DURATION = 1_000L
+        private const val TAP_DURATION = 850L
         private const val DEEP_SLEEP_DELAY = 300_000L
         private const val SECOND_TAP_WINDOW = 4_000L
         private const val SLEEP_FLATTEN_DURATION = 160L
@@ -1376,7 +1424,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         private const val SLEEP_WAKE_DURATION = 580L
         private const val STILL_LOOK_DELAY = 1500L
         private const val PUZZLED_DURATION = 950L
-        private const val RELEASE_DURATION = 440L
+        private const val RELEASE_DURATION = 390L
         private const val GREETING_DURATION = 1400L
         private const val THINK_MOVE_DURATION = 320L
         private const val THINK_CODE_DURATION = 2000L
@@ -1385,6 +1433,10 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         private const val DOUBLE_BLINK_DURATION = 420L
 
         private fun blend(from: Float, to: Float, t: Float) = from + (to - from) * t
+        private fun smoothStep(value: Float): Float {
+            val t = value.coerceIn(0f, 1f)
+            return t * t * (3f - 2f * t)
+        }
         private fun palette(a: Int, b: Int, c: Int) = Palette(a or Color.BLACK, b or Color.BLACK, c or Color.BLACK)
         private fun mixColor(from: Int, to: Int, t: Float) = Color.rgb(
             blend(Color.red(from).toFloat(), Color.red(to).toFloat(), t).toInt(),

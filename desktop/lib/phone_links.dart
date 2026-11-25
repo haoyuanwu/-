@@ -11,15 +11,14 @@ class PhoneLinks {
   ({Uri url, String authorization})? _lan;
   String? _adb;
   ({String serial, int port, bool owned})? _forward;
-  String? _usbLanTransport;
+  ({String serial, String id})? _usbTransport;
   bool _usbLanHandled = false;
-  bool _usbRemotePaired = false;
-  DateTime? _nextUsbPairingAttempt;
+  bool _usbRemoteHandled = false;
   bool _inFlight = false;
   Map<String, Object?>? _pendingSnapshot;
 
   File get _lanFile => File('${directory.path}/phone-lan.json');
-  String? get lanAddress => _lan?.url.toString();
+  String? get lanAddress => _lan?.url.replace(path: '/mcp').toString();
 
   void load() {
     if (!_lanFile.existsSync()) return;
@@ -99,16 +98,16 @@ class PhoneLinks {
         final next = _pendingSnapshot;
         if (next == null) break;
         _pendingSnapshot = null;
-        await Future.wait([_sendAdb(next), _sendLan(next)]);
+        await _sendAdb(next, _sendLan(next));
       }
     } finally {
       _inFlight = false;
     }
   }
 
-  Future<void> _sendLan(Map<String, Object?> snapshot) async {
+  Future<bool> _sendLan(Map<String, Object?> snapshot) async {
     final lan = _lan;
-    if (lan == null) return;
+    if (lan == null) return false;
     final client = _client();
     try {
       final request = await client.postUrl(lan.url).timeout(_timeout);
@@ -120,59 +119,120 @@ class PhoneLinks {
       request.add(body);
       final response = await request.close().timeout(_timeout);
       await response.drain<void>().timeout(_timeout);
+      return response.statusCode == HttpStatus.ok && _lan == lan;
     } on IOException {
-      // The phone may have left the network.
+      return false;
     } on TimeoutException {
-      // Retry on the next scheduled push.
+      return false;
     } finally {
       client.close(force: true);
     }
   }
 
-  Future<void> _sendAdb(Map<String, Object?> snapshot) async {
-    final client = _client();
+  Future<void> _sendAdb(
+    Map<String, Object?> snapshot,
+    Future<bool> lanConnected,
+  ) async {
     try {
       final devices = await _devices();
-      if (!devices.values.any((device) => device.id == _usbLanTransport)) {
-        _usbLanTransport = null;
+      final usb = _usbTransport;
+      if (usb != null && devices[usb.serial]?.id != usb.id) {
+        _usbTransport = null;
       }
-      if (devices.isEmpty) return;
-      final configured = Platform.environment['ANDROID_SERIAL'];
-      var serial = configured ?? devices.keys.first;
-      if (configured == null && devices.length > 1) {
-        final identifiers = <String>{};
-        for (final candidate in devices.keys) {
-          final result = await _adbRun([
-            '-s',
-            candidate,
-            'shell',
-            'getprop',
-            'ro.serialno',
-          ]);
-          identifiers.add((result.stdout as String).trim());
-        }
-        if (identifiers.length != 1 || identifiers.contains('')) return;
-        serial = devices.keys.firstWhere(
-          (key) => devices[key]?.kind == 'USB',
-          orElse: () => devices.keys.first,
-        );
-      }
+      final serial = await _selectDevice(devices);
       final device = devices[serial];
-      if (device == null) return;
+      if (serial == null || device == null) return;
       if (device.kind == 'USB') {
-        if (_usbLanTransport != device.id) {
-          _usbLanTransport = device.id;
+        final transport = (serial: serial, id: device.id);
+        if (_usbTransport != transport) {
+          _usbTransport = transport;
           _usbLanHandled = false;
-          _usbRemotePaired = false;
-          _nextUsbPairingAttempt = null;
+          _usbRemoteHandled = false;
+          await _removeForward();
         }
-        if (!_usbLanHandled) await _importUsbLan(serial);
-        final now = DateTime.now();
-        if (!_usbRemotePaired && _nextUsbPairingAttempt?.isAfter(now) != true) {
-          _nextUsbPairingAttempt = now.add(const Duration(seconds: 15));
-          _usbRemotePaired = await _pairOverUsb(serial);
-        }
+        await Future.wait([
+          _syncAdb(serial, device.kind, snapshot),
+          _repairUsbLan(serial, snapshot, lanConnected),
+          _repairUsbTailscale(serial),
+        ]);
+      } else {
+        await _syncAdb(serial, device.kind, snapshot);
       }
+    } on IOException {
+      await _removeForward();
+    } on TimeoutException {
+      await _removeForward();
+    } finally {
+      await lanConnected;
+    }
+  }
+
+  Future<String?> _selectDevice(
+    Map<String, ({String kind, String id})> devices,
+  ) async {
+    if (devices.isEmpty) return null;
+    final configured = Platform.environment['ANDROID_SERIAL'];
+    if (configured != null || devices.length == 1) {
+      return configured ?? devices.keys.first;
+    }
+    final identifiers = <String>{};
+    for (final candidate in devices.keys) {
+      final result = await _adbRun([
+        '-s',
+        candidate,
+        'shell',
+        'getprop',
+        'ro.serialno',
+      ]);
+      if (result.exitCode != 0) return null;
+      identifiers.add((result.stdout as String).trim());
+    }
+    if (identifiers.length != 1 || identifiers.contains('')) return null;
+    return devices.keys.firstWhere(
+      (key) => devices[key]?.kind == 'USB',
+      orElse: () => devices.keys.first,
+    );
+  }
+
+  Future<void> _repairUsbLan(
+    String serial,
+    Map<String, Object?> snapshot,
+    Future<bool> lanConnected,
+  ) async {
+    if (_usbLanHandled) return;
+    if (await lanConnected) {
+      _usbLanHandled = true;
+      return;
+    }
+    if (_usbLanHandled) return;
+    if (await _importUsbLan(serial)) await _sendLan(snapshot);
+  }
+
+  Future<void> _repairUsbTailscale(String serial) async {
+    if (_usbRemoteHandled) return;
+    _usbRemoteHandled = true;
+    try {
+      final result = await _usbCall(serial, 'getLinkStatus');
+      if (result.exitCode == 0 &&
+          (result.stdout as String).trim() ==
+              'Result: Bundle[{tailscale_connected=true}]') {
+        return;
+      }
+    } on IOException {
+      return;
+    } on TimeoutException {
+      return;
+    }
+    await _pairOverUsb(serial);
+  }
+
+  Future<void> _syncAdb(
+    String serial,
+    String kind,
+    Map<String, Object?> snapshot,
+  ) async {
+    final client = _client();
+    try {
       if (_forward?.serial != serial) {
         await _removeForward();
         final reused = await _forwardedPort(serial);
@@ -199,7 +259,7 @@ class PhoneLinks {
         uri.replace(
           queryParameters: {
             'ticket': reply.substring(5),
-            'transport': device.kind,
+            'transport': kind,
             'state': '${snapshot['state']}',
             if (snapshot['agents'] != null)
               'agents': jsonEncode(snapshot['agents']),
@@ -217,32 +277,36 @@ class PhoneLinks {
     }
   }
 
-  Future<void> _importUsbLan(String serial) async {
+  Future<ProcessResult> _usbCall(String serial, String method) => _adbRun([
+    '-s',
+    serial,
+    'shell',
+    'content',
+    'call',
+    '--uri',
+    'content://com.reareyes.app.usb-lan',
+    '--method',
+    method,
+  ]);
+
+  Future<bool> _importUsbLan(String serial) async {
     try {
-      final result = await _adbRun([
-        '-s',
-        serial,
-        'shell',
-        'content',
-        'call',
-        '--uri',
-        'content://com.reareyes.app.usb-lan',
-        '--method',
-        'getConfig',
-      ]);
-      if (_usbLanHandled || result.exitCode != 0) return;
+      final result = await _usbCall(serial, 'getConfig');
+      if (_usbLanHandled || result.exitCode != 0) return false;
       final encoded = RegExp(
         r'^Result: Bundle\[\{lan_config=([A-Za-z0-9+/=]+)\}\]$',
       ).firstMatch((result.stdout as String).trim())?.group(1);
-      if (encoded == null) return;
+      if (encoded == null) return false;
       _saveLan(utf8.decode(base64Decode(encoded)));
-      _usbLanHandled = true;
+      return true;
     } on IOException {
-      // Keep the existing configuration and USB sync if import fails.
+      return false;
     } on TimeoutException {
-      // Retry on a later push.
+      return false;
     } on FormatException {
-      // Ignore unsupported or invalid configuration.
+      return false;
+    } finally {
+      _usbLanHandled = true;
     }
   }
 

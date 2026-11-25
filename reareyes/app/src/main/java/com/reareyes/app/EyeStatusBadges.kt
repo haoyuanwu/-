@@ -33,21 +33,24 @@ internal class EyeStatusBadges(private val context: Context) {
         EyeState.DONE, EyeState.STOPPED, EyeState.IDLE, EyeState.SLEEP)
     private val icons = EyeState.entries.associateWith(::StatusIcon)
     private var agents = emptyList<Map.Entry<String, EyeState>>()
+    private var connected = false
     private var nextRefresh = 0L
     private var cached: Layout? = null
     private var lastWidth = 0f
     private var lastHeight = 0f
     private var lastState = EyeState.IDLE
 
-    fun layout(state: EyeState, time: Long, w: Float, h: Float, desk: Boolean): Layout {
+    fun layout(state: EyeState, time: Long, w: Float, h: Float, desk: Boolean): Layout? {
         if (time >= nextRefresh) {
             nextRefresh = time + 350L
             val current = EyesBus.agentStates().entries.sortedBy { priority.indexOf(it.value) }
+            connected = EyesBus.connectedTransports().isNotEmpty()
             if (current != agents) {
                 agents = current
                 cached = null
             }
         }
+        if (!connected && agents.isEmpty()) return null
         val previous = cached
         if (previous != null && lastWidth == w && lastHeight == h && lastState == state) return previous
         lastWidth = w
@@ -101,7 +104,7 @@ internal class EyeStatusBadges(private val context: Context) {
     }
 
     fun draw(canvas: Canvas, layout: Layout, x: Float, width: Float, centerY: Float, desk: Boolean,
-             time: Long, motionEnabled: Boolean) {
+             time: Long, motionEnabled: Boolean, loadingInIcon: Boolean) {
         val h = layout.height
         val radius = h / 2f
         val iconSize = (h * 0.70f).toInt().coerceAtLeast(1)
@@ -130,7 +133,17 @@ internal class EyeStatusBadges(private val context: Context) {
                 val textOffset = iconWidth + if (icon != null && badge.label.isNotEmpty()) spacing else 0f
                 val contentWidth = text.measureText(badge.label) + textOffset
                 val contentLeft = left + (badge.width - contentWidth) / 2f
-                if (icon != null) {
+                if (badge.state == EyeState.THINKING && loadingInIcon) {
+                    background.style = Paint.Style.FILL
+                    for (index in 0..2) {
+                        val glow = if (motionEnabled) max(0.0, sin(time / 320.0 - index * 0.9)).toFloat() else 0.45f
+                        background.color = CyberColors.alpha(accent, (75 + 180 * glow).toInt())
+                        canvas.drawCircle(
+                            contentLeft + iconSize * (0.5f + (index - 1) * 0.30f), y,
+                            iconSize * (0.073f + 0.056f * glow), background,
+                        )
+                    }
+                } else if (icon != null) {
                     val top = (y - iconSize / 2f).toInt()
                     val start = contentLeft.toInt()
                     icon.setBounds(start, top, start + iconSize, top + iconSize)

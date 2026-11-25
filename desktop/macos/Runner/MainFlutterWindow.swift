@@ -103,10 +103,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate, NSPopoverDelegate {
     copyMenu.menu?.autoenablesItems = false
     for (name, key) in [
       ("手机配对配置", "pairing"),
-      ("WorkBuddy MCP", "WorkBuddy"),
-      ("OpenCode MCP", "OpenCode"),
-      ("OpenClaw MCP", "OpenClaw"),
-      ("通用 MCP", "generic")
+      ("复制给 AI 配置", "aiSetup")
     ] {
       let item = NSMenuItem(title: name, action: #selector(copyConfiguration(_:)), keyEquivalent: "")
       item.representedObject = key

@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'chat_reasoning.dart';
+import 'phone_model.dart';
 import 'platform_io.dart'
     if (dart.library.js_interop) 'platform_web.dart'
     as platform;
@@ -154,9 +156,121 @@ class Snapshot {
   final List<String> logs;
   final String? nativePairing;
   final EyeMood? remoteState;
+
+  int? get fiveRemaining => links.isEmpty ? null : five?.remaining;
+  int? get weekRemaining => links.isEmpty ? null : week?.remaining;
 }
 
 class RemoteClient {
+  Stream<ChatChunk> directChat(
+    PhoneModel profile,
+    List<Map<String, String>> messages,
+  ) async* {
+    var received = false;
+    var length = 0;
+    var finished = false;
+    await for (final line in platform.modelChat(profile.endpoint, profile.key, {
+      'model': profile.model,
+      'messages': messages,
+      'stream': true,
+    })) {
+      if (!line.startsWith('data:')) continue;
+      final data = line.substring(5).trim();
+      if (data == '[DONE]') {
+        finished = true;
+        break;
+      }
+      if (data.isEmpty) continue;
+      final value = jsonDecode(data);
+      if (value is Map && value['error'] != null) {
+        throw const FormatException('模型服务返回错误，请检查配置。');
+      }
+      final choices = value is Map ? value['choices'] : null;
+      final choice = choices is List ? choices.firstOrNull : null;
+      if (choice is! Map) continue;
+      finished = finished || choice['finish_reason'] != null;
+      final delta = choice['delta'];
+      final text = delta is Map ? delta['content'] : null;
+      final reasoning = delta is Map
+          ? delta['reasoning_content'] ?? delta['reasoning']
+          : null;
+      if (reasoning is String && reasoning.isNotEmpty) {
+        length += reasoning.length;
+        if (length > 48000) throw const FormatException('模型回复超过长度上限');
+        yield (text: reasoning, thinking: true);
+      }
+      if (text is String && text.isNotEmpty) {
+        length += text.length;
+        if (length > 48000) throw const FormatException('模型回复超过长度上限');
+        received = true;
+        yield (text: text, thinking: false);
+      }
+    }
+    if (!received) throw const FormatException('模型没有返回文字。');
+    if (!finished) throw const FormatException('模型连接在回复完成前中断。');
+  }
+
+  Future<List<DesktopModel>> models(Pairing pairing) async {
+    final json = await _request(pairing, '/ai/models');
+    final models = json['models'];
+    if (models is! List) throw const FormatException('电脑返回的模型列表无效');
+    return [
+      for (final model in models)
+        if (model is Map && model['id'] is String && model['name'] is String)
+          DesktopModel(
+            id: model['id'] as String,
+            name: model['name'] as String,
+            local: model['kind'] == 'local',
+            available: model['available'] != false,
+          ),
+    ];
+  }
+
+  Stream<ChatChunk> chat(
+    Pairing pairing,
+    DesktopModel model,
+    List<Map<String, String>> messages,
+    String requestId,
+  ) async* {
+    final lines = platform.modelChat(
+      pairing.url.replace(path: '/ai/chat'),
+      pairing.token,
+      {
+        'model': model.id,
+        'messages': messages,
+        'requestId': requestId,
+        'includeReasoning': true,
+      },
+    );
+    var length = 0;
+    await for (final line in lines) {
+      if (line.isEmpty) continue;
+      final frame = jsonDecode(line);
+      if (frame is! Map) throw const FormatException('电脑返回的回复格式无效');
+      if (frame['done'] == true) return;
+      if (frame['error'] is String) {
+        throw const FormatException('电脑调用模型失败，请检查模型连接并重试。');
+      }
+      final reasoning = frame['reasoning'];
+      final thinking = reasoning is String;
+      final text = thinking ? reasoning : frame['text'];
+      if (text is! String) throw const FormatException('电脑返回的回复格式无效');
+      length += text.length;
+      if (length > 48000) throw const FormatException('模型回复超过长度上限');
+      yield (text: text, thinking: thinking);
+    }
+    throw const FormatException('模型连接已中断');
+  }
+
+  Future<void> cancelChat(Pairing pairing, String requestId) =>
+      platform.cancelModelChat(
+        pairing.url.replace(
+          path: '/ai/chat',
+          queryParameters: {'id': requestId},
+        ),
+        pairing.token,
+      );
+
   Future<Snapshot> fetch(Pairing pairing) async {
     final json = await _request(pairing, '/status');
     if (EyeMood.statusFromWire(json['state']) == null) {
@@ -212,6 +326,20 @@ class RemoteClient {
     FormatException(:final message) => message,
     _ => '连接失败，请检查 Tailscale 和电脑服务。',
   };
+}
+
+class DesktopModel {
+  const DesktopModel({
+    required this.id,
+    required this.name,
+    required this.local,
+    required this.available,
+  });
+
+  final String id;
+  final String name;
+  final bool local;
+  final bool available;
 }
 
 class RemoteFailure implements Exception {

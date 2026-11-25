@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 
 import 'agent_mcp.dart';
 import 'desktop_chrome.dart';
+import 'model_connections_panel.dart';
 import 'remote_server.dart';
 import 'tailscale_endpoint.dart';
 
@@ -65,10 +66,21 @@ class DesktopDashboard extends StatefulWidget {
 }
 
 class _DesktopDashboardState extends State<DesktopDashboard> {
-  static const mcpClients = ['WorkBuddy', 'OpenCode', 'OpenClaw', '通用'];
-  static const setupCommand = 'tailscale serve --bg --https=8443 18792';
+  static const reportingSkillAsset = 'skills/robot-eyes-reporting/SKILL.md';
   late final RemoteServer server;
-  String? endpoint;
+  TailscaleStatus? tailscale;
+  String? get endpoint => tailscale?.endpoint;
+  String? get setupCommand => tailscale?.setupCommand;
+  String get tailscaleLabel => checking
+      ? '检测中'
+      : switch (tailscale?.state) {
+          TailscaleState.ready => '已检测到 HTTPS 地址',
+          TailscaleState.serveMissing => '已连接，待配置 Serve',
+          TailscaleState.serveUnknown => '无法读取 Serve 状态',
+          TailscaleState.disconnected => '未连接 tailnet',
+          TailscaleState.unavailable => '无法读取 Tailscale 状态',
+          null => '等待检测',
+        };
   String? failure;
   bool busy = false;
   bool checking = false;
@@ -90,11 +102,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
           : server.running && server.agentMcpError != null
           ? '启动失败'
           : '已停止'}',
-      'Tailscale · ${checking
-          ? '检测中'
-          : endpoint != null
-          ? '已检测到 HTTPS 地址'
-          : '未检测到'}',
+      'Tailscale · $tailscaleLabel',
       '手机局域网 · ${server.phoneLinks.lanAddress == null ? '未配置' : '已配置'}',
       'Web App · ${!server.webApp.available
           ? '未安装'
@@ -202,16 +210,13 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     if (checking) return;
     setState(() => checking = true);
     publishTray();
-    String? address;
+    TailscaleStatus? result;
     try {
-      address = await findTailscaleEndpoint(
-        RemoteServer.port,
-        RemoteServer.servePort,
-      );
+      result = await detectTailscale(RemoteServer.port, RemoteServer.servePort);
     } finally {
       if (mounted) {
         setState(() {
-          endpoint = address;
+          tailscale = result;
           checking = false;
         });
         publishTray();
@@ -238,12 +243,10 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       );
       return true;
     }
-    final client = configuration == 'generic' ? '通用' : configuration;
-    if (!mcpClients.contains(client) || !server.agentMcp.running) return false;
-    await copy(
-      server.agentMcp.config(client == '通用' ? null : client),
-      '已复制 $client MCP 配置',
-    );
+    if (configuration != 'aiSetup' || !server.agentMcp.running) return false;
+    final skill = await rootBundle.loadString(reportingSkillAsset);
+    if (!mounted || busy || !server.agentMcp.running) return false;
+    await copy(server.agentMcp.setupPrompt(skill), '已复制，粘贴给同一台电脑上的 AI');
     return true;
   }
 
@@ -341,65 +344,72 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     );
   }
 
-  Widget pairingPanel() => panel(
-    Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        heading(Icons.link_rounded, 'Tailscale 连接'),
-        const SizedBox(height: 14),
-        if (endpoint == null) ...[
-          Text(
-            checking ? '正在检测 Tailscale Serve…' : '未检测到 Robot Eyes 的 HTTPS 地址。',
-            style: const TextStyle(color: muted),
-          ),
-          const SizedBox(height: 8),
-          const Text('电脑加入 tailnet 后，在终端运行以下命令，再重新检测。'),
-          const SizedBox(height: 8),
-          const SelectableText(setupCommand, style: TextStyle(color: cyan)),
-        ] else ...[
-          SelectableText(endpoint!, style: const TextStyle(color: cyan)),
-          const SizedBox(height: 8),
-          Text(
-            server.webApp.available
-                ? '在手机浏览器打开上方地址，将配对配置粘贴到「远程连接」。'
-                : '把配对配置复制到手机 Robot Eyes 的「远程连接」。',
-          ),
-        ],
-        const SizedBox(height: 12),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            OutlinedButton(
-              onPressed: checking ? null : detectEndpoint,
-              child: const Text('重新检测'),
+  Widget pairingPanel() {
+    final command = setupCommand;
+    final needsServe = tailscale?.state == TailscaleState.serveMissing;
+    return panel(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          heading(Icons.link_rounded, 'Tailscale 连接'),
+          const SizedBox(height: 14),
+          if (endpoint == null) ...[
+            Text(tailscaleLabel, style: const TextStyle(color: muted)),
+            if (!checking && needsServe && command != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                Platform.isWindows
+                    ? '在 PowerShell 运行以下命令，再重新检测。'
+                    : '在终端运行以下命令，再重新检测。',
+              ),
+              const SizedBox(height: 8),
+              SelectableText(command, style: const TextStyle(color: cyan)),
+            ],
+          ] else ...[
+            SelectableText(endpoint!, style: const TextStyle(color: cyan)),
+            const SizedBox(height: 8),
+            Text(
+              server.webApp.available
+                  ? '在手机浏览器打开上方地址，将配对配置粘贴到「远程连接」。'
+                  : '把配对配置复制到手机 Robot Eyes 的「远程连接」。',
             ),
-            if (endpoint == null)
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
               OutlinedButton(
-                onPressed: () => copy(setupCommand, '已复制命令'),
-                child: const Text('复制命令'),
-              )
-            else ...[
-              if (server.webApp.available)
+                onPressed: checking ? null : detectEndpoint,
+                child: const Text('重新检测'),
+              ),
+              if (!checking && needsServe && command != null)
                 OutlinedButton(
+                  onPressed: () => copy(command, '已复制命令'),
+                  child: const Text('复制命令'),
+                )
+              else if (endpoint != null) ...[
+                if (server.webApp.available)
+                  OutlinedButton(
+                    onPressed: !server.running
+                        ? null
+                        : () => copy(endpoint!, '已复制 Web App 地址'),
+                    child: const Text('复制 Web App 地址'),
+                  ),
+                FilledButton.icon(
                   onPressed: !server.running
                       ? null
-                      : () => copy(endpoint!, '已复制 Web App 地址'),
-                  child: const Text('复制 Web App 地址'),
+                      : () => copyConfiguration('pairing'),
+                  icon: const Icon(Icons.copy_rounded, size: 18),
+                  label: const Text('复制配对配置'),
                 ),
-              FilledButton.icon(
-                onPressed: !server.running
-                    ? null
-                    : () => copyConfiguration('pairing'),
-                icon: const Icon(Icons.copy_rounded, size: 18),
-                label: const Text('复制配对配置'),
-              ),
+              ],
             ],
-          ],
-        ),
-      ],
-    ),
-  );
+          ),
+        ],
+      ),
+    );
+  }
 
   Future<void> editLan() async {
     String config = '';
@@ -408,26 +418,56 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, update) {
+          final address = server.phoneLinks.lanAddress;
           return AlertDialog(
             title: const Text('手机局域网配置'),
+            scrollable: true,
             content: SizedBox(
               width: 460,
-              child: TextField(
-                decoration: InputDecoration(
-                  labelText: '粘贴手机的局域网 MCP 配置',
-                  errorText: error,
-                  helperText: '手机在「局域网 MCP」开启后可以复制配置。',
-                ),
-                obscureText: true,
-                onChanged: (value) => config = value,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (address != null) ...[
+                    const Text('当前配置 · Streamable HTTP'),
+                    const SizedBox(height: 6),
+                    SelectableText(
+                      address,
+                      style: const TextStyle(color: cyan),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Authorization · Bearer ••••••••',
+                      style: TextStyle(color: muted),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                  TextField(
+                    decoration: InputDecoration(
+                      labelText: address == null
+                          ? '粘贴手机的局域网 MCP 配置'
+                          : '粘贴新配置以替换',
+                      errorText: error,
+                      helperText: '手机在「局域网 MCP」开启后可以复制配置。',
+                    ),
+                    obscureText: true,
+                    onChanged: (value) => update(() {
+                      config = value;
+                      error = null;
+                    }),
+                  ),
+                ],
               ),
             ),
             actions: [
-              if (server.phoneLinks.lanAddress != null)
+              if (address != null)
                 TextButton(
                   onPressed: () {
-                    server.phoneLinks.configureLan('');
-                    Navigator.pop(context);
+                    try {
+                      server.phoneLinks.configureLan('');
+                      Navigator.pop(context);
+                    } on FileSystemException {
+                      update(() => error = '无法移除配置，请检查文件权限。');
+                    }
                   },
                   child: const Text('移除配置'),
                 ),
@@ -436,16 +476,18 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                 child: const Text('取消'),
               ),
               FilledButton(
-                onPressed: () {
-                  try {
-                    server.phoneLinks.configureLan(config);
-                    Navigator.pop(context);
-                  } on FormatException {
-                    update(() => error = '请粘贴手机复制的完整 MCP 配置。');
-                  } on FileSystemException {
-                    update(() => error = '无法保存配置，请检查文件权限。');
-                  }
-                },
+                onPressed: config.trim().isEmpty
+                    ? null
+                    : () {
+                        try {
+                          server.phoneLinks.configureLan(config);
+                          Navigator.pop(context);
+                        } on FormatException {
+                          update(() => error = '请粘贴手机复制的完整 MCP 配置。');
+                        } on FileSystemException {
+                          update(() => error = '无法保存配置，请检查文件权限。');
+                        }
+                      },
                 child: const Text('保存'),
               ),
             ],
@@ -459,74 +501,118 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     }
   }
 
-  Widget lanPanel() => panel(
-    Row(
-      children: [
-        Expanded(
+  Widget lanPanel() {
+    final address = server.phoneLinks.lanAddress;
+    return panel(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(child: heading(Icons.phone_android_rounded, '手机局域网')),
+              const SizedBox(width: 8),
+              OutlinedButton(onPressed: editLan, child: const Text('管理配置')),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (address == null)
+            const Text('未配置', style: TextStyle(color: muted))
+          else
+            SelectableText(address, style: const TextStyle(color: cyan)),
+        ],
+      ),
+    );
+  }
+
+  Future<void> showAiConfiguration() async {
+    final skill = await rootBundle.loadString(reportingSkillAsset);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('AI 配置详情'),
+        scrollable: true,
+        content: SizedBox(
+          width: 560,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              heading(Icons.phone_android_rounded, '手机局域网'),
+              const Text('通用 MCP'),
               const SizedBox(height: 8),
-              Text(
-                server.phoneLinks.lanAddress == null ? '未配置' : '已配置手机局域网地址',
+              SelectableText(
+                server.agentMcp.configuration(),
+                style: TextStyle(
+                  color: cyan,
+                  fontFamily: Platform.isWindows ? 'Consolas' : 'Menlo',
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text('robot-eyes-reporting/SKILL.md'),
+              const SizedBox(height: 8),
+              SelectableText(
+                skill.trimRight(),
                 style: const TextStyle(color: muted),
               ),
             ],
           ),
         ),
-        OutlinedButton(onPressed: editLan, child: const Text('管理配置')),
-      ],
-    ),
-  );
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
 
-  Widget agentMcpPanel() => panel(
-    Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        heading(Icons.link_rounded, '桌面 AI MCP'),
-        const SizedBox(height: 8),
-        if (server.agentMcp.running) ...[
-          SelectableText(AgentMcp.url(), style: const TextStyle(color: cyan)),
+  Widget agentMcpPanel() {
+    final verification = server.agentMcp.lastReportingVerification;
+    return panel(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          heading(Icons.link_rounded, '桌面 AI MCP'),
           const SizedBox(height: 8),
-          const Text(
-            '在同一台电脑的 AI 工具中添加配置，连接后在手机查看工具状态。',
-            style: TextStyle(color: muted),
-          ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              MenuAnchor(
-                menuChildren: [
-                  for (final client in mcpClients)
-                    MenuItemButton(
-                      onPressed: () => copyConfiguration(client),
-                      child: Text(client),
-                    ),
-                ],
-                builder: (context, controller, child) => OutlinedButton(
-                  onPressed: () => controller.isOpen
-                      ? controller.close()
-                      : controller.open(),
-                  child: const Text('复制 MCP 配置'),
+          if (server.agentMcp.running) ...[
+            SelectableText(AgentMcp.url(), style: const TextStyle(color: cyan)),
+            const SizedBox(height: 8),
+            const Text(
+              '复制后粘贴给同一台电脑上的 AI，由它添加 MCP 并安装状态上报 Skill。',
+              style: TextStyle(color: muted),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: busy ? null : () => copyConfiguration('aiSetup'),
+                  icon: const Icon(Icons.copy_rounded, size: 18),
+                  label: const Text('复制给 AI 配置'),
                 ),
-              ),
-              OutlinedButton(
-                onPressed: () => copy(AgentMcp.reportingRule, '已复制状态上报规则'),
-                child: const Text('复制上报规则'),
-              ),
-            ],
-          ),
-        ] else
-          Text(
-            server.agentMcpError ?? '启动电脑服务后可连接。',
-            style: const TextStyle(color: muted),
-          ),
-      ],
-    ),
-  );
+                OutlinedButton(
+                  onPressed: showAiConfiguration,
+                  child: const Text('查看配置详情'),
+                ),
+              ],
+            ),
+          ] else
+            Text(
+              server.agentMcpError ?? '启动电脑服务后可连接。',
+              style: const TextStyle(color: muted),
+            ),
+          if (verification != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              '最近验证 · ${verification.name} · ${TimeOfDay.fromDateTime(verification.at).format(context)}',
+              style: const TextStyle(color: muted),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 
   Widget inboxPanel() => panel(
     Column(
@@ -580,12 +666,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              Expanded(child: heading(Icons.hub_outlined, 'AI 工具连接', violet)),
-              StatusPill('${clients.length} 个已连接', active: clients.isNotEmpty),
-            ],
-          ),
+          heading(Icons.hub_outlined, 'AI 工具连接', violet),
           const SizedBox(height: 14),
           if (clients.isEmpty)
             Text(
@@ -602,18 +683,11 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: ListTile(
-                    leading: const Icon(
-                      Icons.extension_outlined,
-                      color: violet,
-                      size: 20,
-                    ),
+                    dense: true,
                     title: Text(
                       client.name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text(
-                      '${client.count} 个会话 · 最近通信 ${TimeOfDay.fromDateTime(client.lastSeen).format(context)}',
                     ),
                     trailing: StatusPill(
                       RemoteServer.labels[states[client.name]] ?? '待机',
@@ -621,11 +695,6 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                   ),
                 ),
               ),
-          const SizedBox(height: 10),
-          const Text(
-            '会话断开或连续 2 小时无请求后移出列表。',
-            style: TextStyle(color: muted, fontSize: 12),
-          ),
         ],
       ),
     );
@@ -694,6 +763,11 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                                 flex: 5,
                                 child: stack([
                                   agentMcpPanel(),
+                                  panel(
+                                    ModelConnectionsPanel(
+                                      server.modelConnections,
+                                    ),
+                                  ),
                                   pairingPanel(),
                                   lanPanel(),
                                 ]),
@@ -705,6 +779,9 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                             servicePanel(),
                             connectedPanel(),
                             agentMcpPanel(),
+                            panel(
+                              ModelConnectionsPanel(server.modelConnections),
+                            ),
                             pairingPanel(),
                             lanPanel(),
                             inboxPanel(),

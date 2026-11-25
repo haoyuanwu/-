@@ -4,6 +4,7 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  private let interaction = RobotInteraction()
   private let pairingQuery: [String: Any] = [
     kSecClass as String: kSecClassGenericPassword,
     kSecAttrService as String: "com.reareyes.mobile",
@@ -15,6 +16,7 @@ import UIKit
     guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "RearEyesMobile") else {
       return
     }
+    interaction.register(with: registrar.messenger())
     let channel = FlutterMethodChannel(name: "com.reareyes/mobile", binaryMessenger: registrar.messenger())
     channel.setMethodCallHandler { [weak self] call, reply in
       guard let self else {

@@ -22,8 +22,70 @@ class StatusGlyph extends StatelessWidget {
   final double size;
 
   @override
-  Widget build(BuildContext context) =>
-      CustomPaint(size: Size.square(size), painter: _GlyphPainter(state));
+  Widget build(BuildContext context) => state == EyeMood.thinking
+      ? _WorkGlyph(size)
+      : CustomPaint(size: Size.square(size), painter: _GlyphPainter(state));
+}
+
+class _WorkGlyph extends StatefulWidget {
+  const _WorkGlyph(this.size);
+  final double size;
+
+  @override
+  State<_WorkGlyph> createState() => _WorkGlyphState();
+}
+
+class _WorkGlyphState extends State<_WorkGlyph>
+    with SingleTickerProviderStateMixin {
+  late final _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 2010),
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _pulse.stop();
+    } else if (!_pulse.isAnimating) {
+      _pulse.repeat();
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+    size: Size.square(widget.size),
+    painter: _WorkDots(MediaQuery.disableAnimationsOf(context) ? null : _pulse),
+  );
+}
+
+class _WorkDots extends CustomPainter {
+  _WorkDots(this.pulse) : super(repaint: pulse);
+  final Animation<double>? pulse;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint();
+    for (var index = 0; index < 3; index++) {
+      final strength = pulse == null
+          ? .45
+          : math.max(0.0, math.sin(pulse!.value * 2 * math.pi - index * .9));
+      canvas.drawCircle(
+        Offset(size.width * (.5 + (index - 1) * .30), size.height / 2),
+        size.width * (.073 + .056 * strength),
+        paint..color = cyan.withAlpha((75 + 180 * strength).round()),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_WorkDots oldDelegate) => oldDelegate.pulse != pulse;
 }
 
 // The same normalized paths as the Android StatusIcon drawable.
@@ -37,12 +99,6 @@ class _GlyphPainter extends CustomPainter {
     void dot() =>
         path.addOval(Rect.fromCircle(center: const Offset(8, 13), radius: .42));
     switch (state) {
-      case EyeMood.thinking:
-        path
-          ..moveTo(4, 2.5)
-          ..lineTo(13, 8)
-          ..lineTo(4, 13.5)
-          ..close();
       case EyeMood.question:
         path
           ..moveTo(5, 5.1)

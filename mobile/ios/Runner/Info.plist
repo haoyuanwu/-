@@ -26,6 +26,19 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Robot Eyes 使用麦克风聆听你的语音提问。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Robot Eyes 将你的语音转成可编辑的提问文字。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>连接同一网络中的 Robot Eyes 桌面端或你设置的局域网模型。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

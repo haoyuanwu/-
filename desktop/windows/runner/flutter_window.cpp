@@ -17,10 +17,7 @@ constexpr UINT kToggleService = 1;
 constexpr UINT kOpenDashboard = 2;
 constexpr UINT kQuit = 3;
 constexpr UINT kCopyPairing = 4;
-constexpr UINT kCopyWorkBuddy = 5;
-constexpr UINT kCopyOpenCode = 6;
-constexpr UINT kCopyOpenClaw = 7;
-constexpr UINT kCopyGeneric = 8;
+constexpr UINT kCopyAiSetup = 5;
 
 NOTIFYICONDATAW TrayIcon(HWND window) {
   NOTIFYICONDATAW icon{};
@@ -165,10 +162,7 @@ void FlutterWindow::ShowTrayMenu(POINT anchor) {
     const UINT pairing_state = can_copy_pairing_ ? MF_ENABLED : MF_GRAYED;
     const UINT mcp_state = can_copy_mcp_ ? MF_ENABLED : MF_GRAYED;
     AppendMenuW(copy_menu, MF_STRING | pairing_state, kCopyPairing, L"手机配对配置");
-    AppendMenuW(copy_menu, MF_STRING | mcp_state, kCopyWorkBuddy, L"WorkBuddy MCP");
-    AppendMenuW(copy_menu, MF_STRING | mcp_state, kCopyOpenCode, L"OpenCode MCP");
-    AppendMenuW(copy_menu, MF_STRING | mcp_state, kCopyOpenClaw, L"OpenClaw MCP");
-    AppendMenuW(copy_menu, MF_STRING | mcp_state, kCopyGeneric, L"通用 MCP");
+    AppendMenuW(copy_menu, MF_STRING | mcp_state, kCopyAiSetup, L"复制给 AI 配置");
     const UINT copy_state = can_copy_pairing_ || can_copy_mcp_ ? MF_ENABLED : MF_GRAYED;
     if (!AppendMenuW(menu, MF_POPUP | copy_state, reinterpret_cast<UINT_PTR>(copy_menu),
                      L"复制配置")) {
@@ -214,10 +208,7 @@ void FlutterWindow::ShowTrayMenu(POINT anchor) {
   const char* configuration = nullptr;
   switch (command) {
     case kCopyPairing: configuration = "pairing"; break;
-    case kCopyWorkBuddy: configuration = "WorkBuddy"; break;
-    case kCopyOpenCode: configuration = "OpenCode"; break;
-    case kCopyOpenClaw: configuration = "OpenClaw"; break;
-    case kCopyGeneric: configuration = "generic"; break;
+    case kCopyAiSetup: configuration = "aiSetup"; break;
   }
   if (configuration && notification_channel_) {
     notification_channel_->InvokeMethod(

@@ -21,11 +21,6 @@ class AgentMcp {
       'Call set_eye_state when starting or resuming work, waiting for approval, '
       'finishing (DONE), failing (ERROR), or cancelling (STOPPED). '
       'Use the same session ID for all updates of a task.';
-  static const reportingRule =
-      '使用 Robot Eyes 的 set_eye_state 上报任务状态。开始或恢复时传 THINKING，'
-      '等待确认时传 QUESTION，完成时传 DONE，失败退出时传 ERROR，手动取消时传 STOPPED。'
-      '同一任务始终使用同一个 session，并行任务使用不同的 session。'
-      '传 IDLE 可清除该任务的状态。';
   static const _serverInfo = {'name': 'robot-eyes', 'version': '1.0.0'};
   static const _tool = {
     'name': 'set_eye_state',
@@ -54,6 +49,15 @@ class AgentMcp {
   HttpServer? _server;
   String _token = '';
   bool get running => _server != null;
+  ({String name, DateTime at})? _lastReportingVerification;
+  ({String name, DateTime at})? get lastReportingVerification {
+    final verification = _lastReportingVerification;
+    if (verification == null) return null;
+    return (
+      name: nameOf(verification.name) ?? verification.name,
+      at: verification.at,
+    );
+  }
 
   Future<void> start(Directory directory) async {
     final key = File('${directory.path}/desktop-mcp.key');
@@ -94,59 +98,67 @@ class AgentMcp {
     }
     final key = name.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
     for (final known in ['WorkBuddy', 'OpenCode', 'OpenClaw', 'Codex']) {
-      if (key == known.toLowerCase()) return known;
+      final product = known.toLowerCase();
+      if (key == product || key == '${product}mcpclient') return known;
     }
     return name;
   }
 
-  static String url([String? client]) => Uri(
+  static String url() => Uri(
     scheme: 'http',
     host: '127.0.0.1',
     port: port,
     path: '/mcp',
-    queryParameters: client == null ? null : {'client': client},
   ).toString();
 
-  String config(String? client) {
-    final entry = {
-      'url': url(client),
-      'headers': {'Authorization': 'Bearer $_token'},
-    };
-    final config = switch (client) {
-      'OpenCode' => {
-        'mcp': {
-          'servers': {
-            'robot-eyes': {'type': 'remote', 'oauth': false, ...entry},
-          },
-        },
-      },
-      'OpenClaw' => {
-        'mcp': {
-          'servers': {
-            'robot-eyes': {'transport': 'streamable-http', ...entry},
-          },
-        },
-      },
-      _ => {
+  String configuration({bool includeCredential = false}) =>
+      const JsonEncoder.withIndent('  ').convert({
         'mcpServers': {
-          'robot-eyes': {'type': 'streamableHttp', ...entry},
+          'robot-eyes': {
+            'type': 'streamableHttp',
+            'url': url(),
+            'headers': {
+              'Authorization': includeCredential
+                  ? 'Bearer $_token'
+                  : 'Bearer ••••••••',
+            },
+          },
         },
-      },
-    };
-    return const JsonEncoder.withIndent('  ').convert(config);
-  }
+      });
+
+  String setupPrompt(String skill) =>
+      '''
+请在你当前使用的 AI 客户端中配置 Robot Eyes，并实际执行下面的安装和验证步骤。
+
+1. 识别当前客户端和实际运行环境。Robot Eyes 的 MCP 在运行桌面端的同一台电脑上监听回环地址，MCP 客户端需能访问该地址。
+2. 将下方通用配置转换为当前客户端支持的 Streamable HTTP 格式，合并到其用户级 MCP 设置，保留其他服务器和现有设置。复用已有的 robot-eyes 条目。按客户端支持的方式保存 Authorization，密钥只写入 MCP 所需的本机配置或凭据存储。
+3. 将下方文件完整保存为客户端用户级 Skills 目录中的 robot-eyes-reporting/SKILL.md，启用该 Skill，并按客户端支持的方式让它应用于后续任务。如果客户端只有持久规则，将 Skill 正文合并到用户级任务规则。
+4. 用客户端加载 robot-eyes，验证能列出 set_eye_state，并用独立的测试 session 调用 IDLE，确认返回成功。桌面端「桌面 AI MCP」会显示最近验证的客户端和时间。说明安装位置和验证结果。若客户端需要重启、授权或无法访问本机服务，请指出待完成的步骤。答复中不要输出密钥。
+
+通用 MCP 配置
+
+```json
+${configuration(includeCredential: true)}
+```
+
+robot-eyes-reporting/SKILL.md
+
+````markdown
+${skill.trimRight()}
+````
+''';
 
   /// Groups initialized HTTP sessions by client name, independent of task state.
-  List<({String name, int count, DateTime lastSeen})> connectedClients() {
+  List<({String name, DateTime lastSeen})> connectedClients() {
     _prune(DateTime.now());
-    final clients = <String, ({String name, int count, DateTime lastSeen})>{};
+    final clients = <String, ({String name, DateTime lastSeen})>{};
     for (final client in _clients.values) {
       if (!client.ready) continue;
-      final key = client.name.toLowerCase();
+      final productName = client.productName;
+      final key = productName.toLowerCase();
       final previous = clients[key];
       clients[key] = (
-        name: previous?.name ?? client.name,
-        count: (previous?.count ?? 0) + 1,
+        name: previous?.name ?? productName,
         lastSeen: previous != null && previous.lastSeen.isAfter(client.seen)
             ? previous.lastSeen
             : client.seen,
@@ -162,7 +174,7 @@ class AgentMcp {
     final states = <String, String>{};
     _recentlyClosed.removeWhere((_, task) => !task.until.isAfter(now));
     for (final entry in _recentlyClosed.entries) {
-      mergeState(states, entry.key, entry.value.state);
+      mergeState(states, nameOf(entry.key) ?? entry.key, entry.value.state);
     }
     for (final client in _clients.values) {
       if (!client.ready) continue;
@@ -171,7 +183,7 @@ class AgentMcp {
         (state) => client.tasks.values.any((task) => task.state == state),
         orElse: () => 'IDLE',
       );
-      mergeState(states, client.name, state);
+      mergeState(states, client.productName, state);
     }
     return states;
   }
@@ -284,6 +296,7 @@ class AgentMcp {
       final info = params['clientInfo'];
       final clientName =
           nameOf(request.uri.queryParameters['client']) ??
+          nameOf(info is Map ? info['title'] : null) ??
           nameOf(info is Map ? info['name'] : null);
       if (clientName == null || params['protocolVersion'] is! String) {
         _error(
@@ -371,11 +384,12 @@ class AgentMcp {
     } else {
       return;
     }
+    final productName = client.productName;
     if (_recentlyClosed.length >= 64 &&
-        !_recentlyClosed.containsKey(client.name)) {
+        !_recentlyClosed.containsKey(productName)) {
       _recentlyClosed.remove(_recentlyClosed.keys.first);
     }
-    _recentlyClosed[client.name] = (
+    _recentlyClosed[productName] = (
       state: state,
       until: now.add(const Duration(seconds: 30)),
     );
@@ -397,8 +411,10 @@ class AgentMcp {
         error: true,
       );
     }
+    final productName = client.productName;
     _recentlyClosed.removeWhere(
-      (name, _) => name.toLowerCase() == client.name.toLowerCase(),
+      (name, _) =>
+          (nameOf(name) ?? name).toLowerCase() == productName.toLowerCase(),
     );
     client.tasks.removeWhere((_, task) => !task.until.isAfter(now));
     if (state == 'IDLE' || state == 'SLEEP') {
@@ -412,8 +428,12 @@ class AgentMcp {
           : const Duration(seconds: 30);
       client.tasks[task] = (state: state, until: now.add(lifetime));
     }
+    if (!client.reportingVerified) {
+      client.reportingVerified = true;
+      _lastReportingVerification = (name: productName, at: now);
+    }
     onChanged();
-    return _toolResult('${client.name}: $state');
+    return _toolResult('$productName: $state');
   }
 
   Map<String, Object?> _toolResult(String text, {bool error = false}) => {
@@ -451,8 +471,10 @@ class _Client {
   _Client(this.name, this.version, this.seen);
 
   final String name;
+  String get productName => AgentMcp.nameOf(name) ?? name;
   final String version;
   DateTime seen;
   bool ready = false;
+  bool reportingVerified = false;
   final tasks = <String, ({String state, DateTime until})>{};
 }

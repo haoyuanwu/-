@@ -17,7 +17,7 @@ internal object LanMcpSettings {
     private const val PREFS = "lan_mcp"
 
     fun enabled(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        .getBoolean("enabled", false)
+        .getBoolean("enabled", true)
 
     @Synchronized
     fun setEnabled(context: Context, enabled: Boolean) {

@@ -34,6 +34,9 @@ object EyesBus {
     val usage: Usage
         @Synchronized get() = activeDesktop(SystemClock.elapsedRealtime())?.second?.usage ?: localUsage
 
+    val connectedUsage: Usage?
+        @Synchronized get() = activeDesktop(SystemClock.elapsedRealtime())?.second?.usage
+
     @Synchronized
     fun connectedTransports(): List<Transport> {
         val now = SystemClock.elapsedRealtime()

@@ -22,6 +22,7 @@ import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
 class FlutterHostActivity : FlutterActivity() {
+    private var interaction: RobotInteractionBridge? = null
     private var pendingRear: Boolean? = null
     private val rearPermission = Shizuku.OnRequestPermissionResultListener { request, granted ->
         if (request == SHIZUKU_REQUEST) {
@@ -68,7 +69,7 @@ class FlutterHostActivity : FlutterActivity() {
     private fun launchRear(calibrate: Boolean) {
         if (switchingRear) return
         switchingRear = true
-        RearDisplayBridge.launch { error ->
+        RearDisplayBridge.launch(MainActivity.hasRearSurface()) { error ->
             if (error == null) {
                 finishRearSwitch(calibrate, SystemClock.uptimeMillis() + 3000)
             } else {
@@ -93,7 +94,6 @@ class FlutterHostActivity : FlutterActivity() {
 
         switchingRear = false
         if (calibrate) MainActivity.requestRearCalibration()
-        moveTaskToBack(true)
     }
 
     private fun reportRearError(error: String) {
@@ -131,6 +131,7 @@ class FlutterHostActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
+        interaction = RobotInteractionBridge(this, engine.dartExecutor.binaryMessenger)
         engine.platformViewsController.registry.registerViewFactory("com.reareyes/eyes-preview",
             object : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
                 override fun create(context: Context, id: Int, args: Any?): PlatformView =
@@ -144,6 +145,21 @@ class FlutterHostActivity : FlutterActivity() {
             .setMethodCallHandler(::onCall)
     }
 
+    override fun cleanUpFlutterEngine(engine: FlutterEngine) {
+        interaction?.close()
+        interaction = null
+        super.cleanUpFlutterEngine(engine)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        interaction?.onPermissionsResult(requestCode, grantResults)
+    }
+
     override fun onStart() {
         super.onStart()
         RemoteConnection.screenStarted()
@@ -151,6 +167,7 @@ class FlutterHostActivity : FlutterActivity() {
     }
 
     override fun onStop() {
+        interaction?.suspendListening()
         RemoteConnection.screenStopped()
         super.onStop()
     }

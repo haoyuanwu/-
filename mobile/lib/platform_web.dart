@@ -169,3 +169,8 @@ Future<({int status, String body})> request(
     timeout.cancel();
   }
 }
+
+Stream<String> modelChat(Uri url, String token, Map<String, Object> data) =>
+    Stream.error(UnsupportedError('语音对话请使用 Robot Eyes 手机 App。'));
+
+Future<void> cancelModelChat(Uri url, String token) async {}

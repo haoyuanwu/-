@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'agent_mcp.dart';
 import 'codex_status.dart';
+import 'model_connections.dart';
 import 'phone_links.dart';
 import 'tailscale_endpoint.dart';
 import 'web_app.dart';
@@ -27,6 +28,7 @@ class RemoteServer {
   final Directory directory;
   late final webApp = WebApp(Directory('${directory.path}/web'));
   late final phoneLinks = PhoneLinks(directory, _usbPairing);
+  late final modelConnections = ModelConnections(directory);
   final void Function(bool newMessage) onChanged;
   late final agentMcp = AgentMcp(_refreshAgents);
   final _codex = CodexStatus();
@@ -127,6 +129,7 @@ class RemoteServer {
     _refresh?.cancel();
     final server = _server;
     _server = null;
+    modelConnections.stop();
     await agentMcp.stop();
     await server?.close(force: true);
   }
@@ -216,8 +219,12 @@ class RemoteServer {
     response.headers.contentType = ContentType.json;
     response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
     try {
+      final path = request.uri.path;
       final api =
-          request.uri.path == '/status' || request.uri.path == '/messages';
+          path == '/status' ||
+          path == '/messages' ||
+          path == '/ai/models' ||
+          path == '/ai/chat';
       if (!api && await webApp.serve(request)) return;
       if (!api) {
         _reply(response, 404, {'error': 'not_found'});
@@ -227,6 +234,13 @@ class RemoteServer {
         _reply(response, 200, status);
       } else if (request.uri.path == '/messages' && request.method == 'POST') {
         await _receive(request);
+      } else if (path == '/ai/models' && request.method == 'GET') {
+        _reply(response, 200, {'models': modelConnections.publishedModels()});
+      } else if (path == '/ai/chat' && request.method == 'POST') {
+        await modelConnections.chat(request);
+      } else if (path == '/ai/chat' && request.method == 'DELETE') {
+        modelConnections.cancelRequest(request.uri.queryParameters['id']);
+        response.statusCode = HttpStatus.noContent;
       } else {
         _reply(response, 404, {'error': 'not_found'});
       }

@@ -9,7 +9,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'design.dart';
+import 'desk_voice_feedback.dart';
 import 'eye_scene.dart';
+import 'interaction.dart';
+import 'interaction_view.dart';
+import 'model_settings_view.dart';
 import 'remote.dart';
 import 'status_strip.dart';
 import 'platform_io.dart'
@@ -61,6 +65,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final client = RemoteClient();
+  late final interaction = RobotInteraction(client, () => pairing);
   final scene = ValueNotifier<(EyeMood, int)>((EyeMood.idle, 0));
   final telemetry = ValueNotifier(Snapshot());
   late final Timer timer;
@@ -83,6 +88,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    interaction.addListener(_updateScene);
+    unawaited(interaction.initialize());
     timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
     unawaited(load());
   }
@@ -106,7 +113,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     foreground = state == AppLifecycleState.resumed;
-    if (foreground) unawaited(refresh(force: true));
+    if (foreground) {
+      unawaited(refresh(force: true));
+      unawaited(interaction.resume());
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      interaction.pause();
+    }
   }
 
   @override
@@ -114,9 +127,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     timer.cancel();
     previewTimer?.cancel();
+    interaction.removeListener(_updateScene);
+    interaction.dispose();
     scene.dispose();
     telemetry.dispose();
     super.dispose();
+  }
+
+  void _updateScene() {
+    final mood = interaction.mood ?? preview ?? snapshot.state;
+    if (scene.value.$1 != mood) scene.value = (mood, ++revision);
+    interaction.updateActivity(
+      interaction.generating ? EyeMood.thinking : snapshot.state,
+    );
   }
 
   Future<void> refresh({bool force = false}) async {
@@ -156,6 +179,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           last != null &&
           DateTime.now().difference(last) >= const Duration(seconds: 12) &&
           (snapshot.state != EyeMood.idle ||
+              snapshot.links.isNotEmpty ||
               snapshot.five != null ||
               snapshot.week != null ||
               snapshot.agents.isNotEmpty)) {
@@ -166,7 +190,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             remoteState: snapshot.remoteState,
           );
           telemetry.value = snapshot;
-          if (preview == null) scene.value = (snapshot.state, revision);
+          _updateScene();
         });
       }
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -203,8 +227,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           syncTicket = null;
           syncResult = syncSummary(next);
         }
-        if (preview == null) scene.value = (next.state, revision);
+        _updateScene();
       });
+      if (saved?.encode() != pairing?.encode()) interaction.resetConnection();
     } catch (error) {
       if (!mounted || saved != pairing) return;
       setState(() {
@@ -235,13 +260,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       'LAN': '局域网',
       'TAILSCALE': 'Tailscale',
     }[data.links.firstOrNull];
-    final prefix = source == null ? '已同步' : '$source 已同步';
-    String quota(UsageWindow? window) => switch (window?.remaining) {
-      final value? => '$value%',
-      null => '暂无',
-    };
-    return '$prefix · 5 小时剩余 ${quota(data.five)} · 周剩余 ${quota(data.week)}';
+    return source == null ? '已同步' : '$source 已同步';
   }
+
+  List<String> usageLabels(Snapshot data) => [
+    if (data.fiveRemaining case final value?) '5 小时剩余 $value%',
+    if (data.weekRemaining case final value?) '周剩余 $value%',
+  ];
 
   Future<void> refreshNow() async {
     if (syncing) return;
@@ -444,9 +469,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           snapshot = Snapshot();
           addLog(value == null ? '已解除 Tailscale 配对' : '已保存 Tailscale 配对');
           telemetry.value = snapshot;
-          if (preview == null) scene.value = (snapshot.state, revision);
+          _updateScene();
         }
       });
+      interaction.resetConnection();
       unawaited(refresh(force: true));
       return true;
     } catch (_) {
@@ -549,7 +575,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     previewTimer?.cancel();
     setState(() {
       preview = mood;
-      scene.value = (mood, ++revision);
+      scene.value = (interaction.mood ?? mood, ++revision);
     });
     final duration = switch (mood) {
       EyeMood.idle || EyeMood.sleep => sleepSeconds,
@@ -560,7 +586,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           preview = null;
-          scene.value = (snapshot.state, ++revision);
+          _updateScene();
         });
       }
     });
@@ -584,11 +610,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               scene: scene,
               telemetry: telemetry,
               sleepSeconds: sleepSeconds,
+              interaction: kIsWeb ? null : interaction,
             ),
           ),
         );
       }
     } finally {
+      if (interaction.listening) await interaction.cancelRecording();
       if (!kIsWeb) {
         await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
         await SystemChrome.setPreferredOrientations([]);
@@ -713,23 +741,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ),
     child: ClipRRect(
       borderRadius: BorderRadius.circular(18),
-      child: android
-          ? AndroidView(
-              viewType: 'com.reareyes/eyes-preview',
-              layoutDirection: TextDirection.ltr,
-              gestureRecognizers: {
-                Factory<EagerGestureRecognizer>(EagerGestureRecognizer.new),
-              },
-            )
-          : ValueListenableBuilder(
-              valueListenable: scene,
-              builder: (_, value, _) => EyeScene(
+      child: ValueListenableBuilder(
+        valueListenable: scene,
+        child: android
+            ? AndroidView(
+                viewType: 'com.reareyes/eyes-preview',
+                layoutDirection: TextDirection.ltr,
+                gestureRecognizers: {
+                  Factory<EagerGestureRecognizer>(EagerGestureRecognizer.new),
+                },
+              )
+            : null,
+        builder: (_, value, nativePreview) => Stack(
+          fit: StackFit.expand,
+          children: [
+            if (nativePreview != null)
+              Offstage(
+                offstage: interaction.mood != null,
+                child: nativePreview,
+              ),
+            if (nativePreview == null || interaction.mood != null)
+              EyeScene(
                 mood: value.$1,
                 revision: value.$2,
                 sleepSeconds: sleepSeconds,
                 agents: snapshot.agents,
+                connected: snapshot.links.isNotEmpty,
               ),
-            ),
+          ],
+        ),
+      ),
     ),
   );
 
@@ -738,14 +779,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     children: [
       const SectionTitle('AI 工具状态'),
       const SizedBox(height: 8),
-      if (snapshot.agents.isEmpty)
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: Text(
-            '暂无 AI 工具状态',
-            style: TextStyle(color: secondaryInk, fontSize: 13),
-          ),
-        ),
       for (final entry in snapshot.agents.entries)
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -818,12 +851,48 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
               const SizedBox(height: 17),
               hero,
-              if (snapshot.five?.remaining != null ||
-                  snapshot.week?.remaining != null) ...[
+              if (!kIsWeb) ...[
+                InteractionBubbles(interaction, showReply: true),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 5,
+                  children: [
+                    ListenableBuilder(
+                      listenable: interaction,
+                      builder: (context, _) => SpeakButton(
+                        icon: interaction.speechEnabled
+                            ? Icons.mic_none
+                            : Icons.chat_bubble_outline,
+                        onPressed: () => openConversation(
+                          context,
+                          interaction,
+                          record: interaction.speechEnabled,
+                        ),
+                        label: interaction.speechEnabled ? '说话' : 'AI 对话',
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => openModelSettings(context, interaction),
+                      child: const Text('模型设置'),
+                    ),
+                    TextButton(
+                      onPressed: () =>
+                          openInteractionSettings(context, interaction),
+                      child: const Text('语音与提醒'),
+                    ),
+                    TextButton(
+                      onPressed: () => openRecentNotices(context, interaction),
+                      child: const Text('最近提醒'),
+                    ),
+                  ],
+                ),
+              ],
+              if (usageLabels(snapshot) case final labels
+                  when labels.isNotEmpty) ...[
                 const SizedBox(height: 6),
                 Text(
-                  '5 小时剩余 ${snapshot.five?.remaining?.toString() ?? '—'}${snapshot.five?.remaining == null ? '' : '%'}'
-                  ' · 本周剩余 ${snapshot.week?.remaining?.toString() ?? '—'}${snapshot.week?.remaining == null ? '' : '%'}',
+                  labels.join(' · '),
                   style: const TextStyle(fontSize: 12, color: secondaryInk),
                 ),
               ],
@@ -906,8 +975,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               control('远程连接', remoteConnection),
               const SizedBox(height: 8),
               control('发消息', message),
-              const SizedBox(height: 18),
-              agentStatuses(),
+              if (snapshot.agents.isNotEmpty) ...[
+                const SizedBox(height: 18),
+                agentStatuses(),
+              ],
               const SizedBox(height: 18),
               const SectionTitle('自动睡眠'),
               const SizedBox(height: 8),
@@ -973,10 +1044,12 @@ class DeskPage extends StatefulWidget {
     required this.scene,
     required this.telemetry,
     required this.sleepSeconds,
+    this.interaction,
   });
   final ValueListenable<(EyeMood, int)> scene;
   final ValueListenable<Snapshot> telemetry;
   final int sleepSeconds;
+  final RobotInteraction? interaction;
 
   @override
   State<DeskPage> createState() => _DeskPageState();
@@ -985,6 +1058,7 @@ class DeskPage extends StatefulWidget {
 class _DeskPageState extends State<DeskPage> {
   Timer? dimTimer;
   bool visible = false;
+  bool _inlineVoice = false;
   PointerDownEvent? _tapDown;
   PointerUpEvent? _previousTap;
 
@@ -1081,13 +1155,14 @@ class _DeskPageState extends State<DeskPage> {
                       fullScreen: true,
                       sleepSeconds: widget.sleepSeconds,
                       agents: data.agents,
+                      connected: data.links.isNotEmpty,
                     ),
                   ),
                 ),
               ),
               Positioned(
                 top: insets.top + 16,
-                left: insets.left + 16,
+                right: insets.right + 16,
                 child: IgnorePointer(
                   child: fade(
                     ValueListenableBuilder(
@@ -1095,27 +1170,105 @@ class _DeskPageState extends State<DeskPage> {
                       builder: (_, data, _) => Row(
                         spacing: 12,
                         children: [
-                          _UsageRing(
-                            '5 小时',
-                            data.five?.remaining,
-                            cyan,
-                            radius,
-                          ),
-                          _UsageRing(
-                            '本周',
-                            data.week?.remaining,
-                            violet,
-                            radius,
-                          ),
+                          if (data.fiveRemaining case final value?)
+                            _UsageRing('5 小时', value, cyan, radius),
+                          if (data.weekRemaining case final value?)
+                            _UsageRing('本周', value, violet, radius),
                         ],
                       ),
                     ),
                   ),
                 ),
               ),
+              if (widget.interaction case final interaction?) ...[
+                ValueListenableBuilder(
+                  valueListenable: widget.telemetry,
+                  builder: (context, data, _) {
+                    final showUsage =
+                        visible &&
+                        (data.fiveRemaining != null ||
+                            data.weekRemaining != null);
+                    final quotaLabelHeight = MediaQuery.textScalerOf(context)
+                        .scale(math.min(11.0, radius * .63));
+                    return Positioned(
+                      top:
+                          insets.top +
+                          16 +
+                          (showUsage
+                              ? radius * 2 + quotaLabelHeight * 1.5 + 12
+                              : 0),
+                      right: insets.right + 16,
+                      width: math.min(330, constraints.maxWidth * .50),
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: constraints.maxHeight * .48,
+                        ),
+                        child: SingleChildScrollView(
+                          child: InteractionBubbles(
+                            interaction,
+                            showReply: !_inlineVoice,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+                if (_inlineVoice)
+                  Positioned(
+                    bottom:
+                        insets.bottom + (constraints.maxWidth < 600 ? 64 : 16),
+                    left: insets.left,
+                    right: insets.right,
+                    child: IgnorePointer(
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            maxWidth: math.min(344, constraints.maxWidth * .54),
+                          ),
+                          child: ListenableBuilder(
+                            listenable: interaction,
+                            builder: (_, _) => DeskVoiceFeedback(interaction),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                Positioned(
+                  bottom: insets.bottom + 16,
+                  right: insets.right + 16,
+                  child: ListenableBuilder(
+                    listenable: interaction,
+                    builder: (context, _) => DeskVoiceButton(
+                      listening: interaction.listening,
+                      speechEnabled: interaction.speechEnabled,
+                      onPressed: interaction.finishingRecording
+                          ? null
+                          : () {
+                              if (!interaction.speechEnabled) {
+                                unawaited(
+                                  openConversation(context, interaction),
+                                );
+                              } else if (interaction.listening) {
+                                unawaited(
+                                  interaction.stopRecording(sendAfter: true),
+                                );
+                              } else {
+                                if (!_inlineVoice) {
+                                  setState(() => _inlineVoice = true);
+                                }
+                                unawaited(
+                                  interaction.startRecording(sendAfter: true),
+                                );
+                              }
+                            },
+                    ),
+                  ),
+                ),
+              ],
               Positioned(
                 bottom: insets.bottom + 16,
-                right: insets.right + 16,
+                left: widget.interaction == null ? null : insets.left + 16,
+                right: widget.interaction == null ? insets.right + 16 : null,
                 child: ExcludeFocus(
                   excluding: !visible,
                   child: IgnorePointer(
@@ -1150,7 +1303,7 @@ class _DeskPageState extends State<DeskPage> {
 class _UsageRing extends StatelessWidget {
   const _UsageRing(this.label, this.remaining, this.accent, this.radius);
   final String label;
-  final int? remaining;
+  final int remaining;
   final Color accent;
   final double radius;
 
@@ -1165,7 +1318,7 @@ class _UsageRing extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             CircularProgressIndicator(
-              value: (remaining ?? 0) / 100,
+              value: remaining / 100,
               strokeWidth: radius * .075,
               backgroundColor: borderColor,
               color: accent,
@@ -1173,7 +1326,7 @@ class _UsageRing extends StatelessWidget {
             ),
             Center(
               child: Text(
-                remaining == null ? '—' : '$remaining%',
+                '$remaining%',
                 style: TextStyle(
                   fontSize: radius * .59,
                   fontWeight: FontWeight.w600,

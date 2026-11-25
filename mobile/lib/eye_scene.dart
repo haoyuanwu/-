@@ -17,12 +17,14 @@ class EyeScene extends StatefulWidget {
     this.revision = 0,
     this.sleepSeconds = 90,
     this.agents = const {},
+    this.connected = false,
   });
   final EyeMood mood;
   final bool fullScreen;
   final int revision;
   final int sleepSeconds;
   final Map<String, EyeMood> agents;
+  final bool connected;
 
   @override
   State<EyeScene> createState() => _EyeSceneState();
@@ -38,8 +40,7 @@ class _EyeSceneState extends State<EyeScene>
     super.initState();
     model = _Animation(widget.mood)
       ..sleepSeconds = widget.sleepSeconds
-      ..desk = widget.fullScreen
-      ..namedBadges = widget.agents.isNotEmpty;
+      ..desk = widget.fullScreen;
     ticker = createTicker((elapsed) => model.step(elapsed.inMilliseconds))
       ..start();
   }
@@ -55,7 +56,6 @@ class _EyeSceneState extends State<EyeScene>
     super.didUpdateWidget(oldWidget);
     model.sleepSeconds = widget.sleepSeconds;
     model.desk = widget.fullScreen;
-    model.namedBadges = widget.agents.isNotEmpty;
     if (oldWidget.mood != widget.mood ||
         oldWidget.revision != widget.revision) {
       model.update(widget.mood);
@@ -77,8 +77,10 @@ class _EyeSceneState extends State<EyeScene>
         _EyeGesture: GestureRecognizerFactoryWithHandlers<_EyeGesture>(
           _EyeGesture.new,
           (gestures) {
-            gestures.onDown = (event) => model.down(event.localPosition);
-            gestures.onMove = (event) => model.move(event.localPosition);
+            gestures.onDown = (event) =>
+                model.down(event.localPosition, event.timeStamp.inMilliseconds);
+            gestures.onMove = (event) =>
+                model.move(event.localPosition, event.timeStamp.inMilliseconds);
             gestures.onUp = (event) =>
                 model.up(event.localPosition, widget.fullScreen);
             gestures.onCancel = model.cancel;
@@ -104,22 +106,16 @@ class _EyeSceneState extends State<EyeScene>
           return Stack(
             fit: StackFit.expand,
             children: [
-              RepaintBoundary(
-                child: CustomPaint(
-                  painter: _Painter(model, bottomInset: insets.bottom),
-                ),
-              ),
-              if (badgeHeight >= 10)
+              RepaintBoundary(child: CustomPaint(painter: _Painter(model))),
+              if (badgeHeight >= 10 &&
+                  (widget.connected || widget.agents.isNotEmpty))
                 if (widget.fullScreen)
                   Positioned(
                     left: insets.left + 16,
                     width: size.width * .26,
-                    top: insets.top + math.min(76, size.height * .22),
+                    top: insets.top + 16,
                     bottom: insets.bottom + math.min(64, size.height * .20),
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: badges,
-                    ),
+                    child: Align(alignment: Alignment.topLeft, child: badges),
                   )
                 else
                   Positioned(
@@ -196,15 +192,17 @@ class _Animation extends ChangeNotifier {
     : expression = status == EyeMood.stopped ? EyeMood.idle : status;
 
   static const _peekDuration = 1730;
+  static const _tapDuration = 850;
+  static const _releaseDuration = 390;
   final random = math.Random();
   EyeMood status;
   EyeMood expression;
   bool motion = true;
   bool desk = false;
-  bool namedBadges = false;
   int time = 0;
   int expressionAt = 0;
   int statusAt = 0;
+  int? donePresentedAt;
   int lastInteractionAt = 0;
   int sleepSeconds = 90;
   int? localSleepAt;
@@ -225,17 +223,24 @@ class _Animation extends ChangeNotifier {
   double tilt = 0;
   Size sceneSize = Size.zero;
   Offset touch = Offset.zero;
+  Offset touchVelocity = Offset.zero;
+  int touchEventAt = 0;
+  int touchMovedAt = 0;
   Offset tapOrigin = Offset.zero;
   bool tapMoved = false;
   Offset stillAnchor = Offset.zero;
   int? pressedAt;
+  bool interactivePress = false;
+  bool sleepingPress = false;
   int stillAt = 0;
   bool held = false;
   bool puzzledAtAnchor = false;
   int puzzledUntil = 0;
   int? tapAt;
   int? releaseAt;
-  bool tapGreets = false;
+  bool tapWinks = false;
+  double tapSide = 0;
+  bool followingTouch = false;
   int? firstDeepTap;
   ({int at, bool wake, double x})? peek;
   ({int at, bool wake, double x})? queuedPeek;
@@ -246,12 +251,12 @@ class _Animation extends ChangeNotifier {
   _Face? morphFrom;
 
   void update(EyeMood value) {
+    final interacting = hasTouchReaction;
     status = value;
     statusAt = time;
+    donePresentedAt = null;
     lastInteractionAt = time;
     localSleepAt = null;
-    tapAt = null;
-    releaseAt = null;
     firstDeepTap = null;
     peek = null;
     queuedPeek = null;
@@ -260,17 +265,28 @@ class _Animation extends ChangeNotifier {
     idleMoodAt = time + _range(10000, 16000);
     nextBlink = time + _range(1900, 4000);
     thought = null;
-    _change(value == EyeMood.stopped ? EyeMood.idle : value);
+    if (!interacting) _change(value == EyeMood.stopped ? EyeMood.idle : value);
     notifyListeners();
   }
 
   int _range(int low, int high) => low + random.nextInt(high - low);
 
-  void down(Offset point) {
+  bool get hasTouchReaction =>
+      (pressedAt != null && interactivePress) ||
+      (tapAt != null && time - tapAt! < _tapDuration) ||
+      (releaseAt != null && time - releaseAt! < _releaseDuration);
+
+  void down(Offset point, int eventAt) {
     if (!sleeping) lastInteractionAt = time;
     pressedAt = time;
+    sleepingPress = sleeping;
+    interactivePress =
+        !sleepingPress && status != EyeMood.question && status != EyeMood.error;
     stillAt = time;
     touch = tapOrigin = stillAnchor = point;
+    touchVelocity = Offset.zero;
+    touchEventAt = eventAt;
+    touchMovedAt = time;
     tapMoved = false;
     tapAt = releaseAt = null;
     held = false;
@@ -278,7 +294,20 @@ class _Animation extends ChangeNotifier {
     puzzledUntil = 0;
   }
 
-  void move(Offset point) {
+  void move(Offset point, int eventAt) {
+    if (pressedAt == null) return;
+    final delta = math.max(1, eventAt - touchEventAt);
+    touchVelocity = Offset.lerp(
+      touchVelocity,
+      (point - touch) / delta.toDouble(),
+      1 - math.exp(-delta / 36),
+    )!;
+    touchEventAt = eventAt;
+    touchMovedAt = time;
+    _positionTouch(point);
+  }
+
+  void _positionTouch(Offset point) {
     touch = point;
     if ((point - tapOrigin).distance > kTouchSlop) tapMoved = true;
     if ((point - stillAnchor).distance > kTouchSlop) {
@@ -290,15 +319,24 @@ class _Animation extends ChangeNotifier {
 
   void cancel() {
     pressedAt = null;
+    interactivePress = false;
+    sleepingPress = false;
     held = false;
   }
 
   void up(Offset point, bool showParticles) {
-    move(point);
-    final duration = time - (pressedAt ?? time);
+    final start = pressedAt;
+    if (start == null) return;
+    _positionTouch(point);
+    final duration = time - start;
     pressedAt = null;
-    if (duration >= 500 || held) {
-      if (!sleeping) releaseAt = time;
+    final canReact = interactivePress;
+    final canWake = sleepingPress && sleeping;
+    interactivePress = false;
+    sleepingPress = false;
+    if (!canReact && !canWake) return;
+    if (duration >= 500 || held || tapMoved) {
+      if (canReact && motion) releaseAt = time;
       held = false;
       return;
     }
@@ -329,8 +367,7 @@ class _Animation extends ChangeNotifier {
         particles.removeRange(0, particles.length - 60);
       }
     }
-    if (status == EyeMood.question) return;
-    if (sleeping) {
+    if (canWake) {
       if (tapMoved) return;
       if (peek?.wake == true || queuedPeek != null) return;
       final first = firstDeepTap;
@@ -348,7 +385,7 @@ class _Animation extends ChangeNotifier {
       firstDeepTap = shouldWake ? null : time;
     } else {
       tapAt = time;
-      tapGreets = random.nextBool();
+      tapWinks = random.nextInt(4) == 0;
     }
   }
 
@@ -400,8 +437,8 @@ class _Animation extends ChangeNotifier {
     final start = pressedAt;
     final tap = tapAt;
     final release = releaseAt;
-    final canReact = base != EyeMood.question && base != EyeMood.sleep;
-    if (canReact && start != null) {
+    var attention = 1.0;
+    if (start != null && interactivePress) {
       if (!held && time - start >= 500) {
         held = true;
         stillAt = time;
@@ -413,25 +450,20 @@ class _Animation extends ChangeNotifier {
       puzzling = held && time < puzzledUntil;
       next = puzzling
           ? EyeMood.question
-          : held
+          : held || tapMoved
           ? EyeMood.focus
           : EyeMood.idle;
       tracking = true;
-      compress = held;
-    } else if (canReact && release != null && time - release < 440) {
+      compress = true;
+    } else if (release != null && time - release < _releaseDuration) {
       next = EyeMood.focus;
       tracking = compress = true;
-    } else if (canReact &&
-        tap != null &&
-        time - tap < (tapGreets ? 5400 : 4000)) {
-      final age = time - tap;
-      tracking = age < 2000 || (age >= 2500 && age < 3000);
-      compress = tracking;
-      next = age < 3000
-          ? EyeMood.idle
-          : age < 4000
-          ? EyeMood.question
-          : EyeMood.hello;
+      final phase = (time - release) / _releaseDuration;
+      attention = math.cos(phase * math.pi * 1.35) * (1 - phase) * (1 - phase);
+    } else if (tap != null && time - tap < _tapDuration) {
+      tracking = compress = true;
+      next = EyeMood.idle;
+      if (motion) attention = 1 - _ease((time - tap - 330) / 520);
     } else if (base == EyeMood.idle && motion) {
       if (time >= idleMoodAt) {
         idleMood = [
@@ -455,27 +487,42 @@ class _Animation extends ChangeNotifier {
         glanceAt = glanceEnd + _range(2200, 4300);
       }
     }
+    if (next == EyeMood.done && status == EyeMood.done) {
+      donePresentedAt ??= followingTouch ? time : statusAt;
+    }
+    followingTouch = tracking;
     _change(next);
     final face = _frame(sceneSize, desk);
     final centered = Offset(
       ((touch.dx - face.left) / math.max(1, face.width) - .5).clamp(-.65, .65),
       ((touch.dy - face.top) / math.max(1, face.height) -
               .445 -
-              (held ? .075 : 0))
+              (next == EyeMood.focus ? .075 : 0))
           .clamp(-.55, .65),
+    );
+    tapSide = centered.dx;
+    final lead = motion && next == EyeMood.focus
+        ? 78 * math.exp(-(time - touchMovedAt) / 110)
+        : 0.0;
+    final predicted = Offset(
+      (touchVelocity.dx * lead / math.max(1, face.width)).clamp(-.18, .18),
+      (touchVelocity.dy * lead / math.max(1, face.height)).clamp(-.15, .15),
     );
     final idleGlance = base == EyeMood.idle && time < glanceEnd
         ? glance
         : Offset.zero;
-    final strength = held || puzzling ? .90 : .68;
+    final strength = next == EyeMood.focus || puzzling ? .90 : .68;
     final target = tracking
         ? Offset(
-            (centered.dx * .36).clamp(-.159, .159) * strength,
-            (centered.dy * .40).clamp(-.08, .19) * strength,
+            (centered.dx * .36).clamp(-.159, .159) * strength * attention,
+            (centered.dy * .40).clamp(-.08, .19) * strength * attention,
           )
         : Offset(idleGlance.dx * .082, idleGlance.dy * .063);
     final pupilTarget = tracking
-        ? Offset(centered.dx * 1.58, centered.dy * 1.7)
+        ? Offset(
+            (centered.dx + predicted.dx) * 1.58 * attention,
+            (centered.dy + predicted.dy) * 1.7 * attention,
+          )
         : next == EyeMood.idea
         ? const Offset(0, -.18)
         : idleGlance;
@@ -495,12 +542,12 @@ class _Animation extends ChangeNotifier {
       gaze = Offset.lerp(
         gaze,
         target,
-        motion ? 1 - math.exp(-elapsed / 90) : 1,
+        motion ? 1 - math.exp(-elapsed / (tracking ? 105 : 90)) : 1,
       )!;
       pupil = Offset.lerp(
         pupil,
         pupilTarget,
-        motion ? 1 - math.exp(-elapsed / 100) : 1,
+        motion ? 1 - math.exp(-elapsed / (tracking ? 38 : 155)) : 1,
       )!;
     }
     final distance = _unit(
@@ -512,23 +559,35 @@ class _Animation extends ChangeNotifier {
     );
     spacing = _mix(
       spacing,
-      compress ? _mix(.143, .18, distance) : .18,
+      compress
+          ? _mix(.18, _mix(.143, .18, distance), math.max(0, attention))
+          : .18,
       motion ? 1 - math.exp(-elapsed / 100) : 1,
     );
     final age = time - expressionAt;
+    final doneAge = status == EyeMood.done
+        ? time - (donePresentedAt ?? statusAt)
+        : age;
     final turn = age % 15800 - 11000;
     final angle = switch (expression) {
       EyeMood.done =>
-        math.sin((age - 270) / 860 * 2 * math.pi) *
-            .112 *
-            _pulse(age - 270, 1800),
+        math.sin((doneAge - 190) / 620 * 2 * math.pi) *
+            .092 *
+            _pulse(doneAge - 190, 620),
       EyeMood.sleep =>
         (age ~/ 15800).isEven
             ? -.148 * _pulse(turn, 3800)
             : .148 * _pulse(turn, 3800),
       _ => 0.0,
     };
-    tilt = _mix(tilt, motion ? angle : 0, 1 - math.exp(-elapsed / 54));
+    final followTilt = tracking
+        ? (centered.dx * .14 + predicted.dx * .244) * attention
+        : 0.0;
+    tilt = _mix(
+      tilt,
+      motion ? angle + followTilt : 0,
+      1 - math.exp(-elapsed / 54),
+    );
     particles.removeWhere(
       (particle) => time - particle.at >= particle.duration,
     );
@@ -575,8 +634,6 @@ class _Animation extends ChangeNotifier {
 
   double blink() {
     if (!motion) return 1;
-    final release = releaseAt;
-    if (release != null && time - release < 440) return _double(time - release);
     final look = thought;
     if (look != null) {
       final moveBlink = look.moveBlink;
@@ -723,10 +780,9 @@ Rect _frame(Size size, bool desk) {
 }
 
 class _Painter extends CustomPainter {
-  _Painter(this.model, {required this.bottomInset}) : super(repaint: model);
+  _Painter(this.model) : super(repaint: model);
 
   final _Animation model;
-  final double bottomInset;
   static const palette = {
     EyeMood.thinking: [0xffaff7f5, 0xff52dce9, 0xff3588eb],
     EyeMood.question: [0xffffe6a0, 0xffffc161, 0xffff7845],
@@ -774,6 +830,18 @@ class _Painter extends CustomPainter {
       switch (expression) {
         case EyeMood.stopped:
         case EyeMood.idle:
+          final tap = model.tapAt;
+          final age = tap == null ? _Animation._tapDuration : model.time - tap;
+          if (model.motion &&
+              model.followingTouch &&
+              age < _Animation._tapDuration &&
+              model.tapSide * side >= 0 &&
+              (model.tapSide != 0 || side > 0)) {
+            final near = _ease((model.tapSide.abs() - .08) / .37);
+            final wink = model.tapWinks ? .54 * _pulse(age - 420, 260) : 0.0;
+            final squint = math.max(near * .28 * _pulse(age, 530), wink);
+            return open(y, .275, .432 * (1 - squint), openness: blink);
+          }
           return open(y, .275, .432);
         case EyeMood.thinking:
           return open(y, .30, .405);
@@ -804,13 +872,19 @@ class _Painter extends CustomPainter {
           );
           return largeEye.mix(smallEye, side < 0 ? 1 - small : small);
         case EyeMood.done:
-          return _Eye(
+          final crescent = _Eye(
             Offset(x, y + .07 - swell * .037),
             .148 + swell * .007,
             .051,
             bend: .286 + swell * .028,
             crescent: 1,
           );
+          final doneAge =
+              model.time - (model.donePresentedAt ?? model.statusAt);
+          final pop = model.motion && model.status == EyeMood.done
+              ? _ease(doneAge / 105) * (1 - _ease((doneAge - 150) / 290))
+              : 0.0;
+          return crescent.mix(open(y - .016, .32, .49, openness: 1), pop);
         case EyeMood.error:
           final shake = model.motion
               ? math.sin(age / 26) * (1 - _unit(age / 410)) * .021
@@ -864,7 +938,10 @@ class _Painter extends CustomPainter {
     final expression = model.expression;
     var face = _face(expression, model.blink(), w / h);
     final age = model.time - model.expressionAt;
-    final progress = model.motion ? _ease(age / 320) : 1.0;
+    final morphDuration = expression == EyeMood.done || model.followingTouch
+        ? 145
+        : 275;
+    final progress = model.motion ? _ease(age / morphDuration) : 1.0;
     final previous = model.morphFrom;
     if (previous != null && progress < 1) face = previous.mix(face, progress);
     final peek = model.peek;
@@ -907,15 +984,6 @@ class _Painter extends CustomPainter {
     _details(canvas, expression, face.colors[0], w, h, age, progress);
     canvas.restore();
     _drawParticles(canvas, h);
-    if (model.desk && expression == EyeMood.thinking) {
-      _loading(
-        canvas,
-        Offset(size.width / 2, size.height - bottomInset - 24),
-        16,
-        math.min(h, 480) * .62,
-        face.colors[0],
-      );
-    }
   }
 
   void _eye(
@@ -1374,14 +1442,7 @@ class _Painter extends CustomPainter {
     int age,
     double progress,
   ) {
-    if (mood == EyeMood.thinking) {
-      if (model.desk) return;
-      final badgeHeight = math.min(h * .085, 17.0);
-      final y = model.namedBadges
-          ? math.min(h * .765, h * .86 - badgeHeight * 1.67)
-          : h * .765;
-      _loading(canvas, Offset(w * .5, y), w * .065, h, color);
-    } else if (mood == EyeMood.question) {
+    if (mood == EyeMood.question) {
       final small = model.time < model.puzzledUntil && model.pressedAt != null
           ? _ease((model.pupil.dx + .44) / .88)
           : 1.0;
@@ -1423,13 +1484,18 @@ class _Painter extends CustomPainter {
         h * .083,
         color.withAlpha(100),
       );
-    } else if (mood == EyeMood.done && model.motion && age < 720) {
-      final t = _unit(age / 720);
+    } else if (mood == EyeMood.done && model.motion) {
+      final doneAge = model.status == EyeMood.done
+          ? model.time - (model.donePresentedAt ?? model.statusAt)
+          : age;
+      if (doneAge >= 720) return;
+      final t = _unit(doneAge / 720);
       for (final side in [-1, 1]) {
         canvas.drawCircle(
           Offset(w * (.5 + side * (.28 + t * .12)), h * (.33 - t * .18)),
           h * (.01 + t * .012),
-          Paint()..color = color.withAlpha((200 * _pulse(age, 720)).round()),
+          Paint()
+            ..color = color.withAlpha((200 * _pulse(doneAge, 720)).round()),
         );
       }
     }
@@ -1497,27 +1563,6 @@ class _Painter extends CustomPainter {
     painter.dispose();
   }
 
-  void _loading(
-    Canvas canvas,
-    Offset center,
-    double spacing,
-    double scale,
-    Color color,
-  ) {
-    final paint = Paint();
-    for (var i = 0; i < 3; i++) {
-      final signal = model.motion
-          ? math.max(0.0, math.sin(model.time / 320 - i * .9))
-          : .45;
-      canvas.drawCircle(
-        center + Offset((i - 1) * spacing, 0),
-        scale * (.012 + .009 * signal),
-        paint..color = color.withAlpha((75 + 180 * signal).round()),
-      );
-    }
-  }
-
   @override
-  bool shouldRepaint(_Painter oldDelegate) =>
-      model != oldDelegate.model || bottomInset != oldDelegate.bottomInset;
+  bool shouldRepaint(_Painter oldDelegate) => model != oldDelegate.model;
 }
