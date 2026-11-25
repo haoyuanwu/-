@@ -11,16 +11,7 @@
 
 ### 换电脑后使用同一 Android 签名
 
-从当前电脑私下复制 `robot-eyes.jks` 和 `key.properties` 到新电脑的 `mobile/android`。也可以用单独保管的 `robot-eyes-signing.agekey` 解开仓库里的 [加密签名备份](android/robot-eyes-signing.tar.gz.age)。
-
-安装 [age](https://github.com/FiloSottile/age#installation) 后，在仓库的 `mobile/android` 目录运行以下命令，并替换解密密钥的路径。`tar` 的 `-k` 会保留已有文件，恢复成功后删除临时的 `robot-eyes-signing.tar.gz`。
-
-```sh
-age --decrypt --identity /path/to/robot-eyes-signing.agekey --output robot-eyes-signing.tar.gz robot-eyes-signing.tar.gz.age
-tar -xkf robot-eyes-signing.tar.gz
-```
-
-确认 `key.properties` 中的 `storeFile=robot-eyes.jks`，再运行 Flutter Manager 或 `flutter run`。Debug、Profile 和 Release 都会使用同一签名证书。缺少签名配置时，Debug 和 Profile 使用该电脑的默认调试签名，Release 生成未签名产物。
+拉取 `main` 后，在 Flutter Manager 导入 `mobile` 并运行 Android，或在 `mobile` 运行 `flutter run`。Gradle 会读取仓库中的 `mobile/android/key.properties` 和 `mobile/android/robot-eyes.jks`。Debug、Profile 和 Release 都使用同一张签名证书，可以覆盖安装到已有相同签名的版本。
 
 ## AI 对话与手机提醒
 
