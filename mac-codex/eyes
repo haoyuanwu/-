@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Connect to Robot Eyes over an authorized ADB transport."""
+from datetime import date, datetime, timedelta
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import ProxyHandler, build_opener
+
+APP = "com.reareyes.app"
+PORT = 8788
+STATES = {"THINKING", "QUESTION", "DONE", "ERROR", "STOPPED", "SLEEP", "IDLE"}
+INPUT_TOOLS = {"request_user_input", "request_user_input_async"}
+QUESTION_REPLY_TAG = "<send_user_message_question_reply>"
+ADB = shutil.which("adb") or str(Path.home() / "Library/Android/sdk/platform-tools/adb")
+HTTP = build_opener(ProxyHandler({}))
+
+
+def adb(*args):
+    try:
+        result = subprocess.run([ADB, *args], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("ADB 响应超时，请检查 USB 或无线调试连接") from error
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ADB 命令失败")
+    return result.stdout.strip()
+
+
+def phone():
+    devices = []
+    for line in adb("devices", "-l").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device" and not fields[0].startswith("emulator-"):
+            devices.append((fields[0], any(field.startswith("usb:") for field in fields[2:])))
+
+    preferred = os.environ.get("ANDROID_SERIAL")
+    if preferred:
+        if any(serial == preferred for serial, _ in devices):
+            return preferred
+        raise RuntimeError("ANDROID_SERIAL 指定的设备未连接或未授权")
+    if not devices:
+        raise RuntimeError("未找到已授权的手机，请连接 USB 或检查无线调试")
+    if len(devices) == 1:
+        return devices[0][0]
+
+    # A paired phone can appear under both a USB serial and a Wi-Fi endpoint.
+    devices.sort(key=lambda device: not device[1])
+    hardware_serials = {
+        adb("-s", serial, "shell", "getprop", "ro.serialno") for serial, _ in devices
+    }
+    if len(hardware_serials) == 1 and "" not in hardware_serials:
+        return devices[0][0]
+    raise RuntimeError("连接了多台设备，请用 ANDROID_SERIAL 指定手机")
+
+
+def forward_url(serial):
+    for line in adb("forward", "--list").splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == serial and fields[1].startswith("tcp:") and fields[2] == f"tcp:{PORT}":
+            return f"http://127.0.0.1:{fields[1].split(':', 1)[1]}"
+    local_port = int(adb("-s", serial, "forward", "tcp:0", f"tcp:{PORT}"))
+    return f"http://127.0.0.1:{local_port}"
+
+
+def request(url, endpoint):
+    with HTTP.open(url + endpoint, timeout=2) as response:
+        return response.read().decode().strip()
+
+
+def codex_usage():
+    codex = shutil.which("codex")
+    if codex is None:
+        raise RuntimeError("PATH 中找不到 codex，无法读取用量")
+    with subprocess.Popen([codex, "app-server", "--listen", "stdio://"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as server:
+        try:
+            def send(message):
+                server.stdin.write(json.dumps(message).encode() + b"\n")
+                server.stdin.flush()
+
+            deadline = time.monotonic() + 8
+            buffered = b""
+
+            def receive(request_id):
+                nonlocal buffered
+                while time.monotonic() < deadline:
+                    if b"\n" not in buffered:
+                        readable, _, _ = select.select([server.stdout], [], [], max(0, deadline - time.monotonic()))
+                        if not readable:
+                            break
+                        chunk = os.read(server.stdout.fileno(), 8192)
+                        if not chunk:
+                            break
+                        buffered += chunk
+                        continue
+                    line, buffered = buffered.split(b"\n", 1)
+                    message = json.loads(line)
+                    if message.get("id") == request_id:
+                        if "error" in message:
+                            raise RuntimeError("Codex 未能提供账号用量，请检查登录状态")
+                        return message["result"]
+                raise RuntimeError("读取 Codex 用量超时")
+
+            send({"id": 1, "method": "initialize",
+                  "params": {"clientInfo": {"name": "reareyes", "version": "0.2"}}})
+            receive(1)
+            send({"method": "initialized"})
+            send({"id": 2, "method": "account/rateLimits/read"})
+            result = receive(2)
+        finally:
+            if server.poll() is None:
+                server.kill()
+
+    # 只读取 Codex 主限额，并按窗口时长匹配。缺失的数据不当作 0%。
+    limits = (result.get("rateLimitsByLimitId") or {}).get("codex")
+    if limits is None:
+        limits = result.get("rateLimits") or {}
+    return format_usage(limits)
+
+
+def format_usage(limits, logged=False):
+    values = {"five": "-", "week": "-", "fiveReset": "-", "weekReset": "-"}
+    for window in (limits.get("primary"), limits.get("secondary")):
+        if not window:
+            continue
+        name = {300: "five", 10080: "week"}.get(window.get("window_minutes" if logged else "windowDurationMins"))
+        used = window.get("used_percent" if logged else "usedPercent")
+        if name and isinstance(used, (int, float)) and 0 <= used <= 100:
+            values[name] = round(used)
+            reset = window.get("resets_at" if logged else "resetsAt")
+            if isinstance(reset, int) and reset > 0:
+                values[name + "Reset"] = reset
+    return values
+
+
+class DesktopSnapshot:
+    """Read only turn lifecycle and quota events written by local Codex sessions."""
+
+    def __init__(self):
+        self.sessions = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+        self.files = {}
+
+    def read(self):
+        recent = []
+        for day in (date.today(), date.today() - timedelta(days=1)):
+            for path in (self.sessions / day.strftime("%Y/%m/%d")).glob("rollout-*.jsonl"):
+                try:
+                    recent.append((path.stat().st_mtime, path))
+                except OSError:
+                    continue
+        recent.sort(reverse=True)
+        paths = {path: modified for modified, path in recent[:24]}
+        for path, record in self.files.items():
+            if path not in paths and record.get("requests"):
+                try:
+                    paths[path] = path.stat().st_mtime
+                except OSError:
+                    pass
+        self.files = {path: record for path, record in self.files.items() if path in paths}
+        for path, modified in paths.items():
+            self.read_file(path, modified)
+
+        now = time.time()
+        records = list(self.files.values())
+        active = [record for record in records if record["state"] == "THINKING"
+                  and now - record["modified"] < 900]
+        latest = max(records, key=lambda record: record["event_time"], default=None)
+        state = "THINKING" if active else "SLEEP"
+        if any(record.get("requests") for record in records):
+            state = "QUESTION"
+        elif not active and latest and now - latest["event_time"] < 30:
+            state = latest["state"] if latest["state"] != "THINKING" else state
+
+        windows = {"five": "-", "week": "-", "fiveReset": "-", "weekReset": "-"}
+        for record in sorted(records, key=lambda record: record["usage_time"], reverse=True):
+            usage = record["usage"]
+            for name in ("five", "week"):
+                reset = name + "Reset"
+                if windows[name] == "-" and isinstance(usage.get(reset), int) and usage[reset] > now:
+                    windows[name], windows[reset] = usage[name], usage[reset]
+        return state, windows
+
+    def read_file(self, path, modified):
+        record = self.files.get(path)
+        if record and record["modified"] == modified:
+            return
+        try:
+            with path.open("rb") as stream:
+                size = os.fstat(stream.fileno()).st_size
+                if not record or record["offset"] > size:
+                    record = {"offset": 0, "modified": 0, "event_time": 0,
+                              "state": "SLEEP", "usage_time": 0, "usage": {}, "requests": {}}
+                    if size > 262144:
+                        stream.seek(size - 262144)
+                        stream.readline()
+                else:
+                    stream.seek(record["offset"])
+                while line := stream.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    record["offset"] = stream.tell()
+                    self.read_event(record, line)
+            record["modified"] = modified
+            self.files[path] = record
+        except OSError:
+            return
+
+    @staticmethod
+    def read_event(record, line):
+        try:
+            event = json.loads(line)
+            payload = event["payload"]
+            kind = payload.get("type")
+            event_type = event.get("type")
+            if event_type != "event_msg" and not (event_type == "response_item" and (
+                (kind == "function_call" and payload.get("name") in INPUT_TOOLS)
+                or (record["requests"] and kind in {"function_call_output", "message"})
+            )):
+                return
+            timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+            if event_type == "response_item":
+                DesktopSnapshot.read_input_event(record, payload, timestamp)
+                return
+            states = {"task_started": "THINKING", "turn_started": "THINKING",
+                      "task_complete": "DONE", "turn_complete": "DONE", "turn_aborted": "STOPPED"}
+            if kind == "error" and not payload.get("will_retry") and record["state"] == "THINKING":
+                record["state"], record["event_time"], record["failed_turn"] = "ERROR", timestamp, True
+                record["requests"].clear()
+                return
+            if kind in states:
+                state = states[kind]
+                if state == "THINKING":
+                    record["failed_turn"] = False
+                elif record.get("failed_turn"):
+                    state = "ERROR"
+                record["state"], record["event_time"] = state, timestamp
+                if kind == "turn_aborted":
+                    record["requests"].clear()
+                elif kind in {"task_complete", "turn_complete"}:
+                    record["requests"] = {
+                        call_id: name for call_id, name in record["requests"].items()
+                        if name == "request_user_input_async"
+                    }
+            elif kind == "token_count":
+                limits = payload.get("rate_limits") or {}
+                if limits.get("limit_id") == "codex":
+                    record["usage"] = format_usage(limits, logged=True)
+                    record["usage_time"] = timestamp
+                    if record["event_time"] == 0:
+                        record["state"], record["event_time"] = "THINKING", timestamp
+        except (KeyError, TypeError, ValueError):
+            return
+
+    @staticmethod
+    def read_input_event(record, payload, timestamp):
+        kind = payload.get("type")
+        call_id = payload.get("call_id")
+        requests = record["requests"]
+        if kind == "function_call" and call_id and payload.get("name") in INPUT_TOOLS:
+            requests[call_id] = payload["name"]
+        elif kind == "function_call_output" and call_id in requests:
+            keep_waiting = False
+            if requests[call_id] == "request_user_input_async":
+                try:
+                    output = json.loads(payload.get("output", ""))
+                    keep_waiting = isinstance(output, dict) and output.get("accepted") is True
+                except (TypeError, ValueError):
+                    pass
+            if not keep_waiting:
+                del requests[call_id]
+                record["state"], record["event_time"] = "THINKING", timestamp
+        elif requests and kind == "message" and payload.get("role") == "user":
+            for item in payload.get("content", []):
+                body = item.get("text", "")
+                if not body.startswith(QUESTION_REPLY_TAG):
+                    continue
+                raw = body[len(QUESTION_REPLY_TAG):].partition("</send_user_message_question_reply>")[0]
+                for answer in json.loads(raw):
+                    question_id = json.loads(answer["questionItemId"])
+                    if len(question_id) >= 2 and requests.pop(question_id[1], None):
+                        record["state"], record["event_time"] = "THINKING", timestamp
+
+
+def agent_database():
+    return Path.home() / ".local/state/reareyes/agents.sqlite3"
+
+
+def report_agent_state(name, session, state):
+    if not name.strip() or not session.strip() or state not in STATES:
+        raise ValueError("用法: eyes agent <名称> <THINKING|QUESTION|DONE|ERROR|STOPPED|SLEEP|IDLE> [会话ID]")
+    database = agent_database()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TABLE IF NOT EXISTS agents (
+            name TEXT, session TEXT, state TEXT, expires REAL, PRIMARY KEY (name, session)
+        )""")
+        connection.execute("DELETE FROM agents WHERE expires <= ?", (now,))
+        if state in {"IDLE", "SLEEP"}:
+            connection.execute("DELETE FROM agents WHERE name = ? AND session = ?", (name, session))
+        else:
+            lifetime = 900 if state in {"QUESTION", "THINKING"} else 30
+            connection.execute("INSERT OR REPLACE INTO agents VALUES (?, ?, ?, ?)",
+                               (name, session, state, now + lifetime))
+
+
+def read_agent_states():
+    database = agent_database()
+    if not database.exists():
+        return set()
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        # The first report may still be creating the table in its write transaction.
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'agents'").fetchone():
+            return set()
+        return {row[0] for row in connection.execute("SELECT state FROM agents WHERE expires > ?", (time.time(),))}
+
+
+def combined_state(codex_state, agent_states):
+    states = agent_states | {codex_state}
+    return next((state for state in ("QUESTION", "THINKING", "ERROR", "DONE") if state in states), codex_state)
+
+
+def watch():
+    desktop = DesktopSnapshot()
+    url = None
+    sent = None
+    while True:
+        try:
+            if url is None:
+                url = forward_url(phone())
+            ticket = request(url, "/codex-sync")
+            if not ticket.startswith("sync "):
+                raise RuntimeError("请更新手机端 Robot Eyes")
+            ticket = ticket.removeprefix("sync ")
+            state, usage = desktop.read()
+            agents = read_agent_states()
+            state = combined_state(state, agents)
+            snapshot = (ticket, state, tuple(usage.items()))
+            restore_state = ((state == "QUESTION" or agents) and snapshot == sent
+                             and request(url, "/ping") != f"pong {state}")
+            if snapshot != sent or restore_state:
+                changes = {"ticket": ticket, **usage}
+                if sent is None or snapshot[:2] != sent[:2] or restore_state:
+                    changes["state"] = state
+                request(url, "/codex-sync?" + urlencode(changes))
+                sent = snapshot
+        except (OSError, RuntimeError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+            url = sent = None
+        time.sleep(2)
+
+
+def usage_snapshot():
+    _, usage = DesktopSnapshot().read()
+    if usage["five"] == "-" and usage["week"] == "-":
+        return codex_usage()
+    return usage
+
+
+def sync_usage(url, throttled=False):
+    if not throttled:
+        return request(url, "/usage?" + urlencode(usage_snapshot()))
+    cache = Path.home() / ".codex/reareyes-usage-refresh"
+    with cache.open("a+") as stamp:
+        try:
+            fcntl.flock(stamp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        stamp.seek(0)
+        prior = stamp.read().strip()
+        now = int(time.time())
+        if prior.isdigit() and 0 <= now - int(prior) < 45:
+            return None
+        stamp.seek(0)
+        stamp.truncate(0)
+        stamp.write(str(now))
+        stamp.flush()
+        return request(url, "/usage?" + urlencode(usage_snapshot()))
+
+
+def stacks(serial):
+    current = None
+    for line in adb("-s", serial, "shell", "am", "stack", "list").splitlines():
+        match = re.match(r"RootTask id=(\d+) .*?\bdisplayId=(\d+)\b", line)
+        if match:
+            current = tuple(map(int, match.groups()))
+        elif current and re.match(rf"\s*taskId=\d+: {re.escape(APP)}/(?:{re.escape(APP)}\.)?MainActivity\b", line):
+            yield current
+
+
+def show(serial, display, url):
+    def shell(*args):
+        return adb("-s", serial, "shell", *args)
+
+    if display == 1 and shell("getprop", "ro.product.model") != "2509FPN0BC":
+        raise RuntimeError("自动背屏切换已适配小米 17 Pro Max（2509FPN0BC）")
+    existing = list(stacks(serial))
+    if display == 0:
+        launcher = shell("cmd", "package", "resolve-activity", "--brief", "-a",
+                         "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", APP)
+        if launcher.rpartition("\n")[2].strip() in (APP + "/.FlutterHostActivity", APP + "/" + APP + ".FlutterHostActivity"):
+            shell("input", "keyevent", "KEYCODE_WAKEUP")
+            launched = shell("am", "start", "-W", "-n", APP + "/.FlutterHostActivity")
+            if "Error" in launched:
+                raise RuntimeError(launched)
+            for attempt in range(3):
+                try:
+                    return request(url, "/ping")
+                except OSError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2)
+    try:
+        request(url, "/ping")
+        running = True
+    except (OSError, RuntimeError):
+        running = False
+
+    # 安装或系统回收后，最近任务可能仍在背屏，但进程已经退出。
+    if not running or not existing:
+        shell("input", "keyevent", "KEYCODE_WAKEUP")
+        if existing and existing[0][1] != 0:
+            shell("am", "display", "move-stack", str(existing[0][0]), "0")
+        result = shell("am", "start", "-W", "-n", APP + "/.MainActivity")
+        if "Error" in result:
+            raise RuntimeError(result)
+        existing = list(stacks(serial))
+
+    if not existing:
+        raise RuntimeError("无法打开 Robot Eyes。首次使用请解锁手机")
+    root, source = next((item for item in existing if item[1] == display), existing[0])
+    if source != display:
+        shell("am", "display", "move-stack", str(root), str(display))
+    shell("input", "-d", str(display), "keyevent", "KEYCODE_WAKEUP")
+    if not any(screen == display for _, screen in stacks(serial)):
+        raise RuntimeError("系统未将 Robot Eyes 移到指定屏幕")
+    if display == 1:
+        for _ in range(5):
+            info = shell("dumpsys", "display")
+            if re.search(r"Display Id=1\s+Display State=ON\b", info):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("系统未点亮背屏，请解锁手机后重新连接")
+    for attempt in range(3):
+        try:
+            return request(url, "/ping")
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(0.2)
+
+
+def main():
+    args = sys.argv[1:]
+    quiet = bool(args and args[0] == "--quiet")
+    if quiet:
+        args.pop(0)
+    action = args[0] if len(args) == 1 else ""
+    try:
+        if args and args[0] == "agent" and len(args) in (3, 4):
+            _, name, state, *session = args
+            report_agent_state(name, session[0] if session else "default", state.upper())
+            return 0
+        if action == "watch":
+            watch()
+        if action in {"connect", "front", "calibrate"}:
+            serial = phone()
+            url = forward_url(serial)
+            print(show(serial, 0 if action == "front" else 1, url), flush=True)
+            if action == "calibrate":
+                for attempt in range(4):
+                    try:
+                        request(url, "/calibrate")
+                        break
+                    except HTTPError as error:
+                        if error.code != 409:
+                            raise
+                        if attempt == 3:
+                            raise RuntimeError("背屏尚未恢复交互，请解锁手机并轻触背屏后重试") from error
+                        time.sleep(0.35)
+                print("请在背屏选择镜头，微调圆环后保存")
+            if action == "connect":
+                try:
+                    print(sync_usage(url))
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    print(f"eyes: 背屏已连接，用量同步失败（{error}）", file=sys.stderr)
+                try:
+                    request(url, "/hello")
+                except OSError:
+                    pass  # Optional feedback must not fail the connection.
+            return 0
+        if action == "usage":
+            result = sync_usage(forward_url(phone()), throttled=quiet)
+            if not quiet:
+                print(result)
+            return 0
+        if action == "status" or action in STATES:
+            if quiet and action in {"THINKING", "DONE", "ERROR"} and DesktopSnapshot().read()[0] == "QUESTION":
+                return 0
+            endpoint = "/ping" if action == "status" else "/set?e=" + action
+            result = request(forward_url(phone()), endpoint)
+            if not quiet:
+                print(result)
+            return 0
+        print("用法: eyes connect | front | calibrate | status | usage | THINKING | QUESTION | DONE | ERROR | SLEEP | IDLE")
+        print("上报其他 Agent: eyes agent <名称> <状态> [会话ID]")
+        return 0 if action in {"help", "--help", "-h"} else 2
+    except (OSError, RuntimeError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+        if not quiet:
+            print(f"eyes: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

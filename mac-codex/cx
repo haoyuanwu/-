@@ -1,0 +1,14 @@
+#!/bin/bash
+# cx —— codex 包装命令：开跑推"认真脸"，结束推"微笑/出错"
+# 用法和 codex 完全一致：cx "帮我写个函数" / cx resume ...
+EYES_CMD="$(cd "$(dirname "$0")" && pwd)/eyes"
+
+"$EYES_CMD" --quiet THINKING
+codex "$@"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  "$EYES_CMD" --quiet DONE
+else
+  "$EYES_CMD" --quiet ERROR
+fi
+exit "$rc"

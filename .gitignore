@@ -1,0 +1,10 @@
+# Local files, dependencies and generated artifacts
+.DS_Store
+__pycache__/
+*.pyc
+*.apk
+/reareyes/.gradle/
+/reareyes/.kotlin/
+/reareyes/app/build/
+/reareyes/local.properties
+/tools/
