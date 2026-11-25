@@ -9,7 +9,18 @@
 - Android 沿用 `com.reareyes.app`。同一签名的升级会保留原配对和校准；实体设备上验证背屏需要小米 17 Pro Max 和运行中的 Shizuku。
 - iOS 在 Xcode 打开 `ios/Runner.xcworkspace`，为 Runner 选择自己的签名 Team。若要脱离调试器从主屏启动，使用 `flutter run --release -d <设备 ID>`。iPhone 与电脑需加入同一个 Tailscale 网络。
 
-换电脑时，把私下备份的 `robot-eyes.jks` 和 `key.properties` 放进新电脑的 `mobile/android`，保留 `storeFile=robot-eyes.jks`。Debug、Profile 和 Release 都会使用这把密钥。缺少签名配置时，Debug 和 Profile 使用该电脑的默认调试签名，Release 生成未签名产物。请备份这两个文件并限制访问。
+### 换电脑后使用同一 Android 签名
+
+从当前电脑私下复制 `robot-eyes.jks` 和 `key.properties` 到新电脑的 `mobile/android`。也可以用单独保管的 `robot-eyes-signing.agekey` 解开仓库里的 [加密签名备份](android/robot-eyes-signing.tar.gz.age)。
+
+安装 [age](https://github.com/FiloSottile/age#installation) 后，在仓库的 `mobile/android` 目录运行以下命令，并替换解密密钥的路径。`tar` 的 `-k` 会保留已有文件，恢复成功后删除临时的 `robot-eyes-signing.tar.gz`。
+
+```sh
+age --decrypt --identity /path/to/robot-eyes-signing.agekey --output robot-eyes-signing.tar.gz robot-eyes-signing.tar.gz.age
+tar -xkf robot-eyes-signing.tar.gz
+```
+
+确认 `key.properties` 中的 `storeFile=robot-eyes.jks`，再运行 Flutter Manager 或 `flutter run`。Debug、Profile 和 Release 都会使用同一签名证书。缺少签名配置时，Debug 和 Profile 使用该电脑的默认调试签名，Release 生成未签名产物。
 
 ## AI 对话与手机提醒
 
