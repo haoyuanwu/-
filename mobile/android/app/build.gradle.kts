@@ -1,4 +1,6 @@
 import java.util.Properties
+import java.net.URI
+import java.security.MessageDigest
 
 plugins {
     id("com.android.application")
@@ -10,6 +12,56 @@ plugins {
 val signingPropertiesFile = rootProject.file("key.properties")
 val signingProperties = signingPropertiesFile.takeIf { it.isFile }?.let { file ->
     Properties().apply { file.inputStream().use { load(it) } }
+}
+
+abstract class BundleMandarinModel : DefaultTask() {
+    @get:Optional
+    @get:InputFile
+    abstract val localArchive: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val assets: DirectoryProperty
+
+    @TaskAction
+    fun bundle() {
+        val name = "vosk-model-small-cn-0.22.zip"
+        val archive = temporaryDir.resolve(name)
+        val selected = localArchive.orNull?.asFile
+        if (selected == null) {
+            val connection = URI("https://alphacephei.com/vosk/models/$name").toURL().openConnection()
+            connection.connectTimeout = 20_000
+            connection.readTimeout = 30_000
+            connection.getInputStream().use { input ->
+                archive.outputStream().use { input.copyTo(it) }
+            }
+        }
+        val source = selected ?: archive
+        val sha256 = MessageDigest.getInstance("SHA-256")
+        source.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                sha256.update(buffer, 0, count)
+            }
+        }
+        val hash = sha256.digest().joinToString("") { "%02x".format(it) }
+        check(hash == "3af8b0e7e0f835ae9d414ce5df580237a3cfb08d586c9fbbb0f7ff29ad5b14ba") {
+            "Unexpected checksum for the Robot Eyes Mandarin speech model."
+        }
+        source.copyTo(assets.get().asFile.resolve(name), overwrite = true)
+    }
+}
+
+val bundleMandarinModel = tasks.register<BundleMandarinModel>("bundleMandarinModel") {
+    val suppliedArchive = providers.gradleProperty("robotEyesSpeechModelArchive")
+        .orElse(providers.environmentVariable("ROBOT_EYES_SPEECH_MODEL_ARCHIVE"))
+    localArchive.set(layout.file(suppliedArchive.map { file(it) }))
+    assets.set(layout.buildDirectory.dir("generated/mandarinSpeechAssets"))
+}
+
+androidComponents.onVariants { variant ->
+    variant.sources.assets?.addGeneratedSourceDirectory(bundleMandarinModel, BundleMandarinModel::assets)
 }
 
 android {
@@ -79,4 +131,6 @@ flutter {
 dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("net.java.dev.jna:jna:5.18.1@aar")
+    implementation("com.alphacephei:vosk-android:0.3.75@aar")
 }

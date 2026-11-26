@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:robot_eyes_models/robot_eyes_models.dart';
+
 class ModelProfile {
   ModelProfile({
     required this.id,
@@ -12,22 +14,37 @@ class ModelProfile {
     required String model,
     required String apiKey,
     required this.kind,
+    String? revision,
+    Iterable<String> modelIds = const [],
+    this.localPath,
+    this.projectorPath,
+    Set<GgufMediaType> mediaTypes = const {},
   }) : name = name.trim(),
-       endpoint = _endpoint(address),
+       endpoint = localPath == null
+           ? _endpoint(address)
+           : Uri(scheme: 'file', path: localPath),
        model = model.trim(),
-       apiKey = apiKey.trim() {
+       apiKey = _validatedApiKey(apiKey),
+       modelIds = List.unmodifiable(modelIds.toSet()),
+       mediaTypes = Set.unmodifiable(mediaTypes),
+       revision = revision ?? ModelConnections.newId() {
     if (this.name.isEmpty || this.name.length > 80) {
       throw const FormatException('请输入 1 到 80 个字符的连接名称。');
     }
     if (this.model.isEmpty || this.model.length > 200) {
       throw const FormatException('请输入模型名称或 ID。');
     }
-    if (this.apiKey.length > 2048 ||
-        this.apiKey.contains(RegExp(r'[^\x21-\x7e]'))) {
-      throw const FormatException('访问密钥格式无效。');
-    }
     if (kind != 'local' && kind != 'cloud') {
       throw const FormatException('连接类型无效。');
+    }
+    if (localPath != null && (kind != 'local' || localPath!.isEmpty)) {
+      throw const FormatException('请选择本机 GGUF 模型文件。');
+    }
+    if (this.mediaTypes.isNotEmpty &&
+        (localPath == null ||
+            projectorPath?.isNotEmpty != true ||
+            projectorPath == localPath)) {
+      throw const FormatException('请选择主模型配套的 mmproj 文件。');
     }
   }
 
@@ -37,6 +54,23 @@ class ModelProfile {
   final String model;
   final String apiKey;
   final String kind;
+  final String revision;
+  final List<String> modelIds;
+  final String? localPath;
+  final String? projectorPath;
+  final Set<GgufMediaType> mediaTypes;
+
+  bool get isLocalService => kind == 'local' && localPath == null;
+
+  String get displayName => isLocalService ? model : name;
+
+  static String _validatedApiKey(String apiKey) {
+    final key = apiKey.trim();
+    if (key.length > 2048 || key.contains(RegExp(r'[^\x21-\x7e]'))) {
+      throw const FormatException('访问密钥格式无效。');
+    }
+    return key;
+  }
 
   static Uri _endpoint(String address) {
     final uri = Uri.tryParse(address.trim());
@@ -50,7 +84,8 @@ class ModelProfile {
                 const ['127.0.0.1', 'localhost', '::1'].contains(uri.host)))) {
       throw const FormatException('请输入 HTTPS 地址，或本机模型的 HTTP 回环地址。');
     }
-    final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
+    final rawPath = uri.path.replaceFirst(RegExp(r'/+$'), '');
+    final path = rawPath.isEmpty ? '/v1' : rawPath;
     return uri.replace(
       path: path.endsWith('/chat/completions')
           ? path
@@ -58,13 +93,20 @@ class ModelProfile {
     );
   }
 
-  Map<String, String> toJson() => {
+  Map<String, Object> toJson() => {
     'id': id,
     'name': name,
     'url': endpoint.toString(),
     'model': model,
     'apiKey': apiKey,
     'kind': kind,
+    'revision': revision,
+    'localPath': ?localPath,
+    if (mediaTypes.isNotEmpty) ...{
+      'projectorPath': projectorPath!,
+      'mediaTypes': [for (final type in mediaTypes) type.name],
+    },
+    if (localPath == null && modelIds.isNotEmpty) 'modelIds': modelIds,
   };
 
   static ModelProfile fromJson(Object? value) {
@@ -86,11 +128,27 @@ class ModelProfile {
       model: value['model'] as String,
       apiKey: value['apiKey'] as String,
       kind: value['kind'] as String,
+      revision: value['revision'] is String
+          ? value['revision'] as String
+          : value['id'] as String,
+      modelIds: value['modelIds'] is List && value['localPath'] == null
+          ? (value['modelIds'] as List).whereType<String>()
+          : const [],
+      localPath: value['localPath'] is String
+          ? value['localPath'] as String
+          : null,
+      projectorPath: value['projectorPath'] is String
+          ? value['projectorPath'] as String
+          : null,
+      mediaTypes: value['mediaTypes'] is List
+          ? {
+              for (final type in GgufMediaType.values)
+                if ((value['mediaTypes'] as List).contains(type.name)) type,
+            }
+          : const {},
     );
   }
 }
-
-typedef LocalModel = ({String service, Uri address, String model});
 
 class ModelConnections {
   ModelConnections(this.directory);
@@ -105,6 +163,8 @@ class ModelConnections {
   static const _probeTimeout = Duration(seconds: 4);
   static const _pollInterval = Duration(seconds: 5);
   final _active = <String, HttpClient>{};
+  final _streams =
+      <HttpClient, StreamIterator<({String text, bool thinking})>>{};
   final _cancelled = <HttpClient>{};
   String? loadError;
   static const _timeout = Duration(seconds: 45);
@@ -191,46 +251,156 @@ class ModelConnections {
 
   bool? availability(String id) => _available[id];
 
-  Future<List<LocalModel>> discoverLocalModels() async {
-    final results = await Future.wait([
-      for (final (service, port) in [('Ollama', 11434), ('LM Studio', 1234)])
-        _discoverService(service, port),
-    ]);
-    return results.expand((models) => models).toList();
+  void selectModelId(String profileId, String model) {
+    final profile = profiles.where((item) => item.id == profileId).firstOrNull;
+    if (profile == null ||
+        profile.localPath != null ||
+        !profile.modelIds.contains(model)) {
+      throw const FormatException('模型列表已变化，请重新选择。');
+    }
+    if (profile.model == model) return;
+    save(
+      ModelProfile(
+        id: profile.id,
+        name: profile.name,
+        address: profile.endpoint.toString(),
+        model: model,
+        apiKey: profile.apiKey,
+        kind: profile.kind,
+        modelIds: profile.modelIds,
+      ),
+    );
   }
 
-  Future<List<LocalModel>> _discoverService(String service, int port) async {
-    final address = Uri.parse('http://127.0.0.1:$port/v1');
-    final client = HttpClient()
-      ..connectionTimeout = _probeTimeout
-      ..findProxy = (_) => 'DIRECT';
+  Future<List<String>> fetchModelIds({
+    required String address,
+    required String apiKey,
+    required bool cloud,
+    bool allowEmpty = false,
+  }) async {
+    final endpoint = ModelProfile._endpoint(address);
+    if (cloud && endpoint.scheme != 'https') {
+      throw const FormatException('云端模型需要 HTTPS 地址。');
+    }
+    final key = ModelProfile._validatedApiKey(apiKey);
+    final client = _client();
     try {
-      final (_, ids) = await _readCatalog(
-        address.replace(path: '${address.path}/models'),
+      final (status, ids) = await _readCatalog(
+        _modelsEndpoint(endpoint),
         client,
-      ).timeout(_probeTimeout);
-      return [
-        for (final model in ids ?? const <String>{})
-          (service: service, address: address, model: model),
-      ];
-    } on IOException {
-      return [];
+        key,
+      ).timeout(const Duration(seconds: 12));
+      if (status != HttpStatus.ok) {
+        throw ModelFailure(switch (status) {
+          401 || 403 => '无法读取模型列表，请检查密钥和权限。',
+          404 || 405 => '该服务未提供模型列表，请手动填写模型 ID。',
+          _ => '获取模型列表失败（HTTP $status）。',
+        });
+      }
+      if (ids == null) throw const ModelFailure('模型列表格式无效或响应过大。');
+      if (ids.isEmpty && !allowEmpty) {
+        throw const ModelFailure('服务未返回可用的模型 ID。');
+      }
+      return ids.toList()..sort();
     } on TimeoutException {
-      return [];
+      throw const ModelFailure('获取模型列表超时，请重试。');
+    } on IOException {
+      throw ModelFailure(
+        cloud ? '无法连接云端服务，请检查接口地址和网络。' : '无法连接本地模型服务，请检查服务是否已启动和地址是否正确。',
+      );
     } finally {
       client.close(force: true);
     }
   }
 
-  bool hasLocalModel(Uri address, String model) => _profiles.any(
-    (profile) =>
-        profile.kind == 'local' &&
-        profile.model == model &&
-        profile.endpoint.scheme == address.scheme &&
-        const {'127.0.0.1', 'localhost'}.contains(profile.endpoint.host) &&
-        profile.endpoint.port == address.port &&
-        profile.endpoint.path == '${address.path}/chat/completions',
-  );
+  Future<bool> syncLocalServiceModels(ModelProfile profile) async {
+    if (!profile.isLocalService) return false;
+    final ids = await fetchModelIds(
+      address: profile.endpoint.toString(),
+      apiKey: profile.apiKey,
+      cloud: false,
+      allowEmpty: true,
+    );
+    if (!_profiles.any((current) => identical(current, profile))) return false;
+    final catalogModel = _catalogModel(profile, ids);
+    final model = catalogModel ?? profile.model;
+    final available = catalogModel != null;
+    if (model == profile.model &&
+        ids.length == profile.modelIds.length &&
+        ids.every(profile.modelIds.contains)) {
+      _setAvailability(profile.id, available);
+    } else {
+      save(
+        ModelProfile(
+          id: profile.id,
+          name: profile.name,
+          address: profile.endpoint.toString(),
+          model: model,
+          apiKey: profile.apiKey,
+          kind: profile.kind,
+          modelIds: ids,
+        ),
+        tested: available,
+      );
+    }
+    return true;
+  }
+
+  String? _catalogModel(ModelProfile profile, Iterable<String> ids) {
+    if (ids.contains(profile.model)) return profile.model;
+    // Ollama can accept a bare name while its catalog lists the :latest tag.
+    final tagged = '${profile.model}:latest';
+    return profile.isLocalService && ids.contains(tagged) ? tagged : null;
+  }
+
+  Future<String?> readLocalModelParameters({
+    required String address,
+    required String model,
+    required String apiKey,
+  }) async {
+    final endpoint = ModelProfile._endpoint(address);
+    final modelId = model.trim();
+    if (modelId.isEmpty || modelId.length > 200) {
+      throw const FormatException('请选择或填写模型 ID。');
+    }
+    final key = ModelProfile._validatedApiKey(apiKey);
+    final uri = endpoint.replace(
+      path: endpoint.path.replaceFirst(
+        RegExp(r'(?:/v1)?/chat/completions$'),
+        '/api/show',
+      ),
+    );
+    final client = _client();
+    try {
+      return await (() async {
+        final request = await client.postUrl(uri);
+        request.followRedirects = false;
+        request.headers.contentType = ContentType.json;
+        if (key.isNotEmpty) {
+          request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $key');
+        }
+        request.write(jsonEncode({'model': modelId}));
+        final response = await request.close();
+        if (const {404, 405, 501}.contains(response.statusCode)) return null;
+        if (response.statusCode != HttpStatus.ok) {
+          throw ModelFailure('无法读取模型参数（HTTP ${response.statusCode}）。');
+        }
+        final data = await _readJsonObject(response);
+        if (data == null) throw const ModelFailure('无法读取模型参数响应。');
+        return switch (data['parameters']) {
+          final String parameters => parameters.trim(),
+          null => data.containsKey('details') ? '' : null,
+          _ => throw const ModelFailure('模型参数格式无效。'),
+        };
+      })().timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      throw const ModelFailure('读取模型参数超时。');
+    } on IOException {
+      throw const ModelFailure('无法连接本地服务读取模型参数。');
+    } finally {
+      client.close(force: true);
+    }
+  }
 
   void refreshAvailability() {
     _nextProbe.clear();
@@ -241,7 +411,7 @@ class ModelConnections {
     for (final profile in _profiles)
       {
         'id': profile.id,
-        'name': profile.name,
+        'name': profile.displayName,
         'kind': profile.kind,
         if (_available[profile.id] case final bool available)
           'available': available,
@@ -314,18 +484,25 @@ class ModelConnections {
     ModelProfile profile,
     HttpClient client,
   ) async {
-    final endpoint = profile.endpoint.replace(
-      path: profile.endpoint.path.replaceFirst(
-        RegExp(r'/chat/completions$'),
-        '/models',
-      ),
-    );
+    if (profile.localPath case final path?) {
+      try {
+        await checkGgufFile(path);
+        return true;
+      } on FormatException {
+        return false;
+      }
+    }
+    final endpoint = _modelsEndpoint(profile.endpoint);
     final (status, ids) = await _readCatalog(endpoint, client, profile.apiKey);
     // Some compatible gateways expose completions without a model catalog.
     if (const {404, 405, 429, 501}.contains(status)) return null;
     if (status != HttpStatus.ok) return false;
-    return ids?.contains(profile.model);
+    return ids == null ? null : _catalogModel(profile, ids) != null;
   }
+
+  Uri _modelsEndpoint(Uri endpoint) => endpoint.replace(
+    path: endpoint.path.replaceFirst(RegExp(r'/chat/completions$'), '/models'),
+  );
 
   Future<(int, Set<String>?)> _readCatalog(
     Uri endpoint,
@@ -341,26 +518,32 @@ class ModelConnections {
     final response = await request.close();
     final status = response.statusCode;
     if (status != HttpStatus.ok) return (status, null);
+    final data = (await _readJsonObject(response))?['data'];
+    if (data is! List) return (status, null);
+    return (
+      status,
+      {
+        for (final entry in data)
+          if (entry case {'id': final String id}
+              when id.isNotEmpty && id == id.trim() && id.length <= 200)
+            id,
+      },
+    );
+  }
 
+  Future<Map<String, Object?>?> _readJsonObject(
+    HttpClientResponse response,
+  ) async {
     final bytes = BytesBuilder(copy: false);
     await for (final chunk in response) {
-      if (bytes.length + chunk.length > 1024 * 1024) return (status, null);
+      if (bytes.length + chunk.length > 1024 * 1024) return null;
       bytes.add(chunk);
     }
     try {
       final json = jsonDecode(utf8.decode(bytes.takeBytes()));
-      if (json is! Map || json['data'] is! List) return (status, null);
-      return (
-        status,
-        {
-          for (final entry in json['data'] as List)
-            if (entry case {'id': final String id}
-                when id.isNotEmpty && id == id.trim() && id.length <= 200)
-              id,
-        },
-      );
+      return json is Map<String, Object?> ? json : null;
     } on FormatException {
-      return (status, null);
+      return null;
     }
   }
 
@@ -388,6 +571,7 @@ class ModelConnections {
     _available.clear();
     for (final client in _active.values) {
       _cancelled.add(client);
+      unawaited(_streams[client]?.cancel());
       client.close(force: true);
     }
     _active.clear();
@@ -397,6 +581,7 @@ class ModelConnections {
     final client = _active[id];
     if (client == null) return;
     _cancelled.add(client);
+    unawaited(_streams[client]?.cancel());
     client.close(force: true);
   }
 
@@ -459,7 +644,10 @@ class ModelConnections {
     try {
       final includeReasoning =
           payload is Map && payload['includeReasoning'] == true;
-      await for (final chunk in _completion(client, profile, messages)) {
+      final stream = StreamIterator(_completion(client, profile, messages));
+      _streams[client] = stream;
+      while (await stream.moveNext()) {
+        final chunk = stream.current;
         if (chunk.thinking && !includeReasoning) continue;
         final field = chunk.thinking ? 'reasoning' : 'text';
         response.writeln(jsonEncode({field: chunk.text}));
@@ -475,6 +663,7 @@ class ModelConnections {
         response.writeln(jsonEncode({'error': error.message}));
       }
     } finally {
+      await _streams.remove(client)?.cancel();
       _cancelled.remove(client);
       if (identical(_active[id], client)) _active.remove(id);
       client.close(force: true);
@@ -513,6 +702,16 @@ class ModelConnections {
     List<Map<String, String>> messages,
   ) async* {
     try {
+      if (profile.localPath case final path?) {
+        try {
+          await for (final text in ggufChat(path, messages)) {
+            yield (text: text, thinking: false);
+          }
+        } on FormatException catch (failure) {
+          throw ModelFailure(failure.message);
+        }
+        return;
+      }
       final request = await client.postUrl(profile.endpoint).timeout(_timeout);
       request.followRedirects = false;
       request.headers.contentType = ContentType.json;

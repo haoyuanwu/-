@@ -11,6 +11,26 @@ import org.json.JSONObject
 
 object EyesBus {
 
+    enum class VoicePhase { LISTENING, THINKING, ANSWERING, SPEAKING }
+    data class RearVoice(
+        val phase: VoicePhase,
+        val startedAt: Long,
+        val level: Float,
+        val activity: Int,
+        val heardAt: Long?,
+    )
+
+    @Volatile private var rearConversationEndedAt: Long? = null
+    @Volatile internal var rearVoice: RearVoice? = null
+        set(value) {
+            if (value != null) rearConversationEndedAt = null
+            else if (field != null) rearConversationEndedAt = SystemClock.elapsedRealtime()
+            field = value
+        }
+
+    internal fun rearConversationKeepsAwake(now: Long): Boolean =
+        rearVoice != null || rearConversationEndedAt?.let { now - it < idleTimeout } == true
+
     data class UsageWindow(val usedPercent: Int, val resetsAt: Long?) {
         fun activePercent(nowSeconds: Long): Int? =
             usedPercent.takeUnless { resetsAt != null && resetsAt <= nowSeconds }
@@ -160,7 +180,7 @@ object EyesBus {
     private var stateRevision = 0L
     private var localState = EyeState.IDLE
     private var localStateSince = stateSince
-    private var idleTimeout = 90_000L
+    @Volatile private var idleTimeout = 90_000L
     private var desktopWakeAt: Long? = null
     private var preview: Pair<EyeState, Long>? = null
 

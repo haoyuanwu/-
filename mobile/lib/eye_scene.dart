@@ -16,21 +16,29 @@ class EyeScene extends StatefulWidget {
     this.fullScreen = false,
     this.noticeCue,
     this.voiceLevel,
+    this.speechActivity = 0,
+    this.speaking = false,
+    this.conversationActive = false,
     this.revision = 0,
     this.sleepSeconds = 90,
     this.agents = const {},
     this.connected = false,
     this.allowVerticalScroll = false,
+    this.onDoubleTap,
   });
   final EyeMood mood;
   final bool fullScreen;
   final Object? noticeCue;
   final double? voiceLevel;
+  final int speechActivity;
+  final bool speaking;
+  final bool conversationActive;
   final int revision;
   final int sleepSeconds;
   final Map<String, EyeMood> agents;
   final bool connected;
   final bool allowVerticalScroll;
+  final VoidCallback? onDoubleTap;
 
   @override
   State<EyeScene> createState() => _EyeSceneState();
@@ -47,7 +55,9 @@ class _EyeSceneState extends State<EyeScene>
     model = _Animation(widget.mood)
       ..sleepSeconds = widget.sleepSeconds
       ..desk = widget.fullScreen
-      ..voiceLevel = widget.voiceLevel;
+      ..voiceLevel = widget.voiceLevel
+      ..setConversationActive(widget.conversationActive)
+      ..setSpeaking(widget.speaking);
     ticker = createTicker((elapsed) => model.step(elapsed.inMilliseconds))
       ..start();
   }
@@ -64,6 +74,13 @@ class _EyeSceneState extends State<EyeScene>
     model.sleepSeconds = widget.sleepSeconds;
     model.desk = widget.fullScreen;
     model.voiceLevel = widget.voiceLevel;
+    if (widget.voiceLevel == null) {
+      model.speechDetectedAt = null;
+    } else if (oldWidget.speechActivity != widget.speechActivity) {
+      model.speechDetectedAt = model.time;
+    }
+    model.setSpeaking(widget.speaking);
+    model.setConversationActive(widget.conversationActive);
     if (oldWidget.noticeCue != widget.noticeCue) {
       model.noticeAt = widget.noticeCue == null ? null : model.time;
     }
@@ -89,12 +106,11 @@ class _EyeSceneState extends State<EyeScene>
           _EyeGesture.new,
           (gestures) {
             gestures.allowVerticalScroll = widget.allowVerticalScroll;
-            gestures.onDown = (event) =>
-                model.down(event.localPosition, event.timeStamp.inMilliseconds);
-            gestures.onMove = (event) =>
-                model.move(event.localPosition, event.timeStamp.inMilliseconds);
-            gestures.onUp = (event) =>
-                model.up(event.localPosition, widget.fullScreen);
+            gestures.onDown = model.down;
+            gestures.onMove = model.move;
+            gestures.onUp = (event) {
+              if (model.up(event)) widget.onDoubleTap?.call();
+            };
             gestures.onCancel = model.cancel;
           },
         ),
@@ -162,7 +178,7 @@ class _EyeGesture extends OneSequenceGestureRecognizer {
 
   @override
   void addAllowedPointer(PointerDownEvent event) {
-    if (_pointer != null) return;
+    if (_pointer != null || event.buttons != kPrimaryButton) return;
     _pointer = event.pointer;
     _origin = event.position;
     startTrackingPointer(event.pointer, event.transform);
@@ -220,13 +236,22 @@ double _pulse(num age, num duration) =>
     math.sin(_unit(age / duration) * math.pi);
 double _mix(double a, double b, double t) => a + (b - a) * t;
 
+enum _GestureReaction {
+  tap(820),
+  doubleTap(1050),
+  swipe(660),
+  peek(1180),
+  wake(950),
+  rollOver(1020);
+
+  const _GestureReaction(this.duration);
+  final int duration;
+}
+
 class _Animation extends ChangeNotifier {
   _Animation(this.status)
     : expression = status == EyeMood.stopped ? EyeMood.idle : status;
 
-  static const _peekDuration = 1730;
-  static const _tapDuration = 850;
-  static const _releaseDuration = 390;
   final random = math.Random();
   EyeMood status;
   EyeMood expression;
@@ -239,8 +264,35 @@ class _Animation extends ChangeNotifier {
   int lastInteractionAt = 0;
   int sleepSeconds = 90;
   int? localSleepAt;
+  bool conversationActive = false;
+  int? conversationEndedAt;
+  bool get conversationKeepsAwake =>
+      conversationActive ||
+      (conversationEndedAt != null &&
+          time - conversationEndedAt! < sleepSeconds * 1000);
   bool get sleeping =>
-      (status == EyeMood.sleep || localSleepAt != null) && wokeAt == null;
+      (status == EyeMood.sleep || localSleepAt != null) &&
+      wokeAt == null &&
+      !conversationKeepsAwake;
+
+  void setConversationActive(bool active) {
+    if (conversationActive == active) return;
+    conversationActive = active;
+    conversationEndedAt = active ? null : time;
+    lastInteractionAt = time;
+    localSleepAt = null;
+    if (active && sleepingPress) cancel();
+    if (active &&
+        switch (reaction?.kind) {
+          _GestureReaction.peek ||
+          _GestureReaction.rollOver ||
+          _GestureReaction.wake => true,
+          _ => false,
+        }) {
+      reaction = null;
+    }
+  }
+
   int idleMoodAt = 10000;
   int glanceAt = 1900;
   int glanceEnd = 0;
@@ -253,7 +305,12 @@ class _Animation extends ChangeNotifier {
   Offset gaze = Offset.zero;
   int? noticeAt;
   double? voiceLevel;
+  int? speechDetectedAt;
   double voiceEnergy = 0;
+  int? speakingAt;
+  double speechPresence = 0;
+  double syllable = 0;
+  double emphasis = 0;
   Offset pupil = Offset.zero;
   double spacing = .18;
   double tilt = 0;
@@ -266,20 +323,29 @@ class _Animation extends ChangeNotifier {
   bool tapMoved = false;
   Offset stillAnchor = Offset.zero;
   int? pressedAt;
-  bool interactivePress = false;
+  PointerDownEvent? press;
   bool sleepingPress = false;
   int stillAt = 0;
   bool held = false;
   bool puzzledAtAnchor = false;
   int puzzledUntil = 0;
-  int? tapAt;
-  int? releaseAt;
-  bool tapWinks = false;
-  double tapSide = 0;
+  PointerUpEvent? pendingTap;
+  int tapDeadline = 0;
+  bool pairingTap = false;
   bool followingTouch = false;
-  int? firstDeepTap;
-  ({int at, bool wake, double x})? peek;
-  ({int at, bool wake, double x})? queuedPeek;
+  double sleepTouch = 0;
+  double sleepTouchSide = 0;
+  Offset sleepDrag = Offset.zero;
+  EyeMood? dragBase;
+  int tapVariation = 0;
+  ({
+    _GestureReaction kind,
+    int at,
+    Offset point,
+    Offset direction,
+    int variation,
+  })?
+  reaction;
   int? wokeAt;
   _Look? thought;
   final particles = <_Particle>[];
@@ -287,51 +353,56 @@ class _Animation extends ChangeNotifier {
   _Face? morphFrom;
 
   void update(EyeMood value) {
-    final interacting = hasTouchReaction;
+    final dragging = press != null && !sleepingPress && (tapMoved || held);
+    if (dragging) dragBase ??= wokeAt != null ? EyeMood.idle : status;
     status = value;
     statusAt = time;
     donePresentedAt = null;
     lastInteractionAt = time;
     localSleepAt = null;
-    firstDeepTap = null;
-    peek = null;
-    queuedPeek = null;
+    pendingTap = null;
+    reaction = null;
+    pairingTap = false;
+    if (!dragging) cancel();
     wokeAt = null;
     idleMood = null;
     idleMoodAt = time + _range(10000, 16000);
     nextBlink = time + _range(1900, 4000);
     thought = null;
-    if (!interacting) _change(value == EyeMood.stopped ? EyeMood.idle : value);
+    if (!dragging) _change(value == EyeMood.stopped ? EyeMood.idle : value);
     notifyListeners();
   }
 
   int _range(int low, int high) => low + random.nextInt(high - low);
 
-  bool get hasTouchReaction =>
-      (pressedAt != null && interactivePress) ||
-      (tapAt != null && time - tapAt! < _tapDuration) ||
-      (releaseAt != null && time - releaseAt! < _releaseDuration);
-
-  void down(Offset point, int eventAt) {
+  void down(PointerDownEvent event) {
+    final previous = pendingTap;
+    pairingTap =
+        previous != null &&
+        previous.kind == event.kind &&
+        event.timeStamp >= previous.timeStamp &&
+        event.timeStamp - previous.timeStamp <= kDoubleTapTimeout &&
+        (previous.position - event.position).distance <= kDoubleTapSlop;
+    if (!pairingTap) _commitTap();
     if (!sleeping) lastInteractionAt = time;
+    press = event;
     pressedAt = time;
     sleepingPress = sleeping;
-    interactivePress =
-        !sleepingPress && status != EyeMood.question && status != EyeMood.error;
     stillAt = time;
-    touch = tapOrigin = stillAnchor = point;
+    touch = tapOrigin = stillAnchor = event.localPosition;
     touchVelocity = Offset.zero;
-    touchEventAt = eventAt;
+    touchEventAt = event.timeStamp.inMilliseconds;
     touchMovedAt = time;
     tapMoved = false;
-    tapAt = releaseAt = null;
     held = false;
     puzzledAtAnchor = false;
     puzzledUntil = 0;
   }
 
-  void move(Offset point, int eventAt) {
-    if (pressedAt == null) return;
+  void move(PointerMoveEvent event) {
+    if (press == null) return;
+    final point = event.localPosition;
+    final eventAt = event.timeStamp.inMilliseconds;
     final delta = math.max(1, eventAt - touchEventAt);
     touchVelocity = Offset.lerp(
       touchVelocity,
@@ -341,6 +412,11 @@ class _Animation extends ChangeNotifier {
     touchEventAt = eventAt;
     touchMovedAt = time;
     _positionTouch(point);
+    // A drag owns this input sequence, including any unconfirmed first tap.
+    if (tapMoved && pairingTap) {
+      pairingTap = false;
+      pendingTap = null;
+    }
   }
 
   void _positionTouch(Offset point) {
@@ -354,29 +430,80 @@ class _Animation extends ChangeNotifier {
   }
 
   void cancel() {
+    if (pairingTap) pendingTap = null;
+    pairingTap = false;
+    press = null;
     pressedAt = null;
-    interactivePress = false;
     sleepingPress = false;
+    dragBase = null;
     held = false;
   }
 
-  void up(Offset point, bool showParticles) {
-    final start = pressedAt;
-    if (start == null) return;
+  bool up(PointerUpEvent event) {
+    final down = press;
+    if (down == null) return false;
+    final point = event.localPosition;
     _positionTouch(point);
-    final duration = time - start;
-    pressedAt = null;
-    final canReact = interactivePress;
-    final canWake = sleepingPress && sleeping;
-    interactivePress = false;
-    sleepingPress = false;
-    if (!canReact && !canWake) return;
-    if (duration >= 500 || held || tapMoved) {
-      if (canReact && motion) releaseAt = time;
-      held = false;
+    final wasSleeping = sleepingPress && sleeping;
+    final dragged = tapMoved;
+    final wasHeld =
+        held || event.timeStamp - down.timeStamp >= kLongPressTimeout;
+    final doubleTap = pairingTap && !dragged && !wasHeld;
+    cancel();
+    if (dragged) {
+      final displacement = point - down.localPosition;
+      if (displacement.distance > kTouchSlop) {
+        _react(
+          wasSleeping ? _GestureReaction.rollOver : _GestureReaction.swipe,
+          point,
+          direction: displacement / displacement.distance,
+        );
+      }
+    } else if (doubleTap) {
+      _react(
+        wasSleeping ? _GestureReaction.wake : _GestureReaction.doubleTap,
+        point,
+      );
+    } else if (wasHeld) {
+      _react(wasSleeping ? _GestureReaction.peek : _GestureReaction.tap, point);
+    } else {
+      pendingTap = event;
+      tapDeadline = time + kDoubleTapTimeout.inMilliseconds;
+    }
+    return doubleTap;
+  }
+
+  void _commitTap() {
+    final tap = pendingTap;
+    if (tap == null) return;
+    pendingTap = null;
+    _react(
+      sleeping ? _GestureReaction.peek : _GestureReaction.tap,
+      tap.localPosition,
+    );
+  }
+
+  void _react(
+    _GestureReaction kind,
+    Offset point, {
+    Offset direction = Offset.zero,
+  }) {
+    // Let a committed wake-up finish before accepting another expression.
+    if (reaction?.kind == _GestureReaction.wake ||
+        (reaction?.kind == _GestureReaction.doubleTap &&
+            kind == _GestureReaction.tap)) {
       return;
     }
-    if (showParticles && motion && !tapMoved) {
+    reaction = (
+      kind: kind,
+      at: time,
+      point: point,
+      direction: direction,
+      variation: kind == _GestureReaction.tap ? tapVariation++ % 3 : 0,
+    );
+    if (desk &&
+        motion &&
+        (kind == _GestureReaction.doubleTap || kind == _GestureReaction.wake)) {
       for (var index = 0; index < 12; index++) {
         particles.add(
           _Particle(
@@ -403,26 +530,6 @@ class _Animation extends ChangeNotifier {
         particles.removeRange(0, particles.length - 60);
       }
     }
-    if (canWake) {
-      if (tapMoved) return;
-      if (peek?.wake == true || queuedPeek != null) return;
-      final first = firstDeepTap;
-      final second = first != null && time - first <= 4000;
-      final shouldWake = time - (localSleepAt ?? statusAt) < 300000 || second;
-      final starts = motion && second
-          ? math.max(time, first + _peekDuration)
-          : time;
-      final action = (at: starts, wake: shouldWake, x: point.dx);
-      if (starts > time) {
-        queuedPeek = action;
-      } else {
-        peek = action;
-      }
-      firstDeepTap = shouldWake ? null : time;
-    } else {
-      tapAt = time;
-      tapWinks = random.nextInt(4) == 0;
-    }
   }
 
   void _change(EyeMood next) {
@@ -432,10 +539,18 @@ class _Animation extends ChangeNotifier {
     expressionAt = time;
   }
 
+  void setSpeaking(bool speaking) {
+    speakingAt = speaking ? (speakingAt ?? time) : null;
+  }
+
   void step(int now) {
     final elapsed = (now - time).clamp(1, 50);
     time = now;
-    final voiceTarget = math.sqrt(_unit(voiceLevel ?? 0));
+    final detectedAt = speechDetectedAt;
+    final detection = detectedAt == null
+        ? 0.0
+        : .82 * (1 - _ease((time - detectedAt - 110) / 290));
+    final voiceTarget = math.max(math.sqrt(_unit(voiceLevel ?? 0)), detection);
     voiceEnergy = motion
         ? _mix(
             voiceEnergy,
@@ -443,71 +558,80 @@ class _Animation extends ChangeNotifier {
             1 - math.exp(-elapsed / (voiceTarget > voiceEnergy ? 62 : 170)),
           )
         : 0;
-    final queued = queuedPeek;
-    if (queued != null && time >= queued.at) {
-      peek = queued;
-      queuedPeek = null;
+    if (!pairingTap && pendingTap != null && time >= tapDeadline) {
+      _commitTap();
     }
-    final activePeek = peek;
-    if (activePeek != null &&
-        (!motion ||
-            time - activePeek.at >=
-                _peekDuration + (activePeek.wake ? 580 : 0))) {
-      if (activePeek.wake) {
+    final reacting = reaction;
+    if (reacting != null &&
+        (time - reacting.at >= reacting.kind.duration ||
+            (!motion && reacting.kind == _GestureReaction.wake))) {
+      if (reacting.kind == _GestureReaction.wake) {
         wokeAt = lastInteractionAt = time;
         localSleepAt = null;
       }
-      peek = null;
+      reaction = null;
     }
     final priorWake = wokeAt;
-    if (priorWake != null && time - priorWake >= sleepSeconds * 1000) {
+    if (priorWake != null && time - lastInteractionAt >= sleepSeconds * 1000) {
       wokeAt = null;
     }
     if (status == EyeMood.idle &&
+        !conversationKeepsAwake &&
         wokeAt == null &&
         pressedAt == null &&
+        pendingTap == null &&
         time - lastInteractionAt >= sleepSeconds * 1000) {
       localSleepAt ??= time;
     }
-    final base = sleeping
-        ? EyeMood.sleep
-        : wokeAt != null
-        ? EyeMood.idle
-        : status;
+    final base =
+        dragBase ??
+        (sleeping
+            ? EyeMood.sleep
+            : wokeAt != null ||
+                  (status == EyeMood.sleep && conversationKeepsAwake)
+            ? EyeMood.idle
+            : status);
     var next = base == EyeMood.stopped ? EyeMood.idle : base;
     var tracking = false;
     var compress = false;
     var puzzling = false;
     final start = pressedAt;
-    final tap = tapAt;
-    final release = releaseAt;
     var attention = 1.0;
-    if (start != null && interactivePress) {
-      if (!held && time - start >= 500) {
+    final playful =
+        base == EyeMood.idle ||
+        base == EyeMood.focus ||
+        base == EyeMood.stopped;
+    if (start != null) {
+      if (!held && time - start >= kLongPressTimeout.inMilliseconds) {
         held = true;
         stillAt = time;
+        if (pairingTap) pendingTap = null;
+        pairingTap = false;
       }
-      if (held && !puzzledAtAnchor && time - stillAt >= 1500) {
-        puzzledAtAnchor = true;
-        puzzledUntil = time + 950;
+      final dragging = tapMoved || held;
+      if (!sleepingPress) {
+        if (playful && held && !puzzledAtAnchor && time - stillAt >= 1500) {
+          puzzledAtAnchor = true;
+          puzzledUntil = time + 950;
+        }
+        puzzling = held && time < puzzledUntil;
+        if (dragging && playful && voiceLevel == null) {
+          next = puzzling ? EyeMood.question : EyeMood.focus;
+        }
+        tracking = dragging || motion;
+        compress = playful && voiceLevel == null;
+        attention = playful && voiceLevel == null ? 1 : .56;
       }
-      puzzling = held && time < puzzledUntil;
-      next = puzzling
-          ? EyeMood.question
-          : held || tapMoved
-          ? EyeMood.focus
-          : EyeMood.idle;
+    } else if (motion &&
+        base != EyeMood.sleep &&
+        (pendingTap != null ||
+            reacting?.kind == _GestureReaction.tap ||
+            reacting?.kind == _GestureReaction.doubleTap ||
+            reacting?.kind == _GestureReaction.swipe)) {
       tracking = true;
-      compress = true;
-    } else if (release != null && time - release < _releaseDuration) {
-      next = EyeMood.focus;
-      tracking = compress = true;
-      final phase = (time - release) / _releaseDuration;
-      attention = math.cos(phase * math.pi * 1.35) * (1 - phase) * (1 - phase);
-    } else if (tap != null && time - tap < _tapDuration) {
-      tracking = compress = true;
-      next = EyeMood.idle;
-      if (motion) attention = 1 - _ease((time - tap - 330) / 520);
+      attention = reacting == null || pendingTap != null
+          ? .78
+          : 1 - _ease((time - reacting.at) / reacting.kind.duration);
     } else if (base == EyeMood.idle && motion) {
       if (time >= idleMoodAt) {
         idleMood = [
@@ -536,15 +660,60 @@ class _Animation extends ChangeNotifier {
     }
     followingTouch = tracking;
     _change(next);
+    final readingAloud = speakingAt != null && next == EyeMood.hello;
+    speechPresence = motion
+        ? _mix(
+            speechPresence,
+            readingAloud ? 1 : 0,
+            1 - math.exp(-elapsed / 58),
+          )
+        : readingAloud
+        ? 1
+        : 0;
+    if (readingAloud) {
+      final seconds = (time - speakingAt!) / 1000;
+      // The TTS bridge reports playback state. Vary the pose with a local cadence.
+      final phrase = .5 - .5 * math.cos(seconds * 2 * math.pi / 1.65);
+      final beat = seconds * 4.6 + .24 * math.sin(seconds * 7);
+      syllable = motion ? _pulse(beat % 1, 1) * (.48 + .52 * phrase) : .35;
+      emphasis = motion ? phrase * syllable : 0;
+    }
     final face = _frame(sceneSize, desk);
+    final lookPoint = start != null
+        ? touch
+        : pendingTap?.localPosition ?? reacting?.point ?? touch;
+    final sleepContact = motion && base == EyeMood.sleep && sleepingPress;
+    final sleepAmount = sleepContact ? (tapMoved ? .42 : .32) : 0.0;
+    final sleepEase = motion
+        ? 1 - math.exp(-elapsed / (sleepContact ? 55 : 125))
+        : 1.0;
+    sleepTouch = _mix(sleepTouch, sleepAmount, sleepEase);
+    sleepTouchSide = _mix(
+      sleepTouchSide,
+      ((lookPoint.dx - face.center.dx) / math.max(1, face.width) * 6).clamp(
+        -1.0,
+        1.0,
+      ),
+      sleepEase,
+    );
+    final displacement = touch - tapOrigin;
+    final drag = sleepContact && tapMoved
+        ? Offset(
+            (displacement.dx / math.max(1, face.width)).clamp(-.35, .35),
+            (displacement.dy / math.max(1, face.height)).clamp(-.30, .30),
+          )
+        : Offset.zero;
+    sleepDrag = Offset.lerp(sleepDrag, drag, sleepEase)!;
     final centered = Offset(
-      ((touch.dx - face.left) / math.max(1, face.width) - .5).clamp(-.65, .65),
-      ((touch.dy - face.top) / math.max(1, face.height) -
+      ((lookPoint.dx - face.left) / math.max(1, face.width) - .5).clamp(
+        -.65,
+        .65,
+      ),
+      ((lookPoint.dy - face.top) / math.max(1, face.height) -
               .445 -
               (next == EyeMood.focus ? .075 : 0))
           .clamp(-.55, .65),
     );
-    tapSide = centered.dx;
     final lead = motion && next == EyeMood.focus
         ? 78 * math.exp(-(time - touchMovedAt) / 110)
         : 0.0;
@@ -571,7 +740,7 @@ class _Animation extends ChangeNotifier {
         ? const Offset(0, -.18)
         : idleGlance;
     final old = thought;
-    if (next == EyeMood.thinking && motion) {
+    if (next == EyeMood.thinking && motion && !tracking) {
       if (old == null || time >= old.end) thought = _look(old);
       final look = thought!;
       final age = time - look.start;
@@ -590,12 +759,12 @@ class _Animation extends ChangeNotifier {
       gaze = Offset.lerp(
         gaze,
         target,
-        motion ? 1 - math.exp(-elapsed / (tracking ? 105 : 90)) : 1,
+        motion ? 1 - math.exp(-elapsed / (tracking ? 57 : 90)) : 1,
       )!;
       pupil = Offset.lerp(
         pupil,
         pupilTarget,
-        motion ? 1 - math.exp(-elapsed / (tracking ? 38 : 155)) : 1,
+        motion ? 1 - math.exp(-elapsed / (tracking ? 29 : 155)) : 1,
       )!;
     }
     final distance = _unit(
@@ -626,16 +795,16 @@ class _Animation extends ChangeNotifier {
         (age ~/ 15800).isEven
             ? -.148 * _pulse(turn, 3800)
             : .148 * _pulse(turn, 3800),
+      EyeMood.hello =>
+        math.sin((time - (speakingAt ?? time)) / 315) * .038 * speechPresence,
       _ => 0.0,
     };
     final followTilt = tracking
         ? (centered.dx * .14 + predicted.dx * .244) * attention
         : 0.0;
-    tilt = _mix(
-      tilt,
-      motion ? angle + followTilt : 0,
-      1 - math.exp(-elapsed / 54),
-    );
+    tilt = motion
+        ? _mix(tilt, angle + followTilt, 1 - math.exp(-elapsed / 54))
+        : 0;
     particles.removeWhere(
       (particle) => time - particle.at >= particle.duration,
     );
@@ -700,7 +869,8 @@ class _Animation extends ChangeNotifier {
     }
     if (expression != EyeMood.idle &&
         expression != EyeMood.question &&
-        expression != EyeMood.focus) {
+        expression != EyeMood.focus &&
+        !(expression == EyeMood.hello && speakingAt != null)) {
       return 1;
     }
     if (time >= nextBlink) {
@@ -876,18 +1046,6 @@ class _Painter extends CustomPainter {
       switch (expression) {
         case EyeMood.stopped:
         case EyeMood.idle:
-          final tap = model.tapAt;
-          final age = tap == null ? _Animation._tapDuration : model.time - tap;
-          if (model.motion &&
-              model.followingTouch &&
-              age < _Animation._tapDuration &&
-              model.tapSide * side >= 0 &&
-              (model.tapSide != 0 || side > 0)) {
-            final near = _ease((model.tapSide.abs() - .08) / .37);
-            final wink = model.tapWinks ? .54 * _pulse(age - 420, 260) : 0.0;
-            final squint = math.max(near * .28 * _pulse(age, 530), wink);
-            return open(y, .275, .432 * (1 - squint), openness: blink);
-          }
           return open(y, .275, .432);
         case EyeMood.thinking:
           final reading = _unit(model.pupil.dy * 2);
@@ -958,25 +1116,49 @@ class _Painter extends CustomPainter {
           );
         case EyeMood.focus:
           final proximity = _ease((model.pupil.dx * side - .045) / .68);
-          final voice = model.followingTouch ? 0.0 : model.voiceEnergy;
+          final voice = model.voiceEnergy;
+          final response = model.desk ? voice : 0.0;
+          final raised = model.desk && model.voiceLevel != null ? .024 : 0.0;
+          final accent = response * math.sin(model.time / 330);
           return open(
-            y - .022 * voice,
-            (.253 + .016 * voice) * (1 - proximity * .14),
-            (.401 + .105 * voice) * (1 - proximity * .24),
-            brow: .172 + proximity * .048 - .045 * voice,
-            lean: -side * (.108 - .072 * voice),
-            arch: .026 + .021 * voice,
+            y - raised - .022 * voice - .035 * response + side * .016 * accent,
+            (.253 + .016 * voice + .032 * response) * (1 - proximity * .14),
+            (.401 + .105 * voice + .035 * response) * (1 - proximity * .24),
+            brow:
+                .172 +
+                proximity * .048 -
+                .045 * voice -
+                raised -
+                .024 * response +
+                side * .018 * accent,
+            lean: -side * (.108 - .072 * voice) + .11 * accent,
+            arch: .026 + .021 * voice + .021 * response,
           );
         case EyeMood.hello:
           final hop = model.motion ? _pulse(age, 680) : 0.0;
           final wink = model.motion && side < 0
               ? 1 - .89 * _pulse(age - 410, 520)
               : 1.0;
-          return open(
+          final greeting = open(
             y - hop * .052 + (side < 0 ? .02 : 0),
             .29,
             side < 0 ? .403 : .458,
             openness: wink,
+          );
+          final speaking = model.speechPresence;
+          if (speaking < .01) return greeting;
+          final beat = model.syllable;
+          return greeting.mix(
+            open(
+              y - .045 + .039 * beat + side * .012 * model.emphasis,
+              .298,
+              .406 + .073 * beat,
+              brow: .133 - .042 * model.emphasis + side * .012 * beat,
+              lean: -side * .12,
+              arch: .064,
+              openness: blink,
+            ),
+            speaking,
           );
       }
     }
@@ -1011,35 +1193,123 @@ class _Painter extends CustomPainter {
     final progress = model.motion ? _ease(age / morphDuration) : 1.0;
     final previous = model.morphFrom;
     if (previous != null && progress < 1) face = previous.mix(face, progress);
-    final peek = model.peek;
-    if (peek != null) {
-      final elapsed = model.time - peek.at;
+    final reaction = model.reaction;
+    var offset = model.sleepDrag * .27;
+    var lean = model.sleepDrag.dx * .75;
+    var detailsProgress = progress;
+    if (expression == EyeMood.sleep && model.sleepTouch > .002) {
       final awake = _face(EyeMood.idle, 1, w / h);
-      if (elapsed >= _Animation._peekDuration) {
-        face = face.mix(
-          awake,
-          _ease((elapsed - _Animation._peekDuration) / 580),
-        );
-      } else if (elapsed < 1490) {
-        final flatten = _ease(math.min(elapsed, 1490 - elapsed) / 160);
-        final open = math.min(
-          _ease((elapsed - 160) / 420),
-          _ease((1330 - elapsed) / 250),
-        );
-        _Eye opening(_Eye closed, _Eye openEye) => closed
-            .sleepLid(bend: _mix(closed.bend, 0, flatten))
-            .mix(openEye.sleepLid(halfLid: 1), open);
-        face = peek.x <= frame.center.dx
-            ? _Face(opening(face.left, awake.left), face.right, face.colors)
-            : _Face(face.left, opening(face.right, awake.right), face.colors);
+      final side = model.sleepTouchSide;
+      face = _Face(
+        face.left.mix(
+          awake.left.sleepLid(halfLid: 1),
+          model.sleepTouch * (.5 - side * .5),
+        ),
+        face.right.mix(
+          awake.right.sleepLid(halfLid: 1),
+          model.sleepTouch * (.5 + side * .5),
+        ),
+        face.colors,
+      );
+    }
+    if (reaction != null) {
+      final age = model.time - reaction.at;
+      final kind = reaction.kind;
+      final strength = model.motion
+          ? _ease(age / 145) *
+                (1 - _ease((age - kind.duration * .55) / (kind.duration * .45)))
+          : .65;
+      final nearLeft = reaction.point.dx <= frame.center.dx;
+      switch (kind) {
+        case _GestureReaction.peek:
+          final awake = _face(EyeMood.idle, 1, w / h);
+          final near = nearLeft ? awake.left : awake.right;
+          final closed = nearLeft ? face.left : face.right;
+          final eye = closed.mix(near.sleepLid(halfLid: 1), strength * .74);
+          face = nearLeft
+              ? _Face(eye, face.right, face.colors)
+              : _Face(face.left, eye, face.colors);
+        case _GestureReaction.wake:
+          final awake = _face(EyeMood.idle, 1, w / h);
+          final startled = _face(EyeMood.idea, 1, w / h);
+          final open = _ease(age / 250);
+          face = face.mix(startled.mix(awake, _ease((age - 330) / 560)), open);
+          detailsProgress *= 1 - open;
+          if (model.motion) offset = Offset(0, -.055 * _pulse(age, 420));
+        case _GestureReaction.rollOver:
+          final awake = _face(EyeMood.idle, 1, w / h);
+          if (model.motion) {
+            final direction = reaction.direction;
+            final settle = _pulse(age - 120, 680);
+            lean -= direction.dx * .08 * settle;
+            offset -= Offset(direction.dx * .023, direction.dy * .018) * settle;
+          }
+          final sleepy = face.mix(awake, strength * .10);
+          face = _Face(sleepy.left, sleepy.right, face.colors);
+        case _GestureReaction.swipe:
+          if (model.motion) {
+            final direction = reaction.direction;
+            final recoil = _pulse(age - 85, 425);
+            offset -= Offset(direction.dx * .027, direction.dy * .021) * recoil;
+            lean -= direction.dx * .07 * recoil;
+          }
+          final squint = _face(expression, .62, w / h);
+          face = face.mix(squint, strength * .44);
+        case _GestureReaction.tap:
+        case _GestureReaction.doubleTap:
+          final twice = kind == _GestureReaction.doubleTap;
+          final activeVoice =
+              model.voiceLevel != null || model.speakingAt != null;
+          final target = switch (expression) {
+            EyeMood.idle || EyeMood.stopped || EyeMood.focus
+                when !activeVoice =>
+              twice
+                  ? EyeMood.done
+                  : [
+                      EyeMood.hello,
+                      EyeMood.idea,
+                      EyeMood.idle,
+                    ][reaction.variation],
+            EyeMood.done => twice ? EyeMood.hello : EyeMood.idea,
+            EyeMood.hello || EyeMood.idea when !activeVoice => EyeMood.done,
+            _ => expression,
+          };
+          final wink = !twice && !activeVoice && target == EyeMood.hello;
+          final openness = wink
+              ? 1 - (model.motion ? .94 * _pulse(age - 115, 360) : .70)
+              : twice
+              ? .60
+              : .78;
+          final pose = _face(target, openness, w / h);
+          final amount =
+              strength *
+              (wink
+                  ? .96
+                  : target == expression
+                  ? .56
+                  : .86);
+          face = _Face(
+            twice || nearLeft ? face.left.mix(pose.left, amount) : face.left,
+            twice || !nearLeft
+                ? face.right.mix(pose.right, amount)
+                : face.right,
+            face.colors,
+          );
+          if (model.motion) {
+            final bounce = twice
+                ? _pulse(age, 420) + .44 * _pulse(age - 360, 370)
+                : _pulse(age, 550);
+            offset = Offset(0, -(twice ? .050 : .018) * bounce);
+            lean = (nearLeft ? -1 : 1) * (twice ? .075 : .045) * strength;
+          }
       }
     }
     model.displayed = face;
     canvas.save();
     canvas.translate(frame.left, frame.top);
     canvas.save();
-    canvas.translate(w * .5, h * .46);
-    canvas.rotate(model.tilt);
+    canvas.translate(w * (.5 + offset.dx), h * (.46 + offset.dy));
+    canvas.rotate(model.tilt + lean);
     canvas.translate(-w * .5, -h * .46);
     final thought = model.thought;
     final code = thought != null && thought.step == null
@@ -1058,10 +1328,84 @@ class _Painter extends CustomPainter {
           );
     _eye(canvas, face.left, eyeColors, w, h, true, code);
     _eye(canvas, face.right, eyeColors, w, h, false, code);
+    if (model.desk && expression == EyeMood.focus && model.voiceLevel != null) {
+      _listeningBars(canvas, face.colors[1], w, h, progress);
+    }
+    if ((expression == EyeMood.hello || expression == EyeMood.idle) &&
+        model.speechPresence >= .01) {
+      _speechMouth(canvas, w, h);
+    }
     canvas.restore();
-    _details(canvas, expression, face.colors[0], w, h, age, progress);
+    _details(canvas, expression, face.colors[0], w, h, age, detailsProgress);
     canvas.restore();
     _drawParticles(canvas, h);
+  }
+
+  void _listeningBars(
+    Canvas canvas,
+    Color color,
+    double w,
+    double h,
+    double progress,
+  ) {
+    final energy = model.voiceEnergy;
+    final paint = Paint()
+      ..color = color.withAlpha((progress * (150 + 105 * energy)).round());
+    for (var index = -2; index <= 2; index++) {
+      final ripple = .5 + .5 * math.sin(model.time / 75 + index * 1.55);
+      final height =
+          h *
+          (.013 + energy * (.025 + .058 * ripple) * (1 - .17 * index.abs()));
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(
+            center: Offset(w * .5 + h * index * .041, h * .745),
+            width: h * .016,
+            height: height,
+          ),
+          Radius.circular(h * .008),
+        ),
+        paint,
+      );
+    }
+  }
+
+  void _speechMouth(Canvas canvas, double w, double h) {
+    final amount = model.speechPresence;
+    final beat = model.syllable;
+    final center = Offset(w * .5, h * (.737 + .015 * beat));
+    final halfWidth = h * (.123 - .047 * beat);
+    final opening = h * (.028 + .112 * beat) * amount;
+    final shape = Path()
+      ..moveTo(center.dx - halfWidth, center.dy)
+      ..quadraticBezierTo(
+        center.dx,
+        center.dy + h * .011 * amount,
+        center.dx + halfWidth,
+        center.dy,
+      )
+      ..cubicTo(
+        center.dx + halfWidth * .62,
+        center.dy + opening,
+        center.dx - halfWidth * .62,
+        center.dy + opening,
+        center.dx - halfWidth,
+        center.dy,
+      )
+      ..close();
+    canvas.drawPath(
+      shape,
+      Paint()
+        ..color = const Color(0xffffc89e).withAlpha((220 * amount).round()),
+    );
+    canvas.drawPath(
+      shape,
+      Paint()
+        ..color = const Color(0xffffe6bb).withAlpha((230 * amount).round())
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = h * .008
+        ..strokeJoin = StrokeJoin.round,
+    );
   }
 
   void _eye(

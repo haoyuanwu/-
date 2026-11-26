@@ -21,8 +21,9 @@ Future<void> keepScreenOn(bool enabled) async {
 Future<({int status, String body})> request(
   Uri url,
   String token,
-  Map<String, String>? data,
-) async {
+  Map<String, String>? data, {
+  int maxBytes = 16384,
+}) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
   const timeout = Duration(seconds: 4);
   try {
@@ -31,7 +32,9 @@ Future<({int status, String body})> request(
           timeout,
         );
     request.followRedirects = false;
-    request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    if (token.isNotEmpty) {
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    }
     if (data != null) {
       final body = utf8.encode(jsonEncode(data));
       request.headers.contentType = ContentType.json;
@@ -44,7 +47,7 @@ Future<({int status, String body})> request(
     }
     final bytes = <int>[];
     await for (final chunk in response.timeout(timeout)) {
-      if (bytes.length + chunk.length > 16384) {
+      if (bytes.length + chunk.length > maxBytes) {
         throw const FormatException('电脑返回的数据过大');
       }
       bytes.addAll(chunk);

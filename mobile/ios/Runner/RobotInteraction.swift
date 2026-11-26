@@ -56,7 +56,7 @@ final class RobotInteraction: NSObject, FlutterStreamHandler, AVSpeechSynthesize
     case "loadSettings":
       reply(defaults.string(forKey: "reareyes.interactionSettings"))
     case "saveSettings":
-      guard let value = call.arguments as? String, value.utf8.count <= 32768 else {
+      guard let value = call.arguments as? String, value.utf8.count <= 256 * 1024 else {
         return reply(FlutterError(code: "invalid_settings", message: nil, details: nil))
       }
       defaults.set(value, forKey: "reareyes.interactionSettings")

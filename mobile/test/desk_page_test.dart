@@ -74,8 +74,9 @@ void main() {
     );
     await tester.pump();
 
-    expect(interaction.spokenText, '测试应用，横屏新提醒');
+    expect(interaction.spokenText, '你在测试应用收到一条消息，内容是：通知内容');
     expect(interaction.mood, isNull);
+    expect(tester.widget<EyeScene>(find.byType(EyeScene)).speaking, isTrue);
     expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNotNull);
     await tester.pump();
     expect(find.byType(Image), findsOneWidget);
@@ -92,6 +93,8 @@ void main() {
     expect(notice, findsOneWidget);
     interaction.clearNotice();
     await interaction.muteCurrent();
+    await tester.pump();
+    expect(tester.widget<EyeScene>(find.byType(EyeScene)).speaking, isFalse);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -172,7 +175,7 @@ void main() {
       await tester.pump();
       expect(find.byType(DeskVoiceControl), findsOneWidget);
       expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
-      expect(find.text('正在聆听'), findsNothing);
+      expect(find.text('正在聆听…'), findsOneWidget);
       final stop = find.byTooltip('结束录音');
       expect(
         find.descendant(
@@ -195,6 +198,18 @@ void main() {
       await messenger.handlePlatformMessage(
         events.name,
         const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'speechDetected',
+        }),
+        (_) {},
+      );
+      await tester.pump();
+      final detected = tester.widget<EyeScene>(find.byType(EyeScene));
+      expect(detected.speechActivity, 1);
+      expect(detected.voiceLevel, 0);
+
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
           'type': 'speechLevel',
           'level': .64,
         }),
@@ -204,6 +219,16 @@ void main() {
       expect(tester.widget<EyeScene>(find.byType(EyeScene)).voiceLevel, .64);
 
       expect(nativeActions, contains('startListening'));
+      await tester.tap(stop);
+      await tester.pump();
+      expect(nativeActions, contains('cancelListening'));
+      expect(nativeActions, isNot(contains('stopListening')));
+      expect(find.byTooltip('取消识别'), findsNothing);
+      expect(interaction.error, isNull);
+
+      await tester.tap(mic);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 650));
       await tester.tap(stop);
       await tester.pump();
       expect(nativeActions, contains('stopListening'));
@@ -232,6 +257,7 @@ void main() {
 
       await tester.tap(mic);
       await tester.pump();
+      await tester.pump(const Duration(milliseconds: 650));
       await tester.tap(stop);
       await tester.pump();
 
@@ -246,7 +272,8 @@ void main() {
       );
       await tester.pump();
       expect(interaction.error, contains('请先配对电脑'));
-      expect(find.textContaining('请先配对电脑'), findsNothing);
+      expect(find.text('测试全屏说话'), findsOneWidget);
+      expect(find.textContaining('请先配对电脑'), findsOneWidget);
       expect(find.byTooltip('重试'), findsOneWidget);
       expect(
         tester.widget<EyeScene>(find.byType(EyeScene)).mood,
@@ -254,70 +281,167 @@ void main() {
       );
       expect(tester.getCenter(find.byTooltip('重试')), controlCenter);
       expect(find.byType(DeskPage), findsOneWidget);
+      final starts = nativeActions
+          .where((action) => action == 'startListening')
+          .length;
+      await tester.tap(find.byTooltip('重试'));
+      await tester.pump();
+      expect(
+        nativeActions.where((action) => action == 'startListening'),
+        hasLength(starts),
+      );
+      expect(interaction.draft, '测试全屏说话');
     },
   );
 
-  testWidgets('speaking raises the listening eyes and they settle in silence', (
-    tester,
-  ) async {
-    final level = ValueNotifier<double>(0);
-    final boundary = GlobalKey();
-    addTearDown(level.dispose);
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Center(
-          child: RepaintBoundary(
-            key: boundary,
-            child: SizedBox(
-              width: 375,
-              height: 210,
-              child: ValueListenableBuilder(
-                valueListenable: level,
-                builder: (_, value, _) =>
-                    EyeScene(mood: EyeMood.focus, voiceLevel: value),
+  testWidgets(
+    'the fullscreen waveform responds to volume and speech detection',
+    (tester) async {
+      final voice = ValueNotifier((0.0, 0));
+      final boundary = GlobalKey();
+      addTearDown(voice.dispose);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: RepaintBoundary(
+              key: boundary,
+              child: SizedBox(
+                width: 375,
+                height: 210,
+                child: ValueListenableBuilder(
+                  valueListenable: voice,
+                  builder: (_, value, _) => EyeScene(
+                    mood: EyeMood.focus,
+                    fullScreen: true,
+                    voiceLevel: value.$1,
+                    speechActivity: value.$2,
+                  ),
+                ),
               ),
             ),
           ),
         ),
-      ),
-    );
+      );
 
-    Future<int> topOfEyes() async {
-      final box =
-          boundary.currentContext!.findRenderObject()! as RenderRepaintBoundary;
-      final frame = box.toImageSync();
-      try {
-        final bytes = await tester.runAsync(
-          () => frame.toByteData(format: ui.ImageByteFormat.rawRgba),
-        );
-        final rgba = bytes!.buffer.asUint8List();
-        // Sample the left eye only, below the eyebrow.
-        for (var y = 40; y < 104; y++) {
-          final pixel = (y * frame.width + 148) * 4;
-          if (rgba[pixel + 2] > 220 && rgba[pixel] > 105) return y;
+      Future<int> waveHeight() async {
+        final box =
+            boundary.currentContext!.findRenderObject()!
+                as RenderRepaintBoundary;
+        final frame = box.toImageSync();
+        try {
+          final bytes = await tester.runAsync(
+            () => frame.toByteData(format: ui.ImageByteFormat.rawRgba),
+          );
+          final rgba = bytes!.buffer.asUint8List();
+          var height = 0;
+          for (var y = 140; y < 175; y++) {
+            final pixel = (y * frame.width + 187) * 4;
+            if (rgba[pixel + 2] > 140 && rgba[pixel + 1] > 100) height++;
+          }
+          return height;
+        } finally {
+          frame.dispose();
         }
-        throw StateError('No bright pixels in the listening eye');
-      } finally {
-        frame.dispose();
       }
-    }
 
-    await tester.pump(const Duration(milliseconds: 16));
-    final quiet = await topOfEyes();
-    level.value = .81;
-    for (var index = 0; index < 6; index++) {
-      await tester.pump(const Duration(milliseconds: 45));
-    }
-    final speaking = await topOfEyes();
-    expect(speaking, lessThan(quiet - 3));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pump(const Duration(milliseconds: 300));
+      final quiet = await waveHeight();
+      expect(quiet, greaterThan(0));
+      voice.value = (.81, 0);
+      for (var index = 0; index < 6; index++) {
+        await tester.pump(const Duration(milliseconds: 45));
+      }
+      expect(await waveHeight(), greaterThan(quiet + 3));
 
-    level.value = 0;
-    for (var index = 0; index < 14; index++) {
-      await tester.pump(const Duration(milliseconds: 45));
-    }
-    expect(await topOfEyes(), closeTo(quiet, 2));
-    await tester.pumpWidget(const SizedBox.shrink());
-  });
+      voice.value = (0, 0);
+      for (var index = 0; index < 14; index++) {
+        await tester.pump(const Duration(milliseconds: 45));
+      }
+      expect(await waveHeight(), closeTo(quiet, 2));
+      voice.value = (0, 1);
+      for (var index = 0; index < 4; index++) {
+        await tester.pump(const Duration(milliseconds: 45));
+      }
+      expect(await waveHeight(), greaterThan(quiet + 3));
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'the reading mouth moves, rests on mute and honors reduced motion',
+    (tester) async {
+      final boundary = GlobalKey();
+      Future<void> show({required bool speaking, bool reduceMotion = false}) {
+        return tester.pumpWidget(
+          MaterialApp(
+            home: MediaQuery(
+              data: MediaQueryData(disableAnimations: reduceMotion),
+              child: Center(
+                child: RepaintBoundary(
+                  key: boundary,
+                  child: SizedBox(
+                    width: 375,
+                    height: 210,
+                    child: EyeScene(
+                      mood: EyeMood.hello,
+                      fullScreen: true,
+                      speaking: speaking,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+
+      Future<int> mouthPixels() async {
+        final box =
+            boundary.currentContext!.findRenderObject()!
+                as RenderRepaintBoundary;
+        final frame = box.toImageSync();
+        try {
+          final bytes = await tester.runAsync(
+            () => frame.toByteData(format: ui.ImageByteFormat.rawRgba),
+          );
+          final rgba = bytes!.buffer.asUint8List();
+          var count = 0;
+          for (var y = 149; y < 180; y++) {
+            for (var x = 159; x < 216; x++) {
+              final pixel = (y * frame.width + x) * 4;
+              if (rgba[pixel] > 110 && rgba[pixel + 1] > 70) count++;
+            }
+          }
+          return count;
+        } finally {
+          frame.dispose();
+        }
+      }
+
+      await show(speaking: true);
+      final samples = <int>{};
+      for (var index = 0; index < 12; index++) {
+        await tester.pump(const Duration(milliseconds: 40));
+        samples.add(await mouthPixels());
+      }
+      expect(samples.where((count) => count > 100).length, greaterThan(1));
+
+      await show(speaking: true, reduceMotion: true);
+      await tester.pump(const Duration(milliseconds: 30));
+      final still = await mouthPixels();
+      expect(still, greaterThan(100));
+      await tester.pump(const Duration(milliseconds: 140));
+      expect(await mouthPixels(), still);
+
+      await show(speaking: false);
+      for (var index = 0; index < 8; index++) {
+        await tester.pump(const Duration(milliseconds: 45));
+      }
+      expect(await mouthPixels(), 0);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   testWidgets('the latest AI expression waits until the drag ends', (
     tester,

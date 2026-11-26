@@ -9,6 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  llamadart_llama_cpp_flutter: 0.20.8
+  robot_eyes_models:
+    path: ../packages/robot_eyes_models
 
 dev_dependencies:
   flutter_test:

@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/gestures.dart';
 // Keep the Flutter SDK Material import for compatibility with stable Flutter.
 // ignore: deprecated_member_use
 import 'package:flutter/material.dart';
@@ -15,7 +14,9 @@ import 'interaction.dart';
 import 'interaction_view.dart';
 import 'model_settings_view.dart';
 import 'permission_settings_view.dart';
+import 'phone_model.dart';
 import 'remote.dart';
+import 'settings_page.dart';
 import 'status_strip.dart';
 import 'platform_io.dart'
     if (dart.library.js_interop) 'platform_web.dart'
@@ -83,6 +84,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String? failure;
   String? syncResult;
   bool syncing = false;
+  (String?, double, int)? _rearVoice;
+  CloudConflictSummary? _announcedModelConflict;
+  int _announcedModelUpdate = 0;
+  OverlayEntry? _modelToast;
+  Timer? _modelToastTimer;
   Future<void>? pendingRefresh;
   final localLogs = <String>[];
   bool foreground = true;
@@ -94,8 +100,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     if (android) native.setMethodCallHandler(_handleNativeEvent);
     interaction.addListener(_updateScene);
-    unawaited(interaction.initialize());
-    timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
+    unawaited(
+      interaction.initialize().then((_) => interaction.syncPhoneModel()),
+    );
+    timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(refresh());
+      if (foreground) unawaited(interaction.syncPhoneModel());
+    });
     unawaited(load());
   }
 
@@ -106,7 +117,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> load() async {
     try {
       final raw = await platform.loadPairing();
-      if (raw != null && mounted) setState(() => pairing = Pairing.parse(raw));
+      if (raw != null && mounted) {
+        final saved = Pairing.parse(raw);
+        if (pairing?.encode() != saved.encode()) {
+          setState(() => pairing = saved);
+          interaction.resetConnection();
+        }
+      }
     } catch (_) {
       if (mounted) setState(() => failure = '无法读取配对配置。');
     }
@@ -125,6 +142,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (foreground) {
       unawaited(refresh(force: true));
       unawaited(interaction.resume());
+      unawaited(interaction.syncPhoneModel(force: true));
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       interaction.pause();
@@ -137,6 +155,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (android) native.setMethodCallHandler(null);
     timer.cancel();
     previewTimer?.cancel();
+    _dismissModelToast();
     interaction.removeListener(_updateScene);
     interaction.dispose();
     scene.dispose();
@@ -145,6 +164,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void _updateScene() {
+    if (interaction.phoneModelUpdate case final update?
+        when update.id != _announcedModelUpdate) {
+      _announcedModelUpdate = update.id;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _announcedModelUpdate != update.id) return;
+        _showModelToast(update.message);
+      });
+      WidgetsBinding.instance.ensureVisualUpdate();
+    }
+    final conflict = interaction.phoneModelConflict;
+    if (_announcedModelConflict != conflict) {
+      _announcedModelConflict = conflict;
+      if (conflict != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || interaction.phoneModelConflict != conflict) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('两端的云端模型配置不同，请在电脑上选择如何同步。'),
+              action: SnackBarAction(
+                label: '查看',
+                onPressed: () =>
+                    unawaited(openModelSettings(context, interaction)),
+              ),
+            ),
+          );
+        });
+      }
+    }
     final mood = interaction.mood ?? preview ?? snapshot.state;
     if (scene.value.$1 != mood) {
       scene.value = (mood, ++revision);
@@ -152,6 +199,94 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     interaction.updateActivity(
       interaction.generating ? EyeMood.thinking : snapshot.state,
     );
+    if (android) {
+      final phase = interaction.finishingRecording
+          ? 'thinking'
+          : interaction.listening
+          ? 'listening'
+          : interaction.spokenText != null
+          ? 'speaking'
+          : switch (interaction.phase) {
+              InteractionPhase.thinking => 'thinking',
+              InteractionPhase.answering => 'answering',
+              _ => null,
+            };
+      final listening = phase == 'listening';
+      final voice = (
+        phase,
+        listening ? interaction.inputLevel : 0.0,
+        listening ? interaction.speechActivity : 0,
+      );
+      if (_rearVoice != voice) {
+        _rearVoice = voice;
+        unawaited(_sendRearVoice(voice));
+      }
+    }
+  }
+
+  void _dismissModelToast() {
+    _modelToastTimer?.cancel();
+    _modelToast?.remove();
+    _modelToast?.dispose();
+    _modelToast = null;
+  }
+
+  void _showModelToast(String message) {
+    final overlay = Navigator.of(context, rootNavigator: true).overlay;
+    if (overlay == null) return;
+    _dismissModelToast();
+    final entry = OverlayEntry(
+      builder: (context) => Positioned.fill(
+        child: IgnorePointer(
+          child: SafeArea(
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(
+                  20,
+                  0,
+                  20,
+                  24 + MediaQuery.viewInsetsOf(context).bottom,
+                ),
+                child: Semantics(
+                  liveRegion: true,
+                  child: Material(
+                    color: panelColor,
+                    shape: const StadiumBorder(
+                      side: BorderSide(color: borderColor),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      child: Text(message, textAlign: TextAlign.center),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    overlay.insert(entry);
+    _modelToast = entry;
+    _modelToastTimer = Timer(const Duration(seconds: 3), _dismissModelToast);
+  }
+
+  Future<void> _sendRearVoice((String?, double, int) voice) async {
+    try {
+      await native.invokeMethod<void>('rearVoice', {
+        'phase': voice.$1,
+        'level': voice.$2,
+        'activity': voice.$3,
+      });
+    } on PlatformException {
+      // The main display can still show the conversation.
+    } on MissingPluginException {
+      // Only the native Android host mirrors voice to the rear display.
+    }
   }
 
   Future<void> refresh({bool force = false}) async {
@@ -284,10 +419,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> refreshNow() async {
     if (syncing) return;
-    if (!android && pairing == null) {
-      await remoteConnection();
-      return;
-    }
+    if (!android && pairing == null) return;
+    unawaited(interaction.syncPhoneModel(force: true));
     setState(() {
       syncing = true;
       syncResult = null;
@@ -366,6 +499,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             child: const Text('管理配对'),
           ),
           TextButton(
+            onPressed: () => Navigator.pop(dialog, 'cloud'),
+            child: const Text('同步云端模型'),
+          ),
+          TextButton(
             onPressed: () => Navigator.pop(dialog),
             child: const Text('关闭'),
           ),
@@ -374,6 +511,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     if (!mounted) return;
     if (action == 'pair') await pair();
+    if (action == 'cloud') {
+      await interaction.syncPhoneModel(force: true);
+      if (mounted) {
+        notice(
+          interaction.phoneModelConflict != null
+              ? '云端配置有冲突，请在电脑的「模型连接 → 手机模型」处理。'
+              : interaction.phoneModelSyncError ??
+                    '已同步 ${interaction.savedCloudModels.length} 个云端模型配置',
+        );
+      }
+    }
   }
 
   Future<void> remoteHelp(BuildContext context) => showDialog<void>(
@@ -711,19 +859,58 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     VoidCallback? onPressed, {
     Color accent = cyan,
     bool prominent = false,
+    IconData? icon,
   }) => OutlinedButton(
     onPressed: onPressed,
     style: OutlinedButton.styleFrom(
-      foregroundColor: accent,
-      backgroundColor: prominent ? const Color(0xff153640) : panelColor,
+      foregroundColor: prominent ? backdrop : accent,
+      backgroundColor: prominent ? cyan : Colors.transparent,
       disabledForegroundColor: secondaryInk,
       minimumSize: const Size(0, 46),
-      padding: const EdgeInsets.symmetric(horizontal: 5),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(11)),
-      side: BorderSide(color: prominent ? accent.withAlpha(205) : borderColor),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      side: BorderSide(color: prominent ? cyan : borderColor),
       textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
     ),
-    child: Text(label, textAlign: TextAlign.center),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        if (icon != null) ...[Icon(icon, size: 18), const SizedBox(width: 6)],
+        Flexible(child: Text(label, textAlign: TextAlign.center)),
+      ],
+    ),
+  );
+
+  Widget actionGroup(List<Widget> actions, {int columns = 2}) => LayoutBuilder(
+    builder: (context, constraints) {
+      const gap = 8.0;
+      final scale = MediaQuery.textScalerOf(context).scale(13) / 13;
+      final count = (constraints.maxWidth / (95 * scale)).floor().clamp(
+        1,
+        columns,
+      );
+      final width = (constraints.maxWidth - gap * (count - 1)) / count;
+      return Wrap(
+        spacing: gap,
+        runSpacing: gap,
+        children: [
+          for (final action in actions) SizedBox(width: width, child: action),
+        ],
+      );
+    },
+  );
+
+  Widget homeSection(String title, List<Widget> children) => Container(
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: panelColor,
+      border: Border.all(color: borderColor),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [SectionTitle(title), const SizedBox(height: 10), ...children],
+    ),
   );
 
   Widget get hero => Container(
@@ -736,11 +923,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ),
     child: ClipRRect(
       borderRadius: BorderRadius.circular(18),
-      child: ValueListenableBuilder(
-        valueListenable: scene,
-        builder: (_, value, _) => EyeScene(
-          mood: value.$1,
-          revision: value.$2,
+      child: ListenableBuilder(
+        listenable: Listenable.merge([scene, interaction]),
+        builder: (_, _) => EyeScene(
+          mood: scene.value.$1,
+          revision: scene.value.$2,
+          conversationActive: interaction.conversationActive,
           sleepSeconds: sleepSeconds,
           agents: snapshot.agents,
           connected: snapshot.links.isNotEmpty,
@@ -753,8 +941,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget agentStatuses() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      const SectionTitle('AI 工具状态'),
-      const SizedBox(height: 8),
       for (final entry in snapshot.agents.entries)
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -774,303 +960,398 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ],
   );
 
-  Widget modelStatuses() => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      const SectionTitle('桌面模型连接'),
-      const SizedBox(height: 8),
-      for (final (index, model) in snapshot.models.indexed)
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: Row(
-            children: [
-              StatusGlyph(
-                snapshot.links.isEmpty
-                    ? EyeMood.stopped
-                    : switch (model.available) {
-                        true => EyeMood.done,
-                        false => EyeMood.error,
-                        null => EyeMood.idle,
-                      },
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  [
-                    model.name,
-                    model.local ? '本地' : '云端',
-                    if (index == 0) '默认',
-                    if (snapshot.links.isEmpty)
-                      '桌面连接中断'
-                    else
-                      switch (model.available) {
-                        true => '已连接',
-                        false => '连接失败',
-                        null => '未验证',
-                      },
-                  ].join(' · '),
-                  style: const TextStyle(fontSize: 13),
+  Widget modelStatuses() => homeSection('桌面模型连接', [
+    if (snapshot.models.isEmpty)
+      Text(
+        snapshot.links.isEmpty ? '连接电脑后查看模型状态' : '暂无桌面模型状态',
+        style: const TextStyle(fontSize: 13, color: secondaryInk),
+      ),
+    for (final (index, model) in snapshot.models.indexed)
+      statusRow(
+        model.name,
+        Icons.memory_outlined,
+        snapshot.links.isEmpty
+            ? ('连接中断', Icons.link_off, secondaryInk)
+            : switch (model.available) {
+                true => (
+                  '已连接',
+                  Icons.check_circle_outline,
+                  moodColor(EyeMood.done),
                 ),
-              ),
-            ],
-          ),
+                false => (
+                  '连接失败',
+                  Icons.error_outline,
+                  Theme.of(context).colorScheme.error,
+                ),
+                null => ('未验证', Icons.help_outline, secondaryInk),
+              },
+        detail: '${model.local ? '本地' : '云端'}${index == 0 ? ' · 默认' : ''}',
+      ),
+  ]);
+
+  Widget homeHeader() => Row(
+    children: [
+      Container(
+        width: 44,
+        height: 44,
+        decoration: BoxDecoration(
+          color: panelColor,
+          border: Border.all(color: borderColor),
+          borderRadius: BorderRadius.circular(10),
         ),
+        child: const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircleAvatar(radius: 4.5, backgroundColor: cyan),
+            SizedBox(width: 5),
+            CircleAvatar(radius: 4.5, backgroundColor: cyan),
+          ],
+        ),
+      ),
+      const SizedBox(width: 12),
+      const Expanded(
+        child: Text(
+          '背屏电子眼',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+        ),
+      ),
+      IconButton(
+        tooltip: '设置',
+        icon: const Icon(Icons.settings_outlined, color: secondaryInk),
+        onPressed: openSettings,
+      ),
     ],
   );
 
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    body: SafeArea(
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 630),
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(20, 17, 20, 24),
-            children: [
-              Row(
+  Future<void> openSettings() => openSettingsPage(context, '设置', (route) {
+    return SettingsGroup([
+      SettingsEntry(
+        Icons.display_settings_outlined,
+        '显示',
+        () => openSettingsPage(route, '显示设置', (_) => displaySettings()),
+        detail: snapshot.rearSupported ? '自动睡眠、背屏亮度与校准' : '自动睡眠',
+      ),
+      SettingsEntry(
+        Icons.link,
+        '连接',
+        () => openSettingsPage(route, '连接设置', (_) => connectionSettings()),
+        detail: android ? 'Tailscale 配对、局域网 MCP' : 'Tailscale 配对',
+      ),
+      if (!kIsWeb) ...[
+        SettingsEntry(
+          Icons.record_voice_over_outlined,
+          '语音与提醒',
+          () => openInteractionSettings(route, interaction),
+          detail: '自动朗读、音色、提醒规则与记录',
+        ),
+        SettingsEntry(
+          Icons.memory_outlined,
+          '模型设置',
+          () => openModelSettings(route, interaction),
+          detail: '桌面、云端和手机本地模型',
+        ),
+      ],
+      if (android || (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS))
+        SettingsEntry(
+          Icons.security_outlined,
+          '权限设置',
+          () => Navigator.of(route).push<void>(
+            MaterialPageRoute(builder: (_) => const PermissionSettingsPage()),
+          ),
+        ),
+      SettingsEntry(
+        Icons.build_outlined,
+        '诊断',
+        () => openSettingsPage(route, '诊断', diagnostics),
+        detail: '表情测试、运行日志',
+      ),
+    ]);
+  });
+
+  Widget displaySettings() => ValueListenableBuilder(
+    valueListenable: telemetry,
+    builder: (context, data, _) => SettingsGroup([
+      SettingsEntry(Icons.bedtime_outlined, '自动睡眠', sleepSettings),
+      if (data.rearSupported) ...[
+        SettingsEntry(
+          Icons.brightness_6_outlined,
+          '背屏常亮与亮度',
+          rearDisplaySettings,
+        ),
+        SettingsEntry(
+          Icons.adjust,
+          '圆环校准',
+          () => native.invokeMethod<void>('rear', true),
+        ),
+      ],
+    ]),
+  );
+
+  Widget connectionSettings() => SettingsGroup([
+    SettingsEntry(Icons.vpn_lock_outlined, 'Tailscale 配对', remoteConnection),
+    if (android) SettingsEntry(Icons.lan_outlined, '局域网 MCP', lan),
+  ]);
+
+  Widget displayActions() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      if (snapshot.rearSupported)
+        actionGroup([
+          control(
+            '显示到背屏',
+            () => native.invokeMethod<void>('rear', false),
+            prominent: true,
+            icon: Icons.phone_android,
+          ),
+          control(
+            '主屏横屏显示',
+            fullscreen,
+            prominent: true,
+            icon: Icons.screen_rotation_outlined,
+          ),
+        ])
+      else
+        control(
+          '主屏横屏显示',
+          fullscreen,
+          prominent: true,
+          icon: Icons.screen_rotation_outlined,
+        ),
+      if (snapshot.rearSupported || !kIsWeb) const SizedBox(height: 8),
+      if (snapshot.rearSupported)
+        const Text(
+          '切换到背屏需要 Shizuku。',
+          style: TextStyle(fontSize: 12, color: secondaryInk),
+        ),
+      if (snapshot.rearSupported && !kIsWeb) const SizedBox(height: 8),
+      if (!kIsWeb)
+        ListenableBuilder(
+          listenable: interaction,
+          builder: (context, _) => control(
+            '对话',
+            () => openConversation(
+              context,
+              interaction,
+              record: interaction.speechEnabled,
+            ),
+            icon: interaction.speechEnabled
+                ? Icons.mic_none
+                : Icons.chat_bubble_outline,
+          ),
+        ),
+      if (!kIsWeb) InteractionBubbles(interaction, showReply: true),
+    ],
+  );
+
+  Widget connectionControls() => homeSection('连接状态', [
+    for (final (source, label, icon) in [
+      if (android) ('USB', 'USB', Icons.usb),
+      if (android) ('LAN', '局域网', Icons.wifi),
+      ('TAILSCALE', 'Tailscale', Icons.vpn_lock_outlined),
+    ])
+      statusRow(
+        label,
+        icon,
+        snapshot.links.firstOrNull == source
+            ? ('同步中', Icons.sync, cyan)
+            : snapshot.links.contains(source)
+            ? ('已连接', Icons.check_circle_outline, moodColor(EyeMood.done))
+            : source == 'TAILSCALE' && pairing == null
+            ? ('未配对', Icons.link_off, secondaryInk)
+            : ('未连接', Icons.remove_circle_outline, secondaryInk),
+      ),
+    if (android || pairing != null) ...[
+      const SizedBox(height: 8),
+      control(
+        syncing ? '正在同步…' : '同步 Codex',
+        syncing ? null : refreshNow,
+        icon: Icons.sync,
+      ),
+    ],
+    if (syncing || syncResult != null || failure != null) ...[
+      const SizedBox(height: 8),
+      Semantics(
+        liveRegion: true,
+        child: Text(
+          syncing ? '正在等待状态更新…' : (syncResult ?? failure!),
+          style: const TextStyle(fontSize: 12, color: secondaryInk),
+        ),
+      ),
+    ],
+  ]);
+
+  Widget statusRow(
+    String label,
+    IconData icon,
+    (String, IconData, Color) status, {
+    String? detail,
+  }) {
+    final (text, stateIcon, color) = status;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Icon(icon, size: 17, color: secondaryInk),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 3,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: const TextStyle(fontSize: 13)),
+                if (detail != null)
+                  Text(
+                    detail,
+                    style: const TextStyle(fontSize: 12, color: secondaryInk),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            flex: 2,
+            child: Align(
+              alignment: AlignmentDirectional.centerEnd,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    width: 52,
-                    height: 52,
-                    decoration: BoxDecoration(
-                      color: const Color(0xff152438),
-                      border: Border.all(color: cyan.withAlpha(124)),
-                      borderRadius: BorderRadius.circular(13),
-                    ),
-                    child: const Center(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CircleAvatar(radius: 5.5, backgroundColor: cyan),
-                          SizedBox(width: 5.5),
-                          CircleAvatar(radius: 5.5, backgroundColor: cyan),
-                        ],
-                      ),
+                  Icon(stateIcon, size: 16, color: color),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      text,
+                      style: TextStyle(fontSize: 13, color: color),
                     ),
                   ),
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '背屏电子眼',
-                          style: TextStyle(
-                            fontSize: 26,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        Text(
-                          'Agent 状态与表情',
-                          style: TextStyle(fontSize: 13, color: secondaryInk),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (android ||
-                      (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS))
-                    IconButton(
-                      tooltip: '权限设置',
-                      icon: const Icon(Icons.settings_outlined),
-                      onPressed: () => Navigator.of(context).push<void>(
-                        MaterialPageRoute(
-                          builder: (_) => const PermissionSettingsPage(),
-                        ),
-                      ),
-                    ),
                 ],
               ),
-              const SizedBox(height: 17),
-              hero,
-              if (!kIsWeb) ...[
-                InteractionBubbles(interaction, showReply: true),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 5,
-                  children: [
-                    ListenableBuilder(
-                      listenable: interaction,
-                      builder: (context, _) => SpeakButton(
-                        icon: interaction.speechEnabled
-                            ? Icons.mic_none
-                            : Icons.chat_bubble_outline,
-                        onPressed: () => openConversation(
-                          context,
-                          interaction,
-                          record: interaction.speechEnabled,
-                        ),
-                        label: '对话',
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: () => openModelSettings(context, interaction),
-                      child: const Text('模型设置'),
-                    ),
-                    TextButton(
-                      onPressed: () =>
-                          openInteractionSettings(context, interaction),
-                      child: const Text('语音与提醒'),
-                    ),
-                    TextButton(
-                      onPressed: () => openRecentNotices(context, interaction),
-                      child: const Text('最近提醒'),
-                    ),
-                  ],
-                ),
-              ],
-              if (usageLabels(snapshot) case final labels
-                  when labels.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text(
-                  labels.join(' · '),
-                  style: const TextStyle(fontSize: 12, color: secondaryInk),
-                ),
-              ],
-              const SizedBox(height: 16),
-              const SectionTitle('显示控制'),
-              const SizedBox(height: 8),
-              control('主屏横屏显示', fullscreen, prominent: true),
-              if (snapshot.rearSupported) ...[
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: control(
-                        '显示到背屏',
-                        () => native.invokeMethod<void>('rear', false),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: control(
-                        '圆环校准',
-                        () => native.invokeMethod<void>('rear', true),
-                        accent: violet,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                control('背屏常亮与亮度', rearDisplaySettings),
-                const SizedBox(height: 6),
-                const Text(
-                  '手机切屏需要 Shizuku。',
-                  style: TextStyle(fontSize: 12, color: secondaryInk),
-                ),
-              ],
-              const SizedBox(height: 10),
-              control(
-                syncing ? '正在同步…' : '同步 Codex',
-                syncing ? null : refreshNow,
-              ),
-              const SizedBox(height: 6),
-              Semantics(
-                liveRegion: true,
-                child: Text(
-                  syncResult ?? '自动使用已连接的同步方式。',
-                  style: const TextStyle(fontSize: 12, color: secondaryInk),
-                ),
-              ),
-              const SizedBox(height: 8),
-              const SectionTitle('连接状态'),
-              for (final (source, label) in [
-                if (android) ('USB', 'USB'),
-                if (android) ('LAN', '局域网'),
-                ('TAILSCALE', 'Tailscale'),
-              ])
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  child: Text(
-                    '$label · ${snapshot.links.firstOrNull == source
-                        ? '同步中'
-                        : snapshot.links.contains(source)
-                        ? '已连接'
-                        : source == 'TAILSCALE' && pairing == null
-                        ? '未配对'
-                        : '未连接'}',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: snapshot.links.contains(source)
-                          ? cyan
-                          : secondaryInk,
-                    ),
-                  ),
-                ),
-              const SizedBox(height: 8),
-              if (android) ...[
-                control('局域网 MCP', lan),
-                const SizedBox(height: 8),
-              ],
-              control('远程连接', remoteConnection),
-              if (snapshot.models.isNotEmpty) ...[
-                const SizedBox(height: 18),
-                modelStatuses(),
-              ],
-              if (snapshot.agents.isNotEmpty) ...[
-                const SizedBox(height: 18),
-                agentStatuses(),
-              ],
-              const SizedBox(height: 18),
-              const SectionTitle('自动睡眠'),
-              const SizedBox(height: 8),
-              control('待机 ${sleepLabel(sleepSeconds)}后睡眠', sleepSettings),
-              const SizedBox(height: 18),
-              const SectionTitle('表情测试'),
-              const SizedBox(height: 8),
-              for (final row in [
-                [EyeMood.thinking, EyeMood.question, EyeMood.done],
-                [EyeMood.error, EyeMood.sleep, EyeMood.idle],
-                if (!android) [EyeMood.stopped, EyeMood.focus, EyeMood.idea],
-              ]) ...[
-                Row(
-                  children: [
-                    for (final (index, mood) in row.indexed) ...[
-                      if (index != 0) const SizedBox(width: 8),
-                      Expanded(
-                        child: control(
-                          mood.label,
-                          () => play(mood),
-                          accent: moodColor(mood),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 8),
-              ],
-              control('试试打招呼', () => play(EyeMood.hello), accent: violet),
-              const SizedBox(height: 19),
-              const SectionTitle('运行日志'),
-              const SizedBox(height: 8),
-              Container(
-                height: 150,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: panelColor,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: borderColor),
-                ),
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    (android ? snapshot.logs : localLogs).join('\n'),
-                    style: const TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 11,
-                      color: secondaryInk,
-                    ),
-                  ),
-                ),
-              ),
-            ],
+            ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget diagnostics(BuildContext route) => SettingsGroup([
+    SettingsEntry(
+      Icons.sentiment_satisfied_alt,
+      '表情测试',
+      () => openSettingsPage(
+        route,
+        '表情测试',
+        (_) => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            hero,
+            const SizedBox(height: 12),
+            actionGroup([
+              for (final mood in [
+                EyeMood.thinking,
+                EyeMood.question,
+                EyeMood.done,
+                EyeMood.error,
+                EyeMood.sleep,
+                EyeMood.idle,
+                if (!android) ...[EyeMood.stopped, EyeMood.focus, EyeMood.idea],
+              ])
+                control(mood.label, () => play(mood), accent: moodColor(mood)),
+              control('试试打招呼', () => play(EyeMood.hello), accent: violet),
+            ], columns: 3),
+          ],
         ),
       ),
     ),
-  );
+    SettingsEntry(
+      Icons.terminal,
+      '运行日志',
+      () => openSettingsPage(
+        route,
+        '运行日志',
+        (_) => ValueListenableBuilder(
+          valueListenable: telemetry,
+          builder: (context, data, _) {
+            final logs = android ? data.logs : localLogs;
+            return SelectableText(
+              logs.isEmpty ? '暂无运行日志' : logs.join('\n'),
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 12,
+                color: secondaryInk,
+              ),
+            );
+          },
+        ),
+      ),
+    ),
+  ]);
+
+  @override
+  Widget build(BuildContext context) {
+    final usage = usageLabels(snapshot);
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 740),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+              children: [
+                homeHeader(),
+                const SizedBox(height: 14),
+                hero,
+                const SizedBox(height: 12),
+                displayActions(),
+                if (usage.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 16,
+                    runSpacing: 4,
+                    children: [
+                      for (final label in usage)
+                        Text(
+                          label,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: secondaryInk,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 16),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    if (constraints.maxWidth < 620) {
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          connectionControls(),
+                          const SizedBox(height: 12),
+                          modelStatuses(),
+                        ],
+                      );
+                    }
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(child: connectionControls()),
+                        const SizedBox(width: 12),
+                        Expanded(child: modelStatuses()),
+                      ],
+                    );
+                  },
+                ),
+                if (snapshot.agents.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  homeSection('AI 工具状态', [agentStatuses()]),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class DeskPage extends StatefulWidget {
@@ -1094,52 +1375,6 @@ class _DeskPageState extends State<DeskPage> {
   Timer? dimTimer;
   bool visible = false;
   bool _inlineVoice = false;
-  PointerDownEvent? _tapDown;
-  PointerUpEvent? _previousTap;
-
-  // Observe taps alongside EyeScene, whose recognizer owns the eye gestures.
-  void _startTap(PointerDownEvent event) {
-    if (_tapDown != null || event.buttons != kPrimaryButton) {
-      _cancelTap();
-      return;
-    }
-    _tapDown = event;
-  }
-
-  void _moveTap(PointerMoveEvent event) {
-    final down = _tapDown;
-    if (down != null &&
-        down.pointer == event.pointer &&
-        (event.position - down.position).distance > kTouchSlop) {
-      _cancelTap();
-    }
-  }
-
-  void _finishTap(PointerUpEvent event) {
-    final down = _tapDown;
-    if (down == null || down.pointer != event.pointer) return;
-    _tapDown = null;
-    if (event.timeStamp - down.timeStamp >= kLongPressTimeout ||
-        (event.position - down.position).distance > kTouchSlop) {
-      _cancelTap();
-      return;
-    }
-    final previous = _previousTap;
-    if (previous != null &&
-        previous.kind == event.kind &&
-        down.timeStamp - previous.timeStamp <= kDoubleTapTimeout &&
-        (previous.position - event.position).distance <= kDoubleTapSlop) {
-      _previousTap = null;
-      _toggleControls();
-    } else {
-      _previousTap = event;
-    }
-  }
-
-  void _cancelTap() {
-    _tapDown = null;
-    _previousTap = null;
-  }
 
   void _toggleControls() {
     dimTimer?.cancel();
@@ -1172,189 +1407,190 @@ class _DeskPageState extends State<DeskPage> {
       builder: (context, constraints) {
         final insets = MediaQuery.paddingOf(context);
         final radius = math.min(18.0, constraints.maxHeight * .054);
-        return Listener(
-          onPointerDown: _startTap,
-          onPointerMove: _moveTap,
-          onPointerUp: _finishTap,
-          onPointerCancel: (_) => _cancelTap(),
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: ValueListenableBuilder(
-                  valueListenable: widget.telemetry,
-                  builder: (_, data, _) => ListenableBuilder(
-                    listenable: Listenable.merge([
-                      widget.scene,
-                      widget.interaction,
-                    ]),
-                    builder: (_, _) {
-                      final (mood, revision) = widget.scene.value;
-                      final interaction = widget.interaction;
-                      final listening = interaction?.listening == true;
-                      final recognizing =
-                          interaction?.finishingRecording == true;
-                      return EyeScene(
-                        mood: recognizing
-                            ? EyeMood.thinking
-                            : _inlineVoice &&
-                                  interaction?.error != null &&
-                                  !listening
-                            ? EyeMood.error
-                            : mood,
-                        revision: revision,
-                        fullScreen: true,
-                        noticeCue: interaction?.noticeReaction,
-                        voiceLevel: listening && !recognizing
-                            ? interaction?.inputLevel
-                            : null,
-                        sleepSeconds: widget.sleepSeconds,
-                        agents: data.agents,
-                        connected: data.links.isNotEmpty,
-                      );
-                    },
-                  ),
+        return Stack(
+          children: [
+            Positioned.fill(
+              child: ValueListenableBuilder(
+                valueListenable: widget.telemetry,
+                builder: (_, data, _) => ListenableBuilder(
+                  listenable: Listenable.merge([
+                    widget.scene,
+                    widget.interaction,
+                  ]),
+                  builder: (_, _) {
+                    final (mood, revision) = widget.scene.value;
+                    final interaction = widget.interaction;
+                    final listening = interaction?.listening == true;
+                    final recognizing = interaction?.finishingRecording == true;
+                    final speaking = interaction?.spokenText != null;
+                    final eyeMood = recognizing
+                        ? EyeMood.thinking
+                        : _inlineVoice &&
+                              interaction?.error != null &&
+                              !listening
+                        ? EyeMood.error
+                        : speaking && !listening
+                        ? EyeMood.hello
+                        : mood;
+                    return EyeScene(
+                      mood: eyeMood,
+                      revision: revision,
+                      fullScreen: true,
+                      onDoubleTap: _toggleControls,
+                      noticeCue: interaction?.noticeReaction,
+                      voiceLevel: listening && !recognizing
+                          ? interaction?.inputLevel
+                          : null,
+                      speechActivity: interaction?.speechActivity ?? 0,
+                      speaking: speaking && eyeMood == EyeMood.hello,
+                      conversationActive:
+                          interaction?.conversationActive == true,
+                      sleepSeconds: widget.sleepSeconds,
+                      agents: data.agents,
+                      connected: data.links.isNotEmpty,
+                    );
+                  },
                 ),
               ),
-              Positioned(
-                top: insets.top + 16,
-                right: insets.right + 16,
-                child: IgnorePointer(
-                  child: fade(
-                    ValueListenableBuilder(
-                      valueListenable: widget.telemetry,
-                      builder: (_, data, _) => Row(
-                        spacing: 12,
-                        children: [
-                          if (data.fiveRemaining case final value?)
-                            _UsageRing('5 小时', value, cyan, radius),
-                          if (data.weekRemaining case final value?)
-                            _UsageRing('本周', value, violet, radius),
-                        ],
-                      ),
+            ),
+            Positioned(
+              top: insets.top + 16,
+              right: insets.right + 16,
+              child: IgnorePointer(
+                child: fade(
+                  ValueListenableBuilder(
+                    valueListenable: widget.telemetry,
+                    builder: (_, data, _) => Row(
+                      spacing: 12,
+                      children: [
+                        if (data.fiveRemaining case final value?)
+                          _UsageRing('5 小时', value, cyan, radius),
+                        if (data.weekRemaining case final value?)
+                          _UsageRing('本周', value, violet, radius),
+                      ],
                     ),
                   ),
                 ),
               ),
-              if (widget.interaction case final interaction?) ...[
-                ValueListenableBuilder(
-                  valueListenable: widget.telemetry,
-                  builder: (context, data, _) {
-                    final showUsage =
-                        visible &&
-                        (data.fiveRemaining != null ||
-                            data.weekRemaining != null);
-                    final quotaLabelHeight = MediaQuery.textScalerOf(context)
-                        .scale(math.min(11.0, radius * .63));
-                    return Positioned(
-                      top:
-                          insets.top +
-                          16 +
-                          (showUsage
-                              ? radius * 2 + quotaLabelHeight * 1.5 + 12
-                              : 0),
-                      right: insets.right + 16,
-                      width: math.min(330, constraints.maxWidth * .50),
-                      bottom: insets.bottom + 76,
-                      child: Column(
-                        children: [
-                          Expanded(
-                            child: Align(
-                              alignment: Alignment.topCenter,
-                              child: ConstrainedBox(
-                                constraints: BoxConstraints(
-                                  maxHeight: constraints.maxHeight * .48,
-                                ),
-                                child: SingleChildScrollView(
-                                  hitTestBehavior: HitTestBehavior.deferToChild,
-                                  child: InteractionBubbles(
-                                    interaction,
-                                    showReply: !_inlineVoice,
-                                    includeNotice: false,
-                                  ),
+            ),
+            if (widget.interaction case final interaction?) ...[
+              ValueListenableBuilder(
+                valueListenable: widget.telemetry,
+                builder: (context, data, _) {
+                  final showUsage =
+                      visible &&
+                      (data.fiveRemaining != null ||
+                          data.weekRemaining != null);
+                  final quotaLabelHeight = MediaQuery.textScalerOf(context)
+                      .scale(math.min(11.0, radius * .63));
+                  return Positioned(
+                    top:
+                        insets.top +
+                        16 +
+                        (showUsage
+                            ? radius * 2 + quotaLabelHeight * 1.5 + 12
+                            : 0),
+                    right: insets.right + 16,
+                    width: math.min(330, constraints.maxWidth * .50),
+                    bottom: insets.bottom + 76,
+                    child: Column(
+                      children: [
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.topCenter,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxHeight: constraints.maxHeight * .48,
+                              ),
+                              child: SingleChildScrollView(
+                                hitTestBehavior: HitTestBehavior.deferToChild,
+                                child: InteractionBubbles(
+                                  interaction,
+                                  showReply: !_inlineVoice,
+                                  includeNotice: false,
                                 ),
                               ),
                             ),
                           ),
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: ConstrainedBox(
-                              constraints: const BoxConstraints(maxWidth: 300),
-                              child: NoticeSignal(interaction),
-                            ),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-                Positioned(
-                  bottom: insets.bottom + 16,
-                  left: insets.left,
-                  right: insets.right,
-                  child: Align(
-                    alignment: Alignment.bottomCenter,
-                    child: ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxWidth: math.min(344, constraints.maxWidth * .54),
-                      ),
-                      child: ListenableBuilder(
-                        listenable: interaction,
-                        builder: (context, _) => DeskVoiceControl(
-                          interaction,
-                          showCaption: _inlineVoice,
-                          onPressed: () {
-                            if (!interaction.speechEnabled) {
-                              unawaited(openConversation(context, interaction));
-                            } else if (interaction.finishingRecording) {
-                              unawaited(interaction.cancelRecording());
-                            } else if (interaction.listening) {
-                              unawaited(
-                                interaction.stopRecording(sendAfter: true),
-                              );
-                            } else {
-                              if (!_inlineVoice) {
-                                setState(() => _inlineVoice = true);
-                              }
-                              unawaited(
-                                interaction.startRecording(sendAfter: true),
-                              );
-                            }
-                          },
                         ),
-                      ),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 300),
+                            child: NoticeSignal(interaction),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ),
-              ],
+                  );
+                },
+              ),
               Positioned(
                 bottom: insets.bottom + 16,
-                left: widget.interaction == null ? null : insets.left + 16,
-                right: widget.interaction == null ? insets.right + 16 : null,
-                child: ExcludeFocus(
-                  excluding: !visible,
-                  child: IgnorePointer(
-                    ignoring: !visible,
-                    child: fade(
-                      OutlinedButton(
-                        onPressed: () => Navigator.pop(context),
-                        style: OutlinedButton.styleFrom(
-                          minimumSize: const Size(0, 48),
-                          backgroundColor: panelColor,
-                          foregroundColor: secondaryInk,
-                          side: const BorderSide(color: borderColor),
-                          padding: const EdgeInsets.symmetric(horizontal: 14),
-                        ),
-                        child: const Text(
-                          '退出全屏',
-                          style: TextStyle(fontSize: 13),
-                        ),
+                left: insets.left,
+                right: insets.right,
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: math.min(344, constraints.maxWidth * .54),
+                    ),
+                    child: ListenableBuilder(
+                      listenable: interaction,
+                      builder: (context, _) => DeskVoiceControl(
+                        interaction,
+                        showCaption: _inlineVoice,
+                        onPressed: () {
+                          if (!interaction.speechEnabled) {
+                            unawaited(openConversation(context, interaction));
+                          } else if (interaction.finishingRecording) {
+                            unawaited(interaction.cancelRecording());
+                          } else if (interaction.listening) {
+                            unawaited(
+                              interaction.stopRecording(sendAfter: true),
+                            );
+                          } else if (interaction.canRetryReply) {
+                            unawaited(interaction.send());
+                          } else {
+                            if (!_inlineVoice) {
+                              setState(() => _inlineVoice = true);
+                            }
+                            unawaited(
+                              interaction.startRecording(sendAfter: true),
+                            );
+                          }
+                        },
                       ),
                     ),
                   ),
                 ),
               ),
             ],
-          ),
+            Positioned(
+              bottom: insets.bottom + 16,
+              left: widget.interaction == null ? null : insets.left + 16,
+              right: widget.interaction == null ? insets.right + 16 : null,
+              child: ExcludeFocus(
+                excluding: !visible,
+                child: IgnorePointer(
+                  ignoring: !visible,
+                  child: fade(
+                    OutlinedButton(
+                      onPressed: () => Navigator.pop(context),
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size(0, 48),
+                        backgroundColor: panelColor,
+                        foregroundColor: secondaryInk,
+                        side: const BorderSide(color: borderColor),
+                        padding: const EdgeInsets.symmetric(horizontal: 14),
+                      ),
+                      child: const Text('退出全屏', style: TextStyle(fontSize: 13)),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
         );
       },
     ),

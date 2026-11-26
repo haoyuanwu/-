@@ -65,6 +65,19 @@ class DesktopDashboard extends StatefulWidget {
   State<DesktopDashboard> createState() => _DesktopDashboardState();
 }
 
+enum _DashboardPage {
+  overview('概览', Icons.space_dashboard_outlined, Icons.space_dashboard_rounded),
+  models('模型', Icons.tune_outlined, Icons.tune_rounded),
+  phone('手机连接', Icons.phone_android_outlined, Icons.phone_android_rounded),
+  tools('AI 工具', Icons.hub_outlined, Icons.hub_rounded),
+  inbox('收件箱', Icons.inbox_outlined, Icons.inbox_rounded);
+
+  const _DashboardPage(this.label, this.icon, this.selectedIcon);
+  final String label;
+  final IconData icon;
+  final IconData selectedIcon;
+}
+
 class _DesktopDashboardState extends State<DesktopDashboard> {
   static const reportingSkillAsset = 'skills/robot-eyes-reporting/SKILL.md';
   late final RemoteServer server;
@@ -100,9 +113,13 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
   bool _detectingEndpoint = false;
   bool busy = false;
   bool checking = false;
+  bool? _startupEnabled;
+  bool _startupBusy = false;
+  bool _startupFailed = false;
   List<String> _publishedRows = const [];
   bool? _publishedBusy;
   bool? _publishedRunning;
+  _DashboardPage _page = _DashboardPage.overview;
 
   void publishTray() {
     final rows = [
@@ -167,6 +184,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
         }
       });
     }
+    if (Platform.isWindows) unawaited(_updateStartup());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(toggleService());
@@ -176,6 +194,28 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
           (_) => unawaited(detectEndpoint(background: true)),
         );
       }
+    });
+  }
+
+  Future<void> _updateStartup([bool? enabled]) async {
+    if (_startupBusy) return;
+    setState(() => _startupBusy = true);
+    bool? current;
+    try {
+      current = await desktopChannel.invokeMethod<bool>(
+        enabled == null ? 'getStartup' : 'setStartup',
+        enabled,
+      );
+    } on PlatformException {
+      // Retain the last confirmed setting if Windows rejects the change.
+    } on MissingPluginException {
+      // The Windows runner provides the setting through the desktop channel.
+    }
+    if (!mounted) return;
+    setState(() {
+      _startupEnabled = current ?? _startupEnabled;
+      _startupFailed = current == null;
+      _startupBusy = false;
     });
   }
 
@@ -275,14 +315,13 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     return true;
   }
 
-  Widget panel(Widget child) => Container(
-    padding: const EdgeInsets.all(20),
-    decoration: BoxDecoration(
-      color: surface,
-      border: Border.all(color: line),
-      borderRadius: BorderRadius.circular(14),
+  Widget panel(Widget child) => Material(
+    color: surface,
+    shape: RoundedRectangleBorder(
+      side: const BorderSide(color: line),
+      borderRadius: BorderRadius.circular(12),
     ),
-    child: child,
+    child: Padding(padding: const EdgeInsets.all(20), child: child),
   );
 
   Widget heading(IconData icon, String text, [Color color = cyan]) => Row(
@@ -307,19 +346,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Expanded(child: heading(Icons.monitor_rounded, '电脑服务')),
-              StatusPill(
-                busy
-                    ? '切换中'
-                    : server.running
-                    ? '运行中'
-                    : '已停止',
-                active: server.running && !busy,
-              ),
-            ],
-          ),
+          heading(Icons.monitor_rounded, '电脑服务'),
           const SizedBox(height: 12),
           const Text(
             '127.0.0.1:${RemoteServer.port}',
@@ -328,46 +355,69 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
               fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
-          if (failure != null) ...[
-            const SizedBox(height: 8),
-            Text(
-              failure!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
-            ),
-          ],
-          const SizedBox(height: 12),
-          FilledButton.icon(
-            icon: Icon(
-              server.running ? Icons.stop_rounded : Icons.play_arrow_rounded,
-              size: 18,
-            ),
-            onPressed: busy ? null : toggleService,
-            label: Text(server.running ? '停止服务' : '启动服务'),
-          ),
-          const Divider(height: 34, color: line),
-          Text(
-            server.running
-                ? '任务状态 · ${RemoteServer.labels[status['state']]}'
-                : '任务状态 · —',
-          ),
-          const SizedBox(height: 10),
+          const Divider(height: 30, color: line),
           Wrap(
-            spacing: 20,
+            spacing: 36,
+            runSpacing: 14,
             children: [
-              Text(
-                '5 小时剩余 ${remaining('five')}',
-                style: const TextStyle(color: muted),
+              _serviceMetric(
+                '任务状态',
+                server.running
+                    ? RemoteServer.labels[status['state']] ?? '待机'
+                    : '—',
               ),
-              Text(
-                '周剩余 ${remaining('week')}',
-                style: const TextStyle(color: muted),
-              ),
+              _serviceMetric('5 小时剩余', remaining('five')),
+              _serviceMetric('周剩余', remaining('week')),
             ],
           ),
+          if (Platform.isWindows) ...[
+            const Divider(height: 30, color: line),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('开机自启'),
+              subtitle: const Text('登录 Windows 后在托盘启动电脑服务'),
+              value: _startupEnabled ?? false,
+              onChanged: _startupBusy || _startupEnabled == null
+                  ? null
+                  : (enabled) => unawaited(_updateStartup(enabled)),
+            ),
+            if (_startupFailed)
+              Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Text(
+                    '无法更新开机自启设置',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _startupBusy ? null : () => _updateStartup(),
+                    child: const Text('重新读取'),
+                  ),
+                ],
+              ),
+          ],
         ],
       ),
     );
   }
+
+  Widget _serviceMetric(String label, String value) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label, style: const TextStyle(color: muted, fontSize: 13)),
+      const SizedBox(height: 4),
+      Text(
+        value,
+        style: const TextStyle(
+          fontSize: 24,
+          fontWeight: FontWeight.w700,
+          fontFeatures: [FontFeature.tabularFigures()],
+        ),
+      ),
+    ],
+  );
 
   Widget pairingPanel() {
     final command = setupCommand;
@@ -648,16 +698,14 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        heading(Icons.inbox_outlined, '手机收件箱', violet),
+        heading(Icons.inbox_outlined, '手机消息', violet),
         const SizedBox(height: 14),
         if (server.messages.isEmpty)
           const Text('暂无消息', style: TextStyle(color: muted))
         else
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 340),
+          Expanded(
             child: ListView.separated(
               primary: false,
-              shrinkWrap: true,
               itemCount: server.messages.length,
               separatorBuilder: (_, _) => const Divider(color: line),
               itemBuilder: (context, index) {
@@ -710,11 +758,9 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
             for (final MapEntry(:key, :value) in states.entries)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: background,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
+                child: Material(
+                  color: background,
+                  borderRadius: BorderRadius.circular(8),
                   child: ListTile(
                     dense: true,
                     title: Text(
@@ -751,6 +797,53 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     ],
   );
 
+  Widget _workspaceHeader() => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 14),
+    child: Row(
+      children: [
+        Expanded(
+          child: Semantics(
+            header: true,
+            child: Text(
+              _page.label,
+              style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        StatusPill(
+          busy
+              ? '切换中'
+              : server.running
+              ? '服务运行中'
+              : '服务已停止',
+          active: server.running && !busy,
+        ),
+        const SizedBox(width: 10),
+        if (server.running)
+          OutlinedButton(
+            onPressed: busy ? null : toggleService,
+            child: const Text('停止服务'),
+          )
+        else
+          FilledButton(
+            onPressed: busy ? null : toggleService,
+            child: const Text('启动服务'),
+          ),
+      ],
+    ),
+  );
+
+  Widget _pageContent() => switch (_page) {
+    _DashboardPage.overview => stack([servicePanel(), connectedPanel()]),
+    _DashboardPage.models => panel(
+      ModelConnectionsPanel(server.modelConnections, server.phoneModels),
+    ),
+    _DashboardPage.phone => stack([pairingPanel(), lanPanel()]),
+    _DashboardPage.tools => stack([agentMcpPanel(), connectedPanel()]),
+    _DashboardPage.inbox => inboxPanel(),
+  };
+
   @override
   Widget build(BuildContext context) => Scaffold(
     body: Column(
@@ -759,78 +852,97 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final wide = constraints.maxWidth >= 780;
-              return SingleChildScrollView(
-                padding: EdgeInsets.fromLTRB(
-                  wide ? 32 : 18,
-                  28,
-                  wide ? 32 : 18,
-                  32,
-                ),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 1160),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text(
-                          '服务概览',
-                          style: TextStyle(
-                            fontSize: 32,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: -.6,
-                          ),
+              final wide = constraints.maxWidth >= 800;
+              final gutter = wide ? 28.0 : 16.0;
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  NavigationRail(
+                    backgroundColor: surface,
+                    extended: wide,
+                    minWidth: 84,
+                    minExtendedWidth: 160,
+                    labelType: wide
+                        ? NavigationRailLabelType.none
+                        : NavigationRailLabelType.all,
+                    leading: const SizedBox(height: 8),
+                    scrollable: true,
+                    selectedIndex: _page.index,
+                    useIndicator: true,
+                    indicatorColor: cyan.withValues(alpha: .15),
+                    selectedIconTheme: const IconThemeData(
+                      color: cyan,
+                      size: 22,
+                    ),
+                    unselectedIconTheme: const IconThemeData(
+                      color: muted,
+                      size: 22,
+                    ),
+                    selectedLabelTextStyle: const TextStyle(
+                      color: cyan,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    unselectedLabelTextStyle: const TextStyle(color: muted),
+                    onDestinationSelected: (index) =>
+                        setState(() => _page = _DashboardPage.values[index]),
+                    destinations: [
+                      for (final page in _DashboardPage.values)
+                        NavigationRailDestination(
+                          icon: Icon(page.icon),
+                          selectedIcon: Icon(page.selectedIcon),
+                          label: Text(page.label),
                         ),
-                        const SizedBox(height: 5),
-                        const Text(
-                          '管理本机服务、AI 工具会话和背屏连接。',
-                          style: TextStyle(color: muted, fontSize: 14),
-                        ),
-                        const SizedBox(height: 24),
-                        if (wide)
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                    ],
+                  ),
+                  const VerticalDivider(width: 1, color: line),
+                  Expanded(
+                    child: Padding(
+                      padding: EdgeInsets.symmetric(horizontal: gutter),
+                      child: Align(
+                        alignment: Alignment.topCenter,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 980),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              Expanded(
-                                flex: 6,
-                                child: stack([
-                                  servicePanel(),
-                                  connectedPanel(),
-                                  inboxPanel(),
-                                ]),
-                              ),
-                              const SizedBox(width: 16),
-                              Expanded(
-                                flex: 5,
-                                child: stack([
-                                  agentMcpPanel(),
-                                  panel(
-                                    ModelConnectionsPanel(
-                                      server.modelConnections,
+                              _workspaceHeader(),
+                              const Divider(height: 1, color: line),
+                              if (failure case final error?)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 12),
+                                  child: Text(
+                                    error,
+                                    style: TextStyle(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .error,
                                     ),
                                   ),
-                                  pairingPanel(),
-                                  lanPanel(),
-                                ]),
+                                ),
+                              Expanded(
+                                child: _page == _DashboardPage.inbox
+                                    ? Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 16,
+                                        ),
+                                        child: _pageContent(),
+                                      )
+                                    : SingleChildScrollView(
+                                        key: PageStorageKey(_page),
+                                        padding: const EdgeInsets.only(
+                                          top: 16,
+                                          bottom: 24,
+                                        ),
+                                        child: _pageContent(),
+                                      ),
                               ),
                             ],
-                          )
-                        else
-                          stack([
-                            servicePanel(),
-                            connectedPanel(),
-                            agentMcpPanel(),
-                            panel(
-                              ModelConnectionsPanel(server.modelConnections),
-                            ),
-                            pairingPanel(),
-                            lanPanel(),
-                            inboxPanel(),
-                          ]),
-                      ],
+                          ),
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                ],
               );
             },
           ),

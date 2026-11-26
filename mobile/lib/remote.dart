@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:robot_eyes_models/robot_eyes_models.dart';
+
 import 'chat_reasoning.dart';
 import 'phone_model.dart';
 import 'platform_io.dart'
@@ -165,10 +167,51 @@ class Snapshot {
 }
 
 class RemoteClient {
+  Future<List<String>> cloudModelIds(String address, String key) async {
+    final profile = PhoneModel(ModelSource.cloud, address, 'catalog', key);
+    final url = profile.endpoint.replace(
+      path: profile.endpoint.path.replaceFirst(
+        RegExp(r'/chat/completions$'),
+        '/models',
+      ),
+    );
+    final response = await platform.request(
+      url,
+      profile.key,
+      null,
+      maxBytes: 1024 * 1024,
+    );
+    if (response.status != 200) {
+      throw FormatException(switch (response.status) {
+        401 || 403 => '无法读取模型列表，请检查密钥和权限。',
+        404 || 405 => '该服务未提供模型列表，请手动填写模型 ID。',
+        final status => '获取模型列表失败（HTTP $status）。',
+      });
+    }
+    final data = jsonDecode(response.body);
+    if (data is! Map || data['data'] is! List) {
+      throw const FormatException('模型列表格式无效。');
+    }
+    final models = {
+      for (final entry in data['data'] as List)
+        if (entry case {'id': final String id}
+            when id.isNotEmpty && id == id.trim() && id.length <= 200)
+          id,
+    }.toList()..sort();
+    if (models.isEmpty) throw const FormatException('服务未返回可用的模型 ID。');
+    return models;
+  }
+
   Stream<ChatChunk> directChat(
     PhoneModel profile,
     List<Map<String, String>> messages,
   ) async* {
+    if (profile.localPath case final path?) {
+      await for (final text in ggufChat(path, messages)) {
+        yield (text: text, thinking: false);
+      }
+      return;
+    }
     var received = false;
     var length = 0;
     var finished = false;
@@ -213,11 +256,99 @@ class RemoteClient {
     if (!finished) throw const FormatException('模型连接在回复完成前中断。');
   }
 
+  Stream<ChatChunk> localMediaChat(
+    PhoneModel profile,
+    List<Map<String, String>> messages,
+    Map<int, GgufMedia> media,
+  ) async* {
+    final path = profile.localPath;
+    if (path == null ||
+        media.values.any((item) => !profile.mediaTypes.contains(item.type))) {
+      throw const FormatException('当前本机模型不支持此类附件。');
+    }
+    await for (final text in ggufChat(
+      path,
+      messages,
+      projectorPath: profile.projectorPath,
+      media: media,
+    )) {
+      yield (text: text, thinking: false);
+    }
+  }
+
   Future<List<DesktopModel>> models(Pairing pairing) async {
     final json = await _request(pairing, '/ai/models');
     final models = json['models'];
     if (models is! List) throw const FormatException('电脑返回的模型列表无效');
     return DesktopModel.readList(models);
+  }
+
+  Future<PhoneModelSync> syncPhoneModel(
+    Pairing pairing,
+    Map<String, String> state,
+  ) async {
+    final data = await _request(
+      pairing,
+      '/ai/phone-model',
+      state,
+      2 * 1024 * 1024,
+    );
+    final revision = data['revision'];
+    final selection = data['selection'];
+    final catalogRevision = data['catalogRevision'] as String?;
+    final options = data['options'] is List
+        ? (data['options'] as List).map(SavedCloudModel.read).nonNulls.toList()
+        : null;
+    if (revision != null && revision is! String) throw const FormatException();
+    if (data['conflict'] case {
+      'desktopModel': final String desktopModel,
+      'desktopHost': final String desktopHost,
+      'phoneModel': final String phoneModel,
+      'phoneHost': final String phoneHost,
+      'keysDiffer': final bool keysDiffer,
+    }) {
+      return PhoneModelSync(
+        catalogRevision: catalogRevision,
+        options: options,
+        conflict: (
+          desktopModel: desktopModel,
+          desktopHost: desktopHost,
+          phoneModel: phoneModel,
+          phoneHost: phoneHost,
+          keysDiffer: keysDiffer,
+        ),
+      );
+    }
+    if (data['compareRequired'] == true) {
+      return const PhoneModelSync(compareRequired: true);
+    }
+    if (selection == null) {
+      return PhoneModelSync(
+        revision: revision as String?,
+        catalogRevision: catalogRevision,
+        options: options,
+      );
+    }
+    if (revision is! String || selection is! Map) throw const FormatException();
+    if (selection['source'] == 'desktop') {
+      return PhoneModelSync(
+        revision: revision,
+        selection: ModelSource.desktop,
+        catalogRevision: catalogRevision,
+        options: options,
+      );
+    }
+    final profile = PhoneModel.fromJson(selection);
+    if (profile == null || profile.source != ModelSource.cloud) {
+      throw const FormatException();
+    }
+    return PhoneModelSync(
+      revision: revision,
+      selection: ModelSource.cloud,
+      profile: profile,
+      catalogRevision: catalogRevision,
+      options: options,
+    );
   }
 
   Stream<ChatChunk> chat(
@@ -242,8 +373,13 @@ class RemoteClient {
       final frame = jsonDecode(line);
       if (frame is! Map) throw const FormatException('电脑返回的回复格式无效');
       if (frame['done'] == true) return;
-      if (frame['error'] is String) {
-        throw const FormatException('电脑调用模型失败，请检查模型连接并重试。');
+      if (frame['error'] case final String error) {
+        final message = error.trim();
+        throw FormatException(
+          message.isNotEmpty && message.length <= 120
+              ? message
+              : '电脑调用模型失败，请检查模型连接并重试。',
+        );
       }
       final reasoning = frame['reasoning'];
       final thinking = reasoning is String;
@@ -282,11 +418,13 @@ class RemoteClient {
     Pairing pairing,
     String path, [
     Map<String, String>? data,
+    int maxBytes = 16384,
   ]) async {
     final result = await platform.request(
       pairing.url.replace(path: path),
       pairing.token,
       data,
+      maxBytes: maxBytes,
     );
     if (result.status != 200 && result.status != 201) {
       throw RemoteFailure(result.status);

@@ -7,6 +7,7 @@ import 'agent_mcp.dart';
 import 'codex_status.dart';
 import 'model_connections.dart';
 import 'phone_links.dart';
+import 'phone_model_bindings.dart';
 import 'tailscale_endpoint.dart';
 import 'web_app.dart';
 
@@ -31,6 +32,7 @@ class RemoteServer {
     if (running) onChanged(false);
   });
   late final modelConnections = ModelConnections(directory);
+  late final phoneModels = PhoneModelBindings(directory, modelConnections);
   final void Function(bool newMessage) onChanged;
   late final agentMcp = AgentMcp(_publishStatus);
   final _codex = CodexStatus();
@@ -235,6 +237,7 @@ class RemoteServer {
           path == '/status' ||
           path == '/messages' ||
           path == '/ai/models' ||
+          path == '/ai/phone-model' ||
           path == '/ai/chat';
       if (!api && await webApp.serve(request)) return;
       if (!api) {
@@ -247,6 +250,8 @@ class RemoteServer {
         await _receive(request);
       } else if (path == '/ai/models' && request.method == 'GET') {
         _reply(response, 200, {'models': modelConnections.publishedModels()});
+      } else if (path == '/ai/phone-model' && request.method == 'POST') {
+        await _exchangePhoneModel(request);
       } else if (path == '/ai/chat' && request.method == 'POST') {
         await modelConnections.chat(request);
       } else if (path == '/ai/chat' && request.method == 'DELETE') {
@@ -270,6 +275,21 @@ class RemoteServer {
         // The client can safely retry with the same message ID.
       }
     }
+  }
+
+  Future<void> _exchangePhoneModel(HttpRequest request) async {
+    final bytes = <int>[];
+    await for (final chunk in request.timeout(const Duration(seconds: 5))) {
+      if (bytes.length + chunk.length > 12 * 1024) {
+        _reply(request.response, 413, {'error': 'message_too_large'});
+        return;
+      }
+      bytes.addAll(chunk);
+    }
+    final data = jsonDecode(utf8.decode(bytes));
+    if (data is! Map<String, Object?>) throw const FormatException();
+    _reply(request.response, 200, phoneModels.exchange(data));
+    onChanged(false);
   }
 
   Future<void> _receive(HttpRequest request) async {

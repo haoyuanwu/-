@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import 'design.dart';
 import 'interaction.dart';
+import 'reply_frame.dart';
 
 class DeskVoiceControl extends StatelessWidget {
   const DeskVoiceControl(
@@ -22,6 +23,11 @@ class DeskVoiceControl extends StatelessWidget {
     final listening = interaction.listening;
     final finishing = interaction.finishingRecording;
     final error = interaction.error;
+    final showReply =
+        showCaption &&
+        !listening &&
+        error == null &&
+        (interaction.generating || interaction.reply.isNotEmpty);
     final action = finishing
         ? '取消识别'
         : listening
@@ -30,17 +36,29 @@ class DeskVoiceControl extends StatelessWidget {
         ? '重试'
         : '对话';
     final caption = switch (phase) {
-      InteractionPhase.listening => interaction.draft,
+      InteractionPhase.listening =>
+        interaction.draft.isNotEmpty
+            ? interaction.draft
+            : finishing
+            ? '正在识别…'
+            : interaction.startingRecording
+            ? '正在准备麦克风…'
+            : '正在聆听…',
       InteractionPhase.thinking => interaction.question,
       _ =>
-        interaction.loading
+        interaction.loading || error != null
             ? interaction.draft
             : interaction.spokenReply ?? interaction.reply,
     };
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (showCaption && error == null && caption.isNotEmpty)
+        if (showReply)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: ReplyPreview(interaction),
+          ),
+        if (showCaption && !showReply && caption.isNotEmpty)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
             child: Text(
@@ -55,6 +73,21 @@ class DeskVoiceControl extends StatelessWidget {
                   Shadow(color: Colors.black, blurRadius: 6),
                   Shadow(color: Colors.black, blurRadius: 12),
                 ],
+              ),
+            ),
+          ),
+        if (showCaption && error != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Text(
+              error,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Color(0xffffb2b4),
+                fontSize: 13,
+                shadows: [Shadow(color: Colors.black, blurRadius: 8)],
               ),
             ),
           ),

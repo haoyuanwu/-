@@ -15,7 +15,7 @@
 class FlutterWindow : public Win32Window {
  public:
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
-  explicit FlutterWindow(const flutter::DartProject& project);
+  FlutterWindow(const flutter::DartProject& project, bool start_in_tray);
   virtual ~FlutterWindow();
 
  protected:
@@ -39,6 +39,7 @@ class FlutterWindow : public Win32Window {
   bool can_copy_mcp_ = false;
   std::vector<std::wstring> tray_rows_ = {L"正在读取服务状态…"};
   bool notification_icon_added_ = false;
+  const bool start_in_tray_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> notification_channel_;
 
   // The project to run.

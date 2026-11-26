@@ -2,8 +2,15 @@
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
 
+#include <algorithm>
+#include <memory>
+
 #include "flutter_window.h"
 #include "utils.h"
+
+namespace {
+constexpr wchar_t kWindowTitle[] = L"Robot Eyes";
+}
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
@@ -13,21 +20,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     CreateAndAttachConsole();
   }
 
-  // Initialize COM, so that it is available for use in the library and/or
-  // plugins.
-  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-  flutter::DartProject project(L"data");
-
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
+  const bool start_in_tray =
+      std::find(command_line_arguments.begin(), command_line_arguments.end(),
+                "--startup") != command_line_arguments.end();
+  const auto instance_handle =
+      CreateMutexW(nullptr, FALSE, L"Local\\RobotEyesDesktop");
+  const DWORD instance_status = GetLastError();
+  const std::unique_ptr<void, decltype(&CloseHandle)> single_instance(
+      instance_handle, &CloseHandle);
+  if (instance_handle && instance_status == ERROR_ALREADY_EXISTS) {
+    if (!start_in_tray) {
+      if (const HWND existing = FindWindowW(nullptr, kWindowTitle)) {
+        ShowWindowAsync(existing, SW_RESTORE);
+        SetForegroundWindow(existing);
+      }
+    }
+    return EXIT_SUCCESS;
+  }
 
+  // Initialize COM for the runner and plugins.
+  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  flutter::DartProject project(L"data");
   project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 
-  FlutterWindow window(project);
+  FlutterWindow window(project, start_in_tray);
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1280, 720);
-  if (!window.Create(L"Robot Eyes", origin, size)) {
+  if (!window.Create(kWindowTitle, origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

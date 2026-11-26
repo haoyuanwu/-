@@ -24,6 +24,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
 
@@ -41,6 +42,9 @@ internal class RobotInteractionBridge(
     private var contactsPermissionResult: MethodChannel.Result? = null
     private val catalog = Executors.newSingleThreadExecutor()
     private var recognizer: SpeechRecognizer? = null
+    private val localSpeech = if (
+        activity.resources.configuration.locales[0]?.language == Locale.CHINESE.language
+    ) LocalMandarinSpeech(activity.applicationContext, ::emit) else null
     private var engine: TextToSpeech? = null
     private var engineReady = false
     private var utterance: Utterance? = null
@@ -51,12 +55,13 @@ internal class RobotInteractionBridge(
     init {
         methods.setMethodCallHandler(::handle)
         events.setStreamHandler(this)
+        localSpeech?.prepare()
     }
 
     private fun handle(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "capabilities" -> result.success(mapOf(
-                "speech" to SpeechRecognizer.isRecognitionAvailable(activity),
+                "speech" to (localSpeech != null || SpeechRecognizer.isRecognitionAvailable(activity)),
                 "notifications" to true,
                 "liveActivity" to false,
             ))
@@ -94,7 +99,7 @@ internal class RobotInteractionBridge(
             "loadSettings" -> result.success(settings.getString(SETTINGS_KEY, null))
             "saveSettings" -> {
                 val json = call.arguments as? String
-                if (json == null || json.length > 65536) {
+                if (json == null || json.length > 256 * 1024) {
                     result.error("interaction_settings", "无效的语音和通知设置。", null)
                 } else {
                     settings.edit().putString(SETTINGS_KEY, json).apply()
@@ -103,10 +108,14 @@ internal class RobotInteractionBridge(
             }
             "startListening" -> requestListening(result)
             "stopListening" -> {
+                localSpeech?.stop()
                 recognizer?.stopListening()
                 result.success(null)
             }
             "cancelListening" -> {
+                val pendingPermission = permissionResult
+                permissionResult = null
+                pendingPermission?.success(null)
                 suspendListening()
                 result.success(null)
             }
@@ -144,9 +153,9 @@ internal class RobotInteractionBridge(
     }
 
     private fun requestListening(result: MethodChannel.Result) {
-        if (!SpeechRecognizer.isRecognitionAvailable(activity)) {
+        if (localSpeech == null && !SpeechRecognizer.isRecognitionAvailable(activity)) {
             result.error("speech_unavailable", "这台设备未提供语音识别服务。", null)
-        } else if (permissionResult != null || recognizer != null) {
+        } else if (permissionResult != null || recognizer != null || localSpeech?.active == true) {
             result.error("speech_busy", "麦克风正在使用。", null)
         } else if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
@@ -257,13 +266,19 @@ internal class RobotInteractionBridge(
 
     private fun startListening(result: MethodChannel.Result) {
         stopSpeaking()
+        if (localSpeech != null) {
+            localSpeech.start(result)
+            return
+        }
         try {
             val session = SpeechRecognizer.createSpeechRecognizer(activity)
             recognizer = session
             session.setRecognitionListener(object : RecognitionListener {
                 private var lastLevelAt = 0L
                 override fun onReadyForSpeech(params: Bundle?) = Unit
-                override fun onBeginningOfSpeech() = Unit
+                override fun onBeginningOfSpeech() {
+                    if (recognizer === session) emit("speechDetected")
+                }
                 override fun onRmsChanged(rmsdB: Float) {
                     if (recognizer !== session || !rmsdB.isFinite()) return
                     val now = android.os.SystemClock.elapsedRealtime()
@@ -325,6 +340,10 @@ internal class RobotInteractionBridge(
     }
 
     fun suspendListening() {
+        if (localSpeech?.active == true) {
+            localSpeech.cancel()
+            emit("speechEnd")
+        }
         val session = recognizer ?: return
         recognizer = null
         session.cancel()
@@ -369,7 +388,19 @@ internal class RobotInteractionBridge(
 
     private fun playUtterance() {
         val item = utterance ?: return
-        if (engine?.speak(item.text, TextToSpeech.QUEUE_FLUSH, null, item.token) != TextToSpeech.SUCCESS) {
+        val speech = engine ?: return
+        val current = speech.voice
+        if (current == null || current.isNetworkConnectionRequired) {
+            val language = current?.locale?.language ?: Locale.getDefault().language
+            val localVoice = speech.voices.orEmpty().firstOrNull {
+                !it.isNetworkConnectionRequired && it.locale.language == language
+            }
+            if (localVoice == null || speech.setVoice(localVoice) != TextToSpeech.SUCCESS) {
+                finishUtterance(item.token, "设备未安装可用的离线朗读音色。")
+                return
+            }
+        }
+        if (speech.speak(item.text, TextToSpeech.QUEUE_FLUSH, null, item.token) != TextToSpeech.SUCCESS) {
             finishUtterance(item.token, "语音朗读失败。")
         }
     }
@@ -398,6 +429,7 @@ internal class RobotInteractionBridge(
         permissionResult?.error("interaction_closed", "语音界面已关闭。", null)
         permissionResult = null
         suspendListening()
+        localSpeech?.close()
         stopSpeaking()
         engine?.shutdown()
         engine = null

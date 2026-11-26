@@ -10,8 +10,40 @@ import 'package:rear_eyes_mobile/interaction.dart';
 import 'package:rear_eyes_mobile/interaction_view.dart';
 import 'package:rear_eyes_mobile/phone_model.dart';
 import 'package:rear_eyes_mobile/remote.dart';
+import 'package:rear_eyes_mobile/reply_frame.dart';
 
 class _LoopbackHttpOverrides extends HttpOverrides {}
+
+class _PhoneModelSync extends RemoteClient {
+  final reports = <Map<String, String>>[];
+  bool offline = false;
+  PhoneModelSync response = const PhoneModelSync();
+  Completer<PhoneModelSync>? pendingResponse;
+  PhoneModel? used;
+
+  @override
+  Future<PhoneModelSync> syncPhoneModel(
+    Pairing pairing,
+    Map<String, String> state,
+  ) async {
+    reports.add(state);
+    if (offline) throw const SocketException('offline');
+    if (pendingResponse case final pending?) {
+      pendingResponse = null;
+      return pending.future;
+    }
+    return response;
+  }
+
+  @override
+  Stream<ChatChunk> directChat(
+    PhoneModel profile,
+    List<Map<String, String>> messages,
+  ) async* {
+    used = profile;
+    yield (text: '云端回复。', thinking: false);
+  }
+}
 
 class _Desktop extends RemoteClient {
   final answers = <StreamController<ChatChunk>>[];
@@ -59,7 +91,308 @@ class _Desktop extends RemoteClient {
 }
 
 void main() {
+  test('pairing and manual refresh update the catalog without replacing local selection', () async {
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    final events = MethodChannel(RobotInteraction.events.name);
+    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+      if (call.method == 'capabilities') return <String, Object>{};
+      return null;
+    });
+    messenger.setMockMethodCallHandler(events, (_) async => null);
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+      messenger.setMockMethodCallHandler(events, null);
+    });
+
+    final desktop = _PhoneModelSync();
+    Pairing? pairing;
+    final interaction = RobotInteraction(desktop, () => pairing);
+    addTearDown(interaction.dispose);
+    await interaction.initialize();
+    final local = PhoneModel.file('/data/private-model.gguf', 'phone-local');
+    interaction.configureModel(ModelSource.local, local);
+    final cloud = PhoneModel(
+      ModelSource.cloud,
+      'https://cloud.example/v1',
+      'cloud',
+      'key',
+    );
+    final pending = Completer<PhoneModelSync>();
+    desktop.pendingResponse = pending;
+    desktop.response = PhoneModelSync(
+      catalogRevision: 'catalog-two',
+      options: [SavedCloudModel('cloud', 'Cloud', cloud)],
+    );
+    pairing = Pairing.parse(
+      '{"url":"https://desk.example.ts.net","token":"${'a' * 43}"}',
+    );
+    interaction.resetConnection();
+    await Future<void>.delayed(Duration.zero);
+    expect(desktop.reports.single, containsPair('cloudCatalog', ''));
+    final refresh = interaction.syncPhoneModel(force: true);
+    pending.complete(
+      const PhoneModelSync(catalogRevision: 'catalog-one', options: []),
+    );
+    await refresh;
+
+    expect(desktop.reports, hasLength(2));
+    expect(desktop.reports.last, containsPair('cloudCatalog', 'catalog-one'));
+    expect(desktop.reports.last, containsPair('source', 'local'));
+    expect(desktop.reports.last, isNot(contains('url')));
+    expect(interaction.cloudProfiles, [cloud]);
+    expect(interaction.phoneModel, local);
+    expect(interaction.phoneModelSyncLabel, '已与电脑同步');
+  });
+
+  test(
+    'the phone applies desktop cloud credentials and retries offline edits',
+    () async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final events = MethodChannel(RobotInteraction.events.name);
+      String? saved;
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        if (call.method == 'capabilities') return <String, Object>{};
+        if (call.method == 'saveSettings') saved = call.arguments as String;
+        return null;
+      });
+      messenger.setMockMethodCallHandler(events, (_) async => null);
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+        messenger.setMockMethodCallHandler(events, null);
+      });
+      final desktop = _PhoneModelSync();
+      final pairing = Pairing.parse(
+        '{"url":"https://desk.example.ts.net","token":"${'a' * 43}"}',
+      );
+      final interaction = RobotInteraction(desktop, () => pairing);
+      addTearDown(interaction.dispose);
+      await interaction.initialize();
+      desktop.response = PhoneModelSync(
+        revision: 'desktop-selection',
+        selection: ModelSource.cloud,
+        profile: PhoneModel(
+          ModelSource.cloud,
+          'https://cloud.example/v1',
+          'cloud-a',
+          'key-a',
+        ),
+      );
+      await interaction.syncPhoneModel(force: true);
+      expect(desktop.reports.single['source'], 'desktop');
+      expect(interaction.modelSource, ModelSource.cloud);
+      expect(interaction.phoneModel?.key, 'key-a');
+      final applied = interaction.phoneModelUpdate;
+      expect(applied?.message, '已从电脑同步模型 · cloud-a');
+      await interaction.syncPhoneModel(force: true);
+      expect(interaction.phoneModelUpdate, applied);
+      await interaction.send('你好');
+      await Future<void>.delayed(Duration.zero);
+      expect(desktop.used?.model, 'cloud-a');
+      expect(interaction.reply, '云端回复。');
+
+      desktop.offline = true;
+      interaction.configureModel(
+        ModelSource.cloud,
+        PhoneModel(
+          ModelSource.cloud,
+          'https://cloud.example/v1',
+          'cloud-b',
+          'key-b',
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      final pendingEdit = desktop.reports.last['edit'];
+      expect(pendingEdit, isNotNull);
+      expect(interaction.phoneModelSyncLabel, '待同步到电脑');
+      desktop.offline = false;
+      desktop.response = const PhoneModelSync(
+        conflict: (
+          desktopModel: 'cloud-a-edited',
+          desktopHost: 'cloud.example',
+          phoneModel: 'cloud-b',
+          phoneHost: 'cloud.example',
+          keysDiffer: true,
+        ),
+      );
+      await interaction.syncPhoneModel(force: true);
+      expect(interaction.phoneModel?.model, 'cloud-b');
+      expect(interaction.phoneModelConflict?.desktopModel, 'cloud-a-edited');
+      expect(interaction.phoneModelSyncLabel, '云端配置不同，等待处理');
+      expect(interaction.phoneModelUpdate, applied);
+      final comparison = desktop.reports.last['compare'];
+      expect(comparison, isNotNull);
+
+      desktop.response = PhoneModelSync(
+        revision: 'phone-selection',
+        selection: ModelSource.cloud,
+        profile: interaction.phoneModel,
+        options: [
+          SavedCloudModel(
+            'desktop',
+            '电脑配置',
+            PhoneModel(
+              ModelSource.cloud,
+              'https://cloud.example/v1',
+              'cloud-a-edited',
+              'key-a',
+            ),
+          ),
+          SavedCloudModel('phone', '手机配置', interaction.phoneModel!),
+        ],
+      );
+      await interaction.syncPhoneModel(force: true);
+      expect(desktop.reports.last, containsPair('seen', 'desktop-selection'));
+      expect(desktop.reports.last, containsPair('edit', pendingEdit));
+      expect(desktop.reports.last, containsPair('model', 'cloud-b'));
+      expect(desktop.reports.last, containsPair('key', 'key-b'));
+      expect(desktop.reports.last, containsPair('compare', comparison));
+      expect(interaction.phoneModelSyncLabel, '已与电脑同步');
+      expect(interaction.phoneModelConflict, isNull);
+      expect(interaction.savedCloudModels.map((item) => item.profile.model), [
+        'cloud-a-edited',
+        'cloud-b',
+      ]);
+      expect(jsonDecode(saved!)['phoneModelSync']['edit'], isNull);
+      expect(jsonDecode(saved!)['phoneModelSync']['options'], hasLength(2));
+
+      desktop.response = const PhoneModelSync();
+      interaction.configureModel(
+        ModelSource.local,
+        PhoneModel(
+          ModelSource.local,
+          'http://127.0.0.1:11434/v1',
+          'phone-only',
+          'phone-key',
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(desktop.reports.last, containsPair('source', 'local'));
+      expect(desktop.reports.last, containsPair('model', ''));
+      expect(desktop.reports.last, isNot(contains('url')));
+      expect(desktop.reports.last, isNot(contains('key')));
+    },
+  );
+
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'notification speech announces sender, SMS excerpts and verification codes',
+    () async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final events = MethodChannel(RobotInteraction.events.name);
+      String? verification = '短信\n验证码：482096，订单号 997766。';
+      final utterances = <String>[];
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        switch (call.method) {
+          case 'capabilities':
+            return {'speech': true};
+          case 'notificationDetails':
+            return verification;
+          case 'speak':
+            utterances.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      });
+      messenger.setMockMethodCallHandler(events, (_) async => null);
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+        messenger.setMockMethodCallHandler(events, null);
+      });
+      final interaction = RobotInteraction(RemoteClient(), () => null);
+      addTearDown(interaction.dispose);
+      await interaction.initialize();
+      interaction.setReadNotices(true);
+
+      Future<void> send(Map<String, Object> event) async {
+        await messenger.handlePlatformMessage(
+          events.name,
+          const StandardMethodCodec().encodeSuccessEnvelope(event),
+          (_) {},
+        );
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      Future<void> notice(String id, Map<String, Object> fields) async {
+        await send({'type': 'notification', 'id': id, 'app': '微信', ...fields});
+      }
+
+      await notice('ordinary', {'sender': '小明', 'text': '晚上见！'});
+      expect(utterances.last, '小明在微信对你说：晚上见！');
+      await send({'type': 'speechDone'});
+      await notice('empty', {'sender': '小明'});
+      expect(utterances.last, '小明在微信给你发消息了。');
+      await send({'type': 'speechDone'});
+      final opening = '短信内容' * 12 + '短信';
+      await notice('sms', {
+        'app': '信息',
+        'sender': '快递',
+        'sms': true,
+        'text': '$opening这一段不播报',
+      });
+      expect(utterances.last, '收到来自快递的短信，内容是：$opening，后面还有内容。');
+      await send({'type': 'speechDone'});
+      await notice('code', {'verification': true});
+      expect(utterances.last, '收到验证码为，4 8 2 0 9 6。');
+      expect(interaction.recentNotices.first.text, isEmpty);
+      await send({'type': 'speechDone'});
+      verification = null;
+      await notice('hidden-code', {'verification': true});
+      expect(utterances.last, '收到一条验证消息。');
+    },
+  );
+
+  testWidgets('the conversation speaker is in the app bar and persists', (
+    tester,
+  ) async {
+    final messenger = tester.binding.defaultBinaryMessenger;
+    final events = MethodChannel(RobotInteraction.events.name);
+    String? saved;
+    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+      if (call.method == 'capabilities') return {'speech': true};
+      if (call.method == 'loadSettings') return saved;
+      if (call.method == 'saveSettings') saved = call.arguments as String;
+      return null;
+    });
+    messenger.setMockMethodCallHandler(events, (_) async => null);
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+      messenger.setMockMethodCallHandler(events, null);
+    });
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    await interaction.initialize();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) {
+            return TextButton(
+              onPressed: () => openConversation(context, interaction),
+              child: const Text('打开对话'),
+            );
+          },
+        ),
+      ),
+    );
+    await tester.tap(find.text('打开对话'));
+    await tester.pumpAndSettle();
+    final speaker = find.descendant(
+      of: find.byType(AppBar),
+      matching: find.byTooltip('关闭自动朗读'),
+    );
+    expect(speaker, findsOneWidget);
+    await tester.tap(speaker);
+    await tester.pump();
+    expect(find.byTooltip('开启自动朗读'), findsOneWidget);
+    expect(jsonDecode(saved!)['readAnswers'], isFalse);
+
+    final restarted = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(restarted.dispose);
+    await restarted.initialize();
+    expect(restarted.readAnswers, isFalse);
+  });
 
   testWidgets('notice signal animates in and dismisses', (tester) async {
     final interaction = RobotInteraction(RemoteClient(), () => null);
@@ -85,6 +418,129 @@ void main() {
     interaction.clearNotice();
     await tester.pumpAndSettle();
     expect(title, findsNothing);
+  });
+
+  testWidgets(
+    'verification notice opens directly to just the code when available',
+    (tester) async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final events = MethodChannel(RobotInteraction.events.name);
+      String? message = '短信\n【服务】验证码：482096，订单号 997766。';
+      var requests = 0;
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        if (call.method == 'notificationDetails') {
+          requests++;
+          return message;
+        }
+        return call.method == 'capabilities' ? <String, Object>{} : null;
+      });
+      messenger.setMockMethodCallHandler(events, (_) async => null);
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+        messenger.setMockMethodCallHandler(events, null);
+      });
+      final interaction = RobotInteraction(RemoteClient(), () => null);
+      addTearDown(interaction.dispose);
+      await interaction.initialize();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.bottomCenter,
+              child: SizedBox(width: 280, child: NoticeSignal(interaction)),
+            ),
+          ),
+        ),
+      );
+      interaction.notice = (
+        source: '短信',
+        title: '收到验证消息',
+        text: '',
+        verification: true,
+        id: 'verification',
+        eventKey: 'verification:1',
+        packageName: null,
+      );
+      interaction.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(requests, 0);
+      await tester.tap(find.text('收到验证消息'));
+      await tester.pump();
+      expect(
+        tester
+            .widget<FadeTransition>(
+              find
+                  .ancestor(
+                    of: find.byTooltip('关闭'),
+                    matching: find.byType(FadeTransition),
+                  )
+                  .first,
+            )
+            .opacity
+            .value,
+        0,
+      );
+      await tester.pumpAndSettle();
+      expect(requests, 1);
+      expect(find.text('482096'), findsOneWidget);
+      expect(find.textContaining('订单号'), findsNothing);
+      expect(find.text('查看验证内容'), findsNothing);
+      await tester.tap(find.byTooltip('关闭'));
+      await tester.pumpAndSettle();
+      expect(find.text('收到验证消息'), findsOneWidget);
+      message = 'Service\nA12B34 is your Example verification code.';
+      expect(await interaction.noticeCode(interaction.notice!), 'A12B34');
+      message = '短信\n验证码：******，订单号 997766。';
+      expect(await interaction.noticeCode(interaction.notice!), isNull);
+      message = null;
+      await tester.tap(find.text('收到验证消息'));
+      await tester.pumpAndSettle();
+      expect(find.text('验证码不可用'), findsOneWidget);
+    },
+  );
+
+  testWidgets('long notice stays scrollable with large text in landscape', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(700, 375);
+    addTearDown(tester.view.reset);
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MediaQuery(
+          data: MediaQueryData.fromView(tester.view).copyWith(
+            disableAnimations: true,
+            textScaler: const TextScaler.linear(2),
+          ),
+          child: Scaffold(body: NoticeSignal(interaction)),
+        ),
+      ),
+    );
+    interaction.notice = (
+      source: '短信',
+      title: '长通知',
+      text: List.filled(15, '这是一条需要滚动才能读完的提醒。').join('\n'),
+      verification: false,
+      id: null,
+      eventKey: 'long:1',
+      packageName: null,
+    );
+    interaction.notifyListeners();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('长通知'));
+    await tester.pumpAndSettle();
+    final action = find.text('问 AI');
+    await tester.ensureVisible(action);
+    await tester.pumpAndSettle();
+    expect(action.hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    expect(find.text('AI 对话'), findsOneWidget);
+    expect(interaction.draft, interaction.notice?.text);
   });
 
   testWidgets('chat opens as a page with reasoning collapsed', (tester) async {
@@ -140,6 +596,92 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('stopping a reply removes only its reasoning card', (
+    tester,
+  ) async {
+    final desktop = _Desktop();
+    final pairing = Pairing.parse(
+      '{"url":"https://desk.example.ts.net","token":"${'a' * 43}"}',
+    );
+    final interaction = RobotInteraction(desktop, () => pairing);
+    addTearDown(interaction.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => openConversation(context, interaction),
+            child: const Text('打开对话'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('打开对话'));
+    await tester.pumpAndSettle();
+    await interaction.send('第一轮');
+    desktop.answers.single
+      ..add((text: '第一轮思考', thinking: true))
+      ..add((text: '第一轮回复', thinking: false));
+    unawaited(desktop.answers.single.close());
+    await tester.pumpAndSettle();
+
+    await interaction.send('第二轮');
+    desktop.answers.last
+      ..add((text: '第二轮思考', thinking: true))
+      ..add((text: '已输出的正文', thinking: false));
+    await tester.pump();
+    expect(find.text('思考过程'), findsNWidgets(2));
+
+    await tester.tap(find.byTooltip('停止回答'));
+    await tester.pumpAndSettle();
+    expect(find.text('思考过程'), findsOneWidget);
+    expect(find.text('已输出的正文', findRichText: true), findsOneWidget);
+    expect(interaction.draft, '第二轮');
+    unawaited(desktop.answers.last.close());
+    await tester.pump();
+  });
+
+  testWidgets(
+    'compact replies show the newest stream text without a tap action',
+    (tester) async {
+      final interaction = RobotInteraction(_Desktop(), () => null);
+      addTearDown(interaction.dispose);
+      interaction.phase = InteractionPhase.thinking;
+      interaction.question = '介绍一下机器人';
+      interaction.replyModel = '桌面测试模型';
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: 280,
+              child: ListenableBuilder(
+                listenable: interaction,
+                builder: (_, _) => ReplyPreview(interaction),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(find.text('等待回复'), findsOneWidget);
+      interaction.phase = InteractionPhase.answering;
+      interaction.reply = '${'这是一段正在流式接收的回复。' * 16}最后一句。';
+      interaction.notifyListeners();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.text('接收中'), findsOneWidget);
+      expect(find.textContaining('最后一句。'), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(ReplyPreview),
+          matching: find.byType(InkWell),
+        ),
+        findsNothing,
+      );
+      interaction.phase = InteractionPhase.idle;
+      interaction.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.text('接收中'), findsNothing);
+    },
+  );
+
   test(
     'a followed app notification received in background is shown on resume',
     () async {
@@ -173,6 +715,8 @@ void main() {
         String title, {
         String? id,
         String? sender,
+        bool verification = false,
+        bool? matchesNoticeRules,
       }) => messenger.handlePlatformMessage(
         channel.name,
         const StandardMethodCodec().encodeSuccessEnvelope({
@@ -182,6 +726,8 @@ void main() {
           'id': id ?? package,
           'sender': sender ?? '',
           'title': title,
+          'verification': verification,
+          'matchesNoticeRules': ?matchesNoticeRules,
         }),
         (_) {},
       );
@@ -222,6 +768,26 @@ void main() {
       expect(reopened.recentNotices.first.title, '联系人提醒');
       expect(reopened.recentNotices.length, 5);
       expect(reopened.notice, isNull);
+
+      reopened.saveKeywords(['验证码']);
+      await emit(
+        'sms.app',
+        '收到验证消息',
+        id: 'unmatched-verification',
+        verification: true,
+        matchesNoticeRules: false,
+      );
+      expect(reopened.notice, isNull);
+      await emit(
+        'sms.app',
+        '收到验证消息',
+        id: 'matched-verification',
+        verification: true,
+        matchesNoticeRules: true,
+      );
+      expect(reopened.notice?.title, '收到验证消息');
+      expect(reopened.notice?.text, isEmpty);
+      expect(reopened.recentNotices.first.verification, isTrue);
     },
   );
 
@@ -249,7 +815,6 @@ void main() {
       final interaction = RobotInteraction(desktop, () => pairing);
       addTearDown(interaction.dispose);
       await interaction.initialize();
-      await interaction.startRecording();
 
       Future<void> emit(Map<String, Object> event) async {
         await messenger.handlePlatformMessage(
@@ -259,6 +824,17 @@ void main() {
         );
       }
 
+      interaction.setDraft('原来草稿');
+      await interaction.startRecording(sendAfter: true);
+      await emit({'type': 'speech', 'text': '短暂录音', 'final': false});
+      expect(interaction.draft, isEmpty);
+      await emit({'type': 'speech', 'text': '短暂录音', 'final': true});
+      expect(interaction.draft, '原来草稿');
+      expect(interaction.error, isNull);
+      expect(desktop.requests, isEmpty);
+
+      await interaction.startRecording();
+      await Future<void>.delayed(const Duration(milliseconds: 650));
       await emit({'type': 'speechLevel', 'level': .75});
       expect(interaction.inputLevel, .75);
       await emit({'type': 'speech', 'text': '你好', 'final': false});
@@ -309,21 +885,70 @@ void main() {
     expect(interaction.phase, InteractionPhase.idle);
   });
 
-  test('a LAN model sends without a desktop pairing', () async {
-    final interaction = RobotInteraction(_Desktop(), () => null);
-    addTearDown(interaction.dispose);
-    final profile = PhoneModel(
-      ModelSource.lan,
-      'http://192.168.1.8:11434/v1',
-      'test-model',
-      '',
+  test(
+    'standalone cloud profiles can be saved and switched without a pairing',
+    () async {
+      final interaction = RobotInteraction(_Desktop(), () => null);
+      addTearDown(interaction.dispose);
+      final profile = PhoneModel(
+        ModelSource.cloud,
+        'https://cloud.example/v1',
+        'test-model',
+        '',
+      );
+      expect(profile.endpoint.path, '/v1/chat/completions');
+      interaction.configureModel(ModelSource.cloud, profile);
+      interaction.configureModel(
+        ModelSource.cloud,
+        PhoneModel(
+          ModelSource.cloud,
+          'https://second.example/v1',
+          'second-model',
+          '',
+        ),
+      );
+      expect(interaction.cloudProfiles.map((item) => item.model), [
+        'second-model',
+        'test-model',
+      ]);
+      interaction.configureModel(ModelSource.cloud, profile);
+      await interaction.send('你好');
+      await Future<void>.delayed(Duration.zero);
+      expect(interaction.reply, '直连回复。');
+      expect(interaction.reasoning, '单独返回的推理标签里的推理');
+    },
+  );
+
+  test('local file profiles keep the file reference and report an unavailable GGUF', () async {
+    final folder = await Directory.systemTemp.createTemp('robot-eyes-gguf-');
+    addTearDown(() => folder.delete(recursive: true));
+    final file = '${folder.path}/missing.gguf';
+    final profile = PhoneModel.file(file, '本机对话');
+    final restored = PhoneModel.fromJson(profile.toJson())!;
+    expect(restored.localPath, file);
+    expect(restored.source, ModelSource.local);
+    expect(restored.toJson(), isNot(contains('url')));
+    await expectLater(
+      RemoteClient().directChat(restored, [
+        {'role': 'user', 'content': '你好'},
+      ]),
+      emitsError(
+        isA<FormatException>().having(
+          (error) => error.message,
+          'message',
+          contains('GGUF'),
+        ),
+      ),
     );
-    expect(profile.endpoint.path, '/v1/chat/completions');
-    interaction.configureModel(ModelSource.lan, profile);
-    await interaction.send('你好');
-    await Future<void>.delayed(Duration.zero);
-    expect(interaction.reply, '直连回复。');
-    expect(interaction.reasoning, '单独返回的推理标签里的推理');
+    expect(
+      PhoneModel.fromJson({
+        'source': 'lan',
+        'url': 'http://192.168.1.10/v1',
+        'model': 'old',
+        'key': '',
+      }),
+      isNull,
+    );
   });
 
   test('phone model streams a reply from a loopback service', () async {

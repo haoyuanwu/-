@@ -132,8 +132,9 @@ Future<void> keepScreenOn(bool enabled) async {
 Future<({int status, String body})> request(
   Uri url,
   String token,
-  Map<String, String>? data,
-) async {
+  Map<String, String>? data, {
+  int maxBytes = 16384,
+}) async {
   if (url.origin != Uri.base.origin) {
     throw const FormatException('请在这台电脑的 Tailscale 地址打开 Web App，再使用它的配对配置。');
   }
@@ -163,7 +164,7 @@ Future<({int status, String body})> request(
       return (status: result.status, body: '');
     }
     final body = (await result.text().toDart).toDart;
-    if (body.length > 16384) throw const FormatException('电脑返回的数据过大');
+    if (body.length > maxBytes) throw const FormatException('电脑返回的数据过大');
     return (status: result.status, body: body);
   } finally {
     timeout.cancel();

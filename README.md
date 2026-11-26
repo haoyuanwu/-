@@ -12,8 +12,8 @@ Robot Eyes 桌面端位于 [desktop](desktop/README.md)，共用 Flutter 和 Dar
 
 1. 启动桌面端。服务自动绑定电脑本机的 `127.0.0.1:18792`。
 2. 在电脑终端运行 `tailscale serve --bg --https=8443 18792`。如果 Tailscale 提示启用 HTTPS，按提示完成设置。8443 需空闲。
-3. 安装新版 Android 应用后，用 USB 连接电脑并授权调试。桌面端会把配对配置自动传到手机。也可以点击桌面端「复制配对配置」，手动粘贴到手机「远程连接」并保存。
-4. 在手机打开「远程连接」，可以查看电脑状态和最近同步时间。
+3. 安装新版 Android 应用后，用 USB 连接电脑并授权调试。桌面端会把配对配置自动传到手机。也可以点击桌面端「复制配对配置」，手动粘贴到手机「设置 → 连接 → Tailscale 配对」并保存。
+4. 在手机首页查看连接状态和桌面模型状态。打开「设置 → 连接 → Tailscale 配对」可查看最近同步时间。
 
 两端保持 Tailscale 在线，电脑需保持唤醒，桌面端可最小化。安卓端在应用可见时刷新远程状态，包含背屏和主屏横屏模式。
 
@@ -45,7 +45,7 @@ Codex 弹出用户选择时，背屏会显示疑问表情，等 Codex 收到答�
 如果 AI 工具和 Robot Eyes 桌面端运行在同一台电脑，在「桌面 AI MCP」点「复制给 AI 配置」，再将内容粘贴到 AI 对话，让它安装状态上报 Skill 并配置 MCP。手机主屏「AI 工具状态」会按名称显示已接入的工具。具体步骤见[桌面端说明](desktop/README.md#桌面-ai-mcp)。
 
 1. 用下文的 Gradle 命令构建并安装 `reareyes/app/build/outputs/apk/debug/app-debug.apk`。历史 APK 不包含此功能。
-2. 让手机和电脑连接同一个可信局域网。在手机主屏打开「局域网 MCP」，点「开启 MCP」和「复制配置」。通过可信的方式把配置转到电脑。
+2. 让手机和电脑连接同一个可信局域网。在手机打开「设置 → 连接 → 局域网 MCP」，点「开启 MCP」和「复制配置」。通过可信的方式把配置转到电脑。
 3. 在桌面工具的 MCP 设置中添加 `robot-eyes`，传输选 **Streamable HTTP**。使用配置中的 `url` 和 `Authorization: Bearer <访问密钥>` 请求头。支持 `mcpServers` JSON 的客户端可以粘贴配置，具体字段以客户端为准。
 4. 让 Agent 调用 `set_eye_state`，例如传入 `{"agent":"WorkBuddy","state":"THINKING"}`。开启手机背屏显示后即可看到汇总状态。
 

@@ -3,7 +3,9 @@
 #include <cwchar>
 #include <optional>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <windowsx.h>
+#include <wrl/client.h>
 
 #include <flutter/standard_method_codec.h>
 
@@ -18,6 +20,64 @@ constexpr UINT kOpenDashboard = 2;
 constexpr UINT kQuit = 3;
 constexpr UINT kCopyPairing = 4;
 constexpr UINT kCopyAiSetup = 5;
+
+HRESULT StartupShortcut(std::wstring& path) {
+  PWSTR folder = nullptr;
+  const HRESULT status =
+      SHGetKnownFolderPath(FOLDERID_Startup, KF_FLAG_DEFAULT, nullptr, &folder);
+  if (SUCCEEDED(status)) {
+    path = std::wstring(folder) + L"\\Robot Eyes.lnk";
+  }
+  CoTaskMemFree(folder);
+  return status;
+}
+
+HRESULT ReadStartup(const std::wstring& path, bool& enabled) {
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes != INVALID_FILE_ATTRIBUTES) {
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) return E_FAIL;
+    enabled = true;
+    return S_OK;
+  }
+  const DWORD error = GetLastError();
+  enabled = false;
+  return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+             ? S_OK
+             : HRESULT_FROM_WIN32(error);
+}
+
+HRESULT WriteStartup(const std::wstring& path, bool enabled) {
+  if (!enabled) {
+    if (DeleteFileW(path.c_str())) return S_OK;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+               ? S_OK
+               : HRESULT_FROM_WIN32(error);
+  }
+
+  std::wstring executable(32768, L'\0');
+  const DWORD size = static_cast<DWORD>(executable.size());
+  const DWORD length = GetModuleFileNameW(nullptr, executable.data(), size);
+  if (length == 0 || length >= size) return E_FAIL;
+  executable.resize(length);
+  const auto directory = executable.substr(0, executable.find_last_of(L'\\'));
+
+  Microsoft::WRL::ComPtr<IShellLinkW> shortcut;
+  HRESULT status = CoCreateInstance(CLSID_ShellLink, nullptr,
+                                    CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(shortcut.GetAddressOf()));
+  if (FAILED(status)) return status;
+  status = shortcut->SetPath(executable.c_str());
+  if (FAILED(status)) return status;
+  status = shortcut->SetArguments(L"--startup");
+  if (FAILED(status)) return status;
+  status = shortcut->SetWorkingDirectory(directory.c_str());
+  if (FAILED(status)) return status;
+  Microsoft::WRL::ComPtr<IPersistFile> file;
+  status = shortcut.As(&file);
+  if (FAILED(status)) return status;
+  return file->Save(path.c_str(), TRUE);
+}
 
 NOTIFYICONDATAW TrayIcon(HWND window) {
   NOTIFYICONDATAW icon{};
@@ -39,8 +99,9 @@ std::wstring FromUtf8(const std::string& text) {
 }
 }  // namespace
 
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+FlutterWindow::FlutterWindow(const flutter::DartProject& project,
+                             bool start_in_tray)
+    : start_in_tray_(start_in_tray), project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -89,6 +150,23 @@ bool FlutterWindow::OnCreate() {
           ShowWindow(window, SW_MINIMIZE);
         } else if (method == "hideWindow") {
           PostMessage(window, WM_CLOSE, 0, 0);
+        } else if (method == "getStartup" || method == "setStartup") {
+          std::wstring path;
+          bool enabled = false;
+          HRESULT status = StartupShortcut(path);
+          if (SUCCEEDED(status) && method == "setStartup") {
+            const auto* requested = call.arguments()
+                                        ? std::get_if<bool>(call.arguments())
+                                        : nullptr;
+            status = requested ? WriteStartup(path, *requested) : E_INVALIDARG;
+          }
+          if (SUCCEEDED(status)) status = ReadStartup(path, enabled);
+          if (SUCCEEDED(status)) {
+            result->Success(flutter::EncodableValue(enabled));
+          } else {
+            result->Error("windows_startup");
+          }
+          return;
         } else {
           result->NotImplemented();
           return;
@@ -100,7 +178,9 @@ bool FlutterWindow::OnCreate() {
   taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
   AddTrayIcon();
 
-  flutter_controller_->engine()->SetNextFrameCallback([this]() { Show(); });
+  flutter_controller_->engine()->SetNextFrameCallback([this]() {
+    if (!start_in_tray_ || !notification_icon_added_) Show();
+  });
   flutter_controller_->ForceRedraw();
   return true;
 }

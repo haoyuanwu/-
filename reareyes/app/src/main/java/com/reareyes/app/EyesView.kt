@@ -25,6 +25,7 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /** 双眼和眉毛共用一组几何参数，切换表情时在同一个轮廓上插值。 */
@@ -43,7 +44,10 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             invalidate()
         }
 
-    private fun sleepSession() = if (keepAwake) null else EyesBus.sleepSession()
+    private fun sleepSession() =
+        if (keepAwake || (display == Presentation.REAR &&
+                EyesBus.rearConversationKeepsAwake(SystemClock.elapsedRealtime()))) null
+        else EyesBus.sleepSession()
 
     internal var deskUsageOpacity = 1f
         set(value) {
@@ -156,6 +160,9 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
 
     private var target = expressionFor(EyesBus.state)
     private var motionEnabled = true
+    private var voiceEnergy = 0f
+    private val voicePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val mouthPath = Path()
     private var gesture = Gesture.NORMAL
     private var pointerId = MotionEvent.INVALID_POINTER_ID
     private var pressedAt = 0L
@@ -560,8 +567,19 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
 
         val previousGesture = gesture
         gesture = gestureAt(time)
+        val voice = EyesBus.rearVoice.takeIf { rear && gesture == Gesture.NORMAL }
+        val listening = voice?.phase == EyesBus.VoicePhase.LISTENING
+        val speechBeat = voice?.takeIf { it.phase == EyesBus.VoicePhase.SPEAKING }?.let {
+            if (motionEnabled) {
+                val seconds = (time - it.startedAt) / 1000f
+                val beat = (seconds * 4.6f + 0.24f * sin(seconds * 7f)).mod(1f)
+                val phrase = 0.5f - 0.5f * cos(seconds * 2f * PI.toFloat() / 1.65f)
+                sin(beat * PI.toFloat()) * (0.48f + 0.52f * phrase)
+            } else 0.35f
+        }
         val status = EyesBus.state.let {
-            if (keepAwake && it == EyeState.SLEEP) EyeState.IDLE else it
+            if (it == EyeState.SLEEP &&
+                (keepAwake || (rear && EyesBus.rearConversationKeepsAwake(time)))) EyeState.IDLE else it
         }
         if (status != lastStatus) {
             if (gesture == Gesture.NORMAL && blinkStarted == 0L &&
@@ -575,10 +593,14 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val greeting = greetedAt > 0 && time - greetedAt < GREETING_DURATION &&
             (EyesBus.stateSince <= greetedAt || !fullScreen) &&
             (!fullScreen || (status != EyeState.QUESTION && status != EyeState.ERROR))
-        val idleActive = gesture == Gesture.NORMAL && status == EyeState.IDLE && !greeting && motionEnabled
+        val idleActive = voice == null && gesture == Gesture.NORMAL &&
+            status == EyeState.IDLE && !greeting && motionEnabled
         val idleMood = idleExpressionAt(time, idleActive)
         val expression = when (gesture) {
             Gesture.NORMAL -> when {
+                listening -> Expression.FOCUS
+                voice?.phase == EyesBus.VoicePhase.THINKING -> Expression.THINKING
+                voice != null -> Expression.HELLO
                 greeting -> Expression.HELLO
                 idleMood != null -> idleMood
                 else -> expressionFor(status)
@@ -649,6 +671,14 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             else -> Point(0f, 0f)
         }
         val elapsed = if (lastFrameAt == 0L) 16L else (time - lastFrameAt).coerceIn(1L, 50L)
+        val heard = voice?.heardAt?.let {
+            0.83f * (1f - smoothStep((time - it - 100L) / 360f))
+        } ?: 0f
+        val voiceTarget = if (listening) max(sqrt(voice?.level ?: 0f), heard) else 0f
+        voiceEnergy = if (motionEnabled) {
+            val response = if (voiceTarget > voiceEnergy) 44f else 150f
+            blend(voiceEnergy, voiceTarget, 1f - exp(-elapsed / response))
+        } else 0f
         lastFrameAt = time
         if (thought != null) {
             val age = time - thought.startedAt
@@ -675,7 +705,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             Gesture.TRACK -> if (motionEnabled) blink(time) else 1f
             Gesture.NORMAL -> when {
                 thought != null -> thinkingBlink(time, thought)
-                motionEnabled && (expression == Expression.IDLE || expression == Expression.QUESTION) ->
+                motionEnabled && (expression == Expression.IDLE || expression == Expression.QUESTION ||
+                    listening || speechBeat != null) ->
                     blink(time, idle = expression == Expression.IDLE)
                 else -> 1f
             }
@@ -690,7 +721,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         eyeSpacing = if (motionEnabled) blend(eyeSpacing, desiredSpacing, (1 - exp(-elapsed / 100.0)).toFloat())
             else desiredSpacing
         val alertBlink = if (reacting) 1f - 0.88f * pulse(noticeAge - 320L, 210L) else 1f
-        var destination = faceFor(expression, time, blink * alertBlink, w / h, eyeSpacing)
+        var destination = faceFor(expression, time, blink * alertBlink, w / h, eyeSpacing,
+            listeningEnergy = voiceEnergy.takeIf { listening }, speechBeat = speechBeat)
         if (gesture == Gesture.TAP_LOOK && motionEnabled) {
             val near = smoothStep((abs(touchX) - 0.08f) / 0.37f)
             val wink = if (tapWinks) 0.54f * pulse(tapAge - 420L, 260L) else 0f
@@ -739,7 +771,10 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             touchX * 8f * attention + leadX * 14f * attention
         } else 0f
         val expressionAge = time - if (status == EyeState.DONE) donePresentedAt else morphStart
-        val nextTilt = headAngle(expression, expressionAge) + touchTilt
+        val voiceTilt = if (motionEnabled && voice != null && (listening || speechBeat != null)) {
+            sin((time - voice.startedAt) / 300f) * (voiceEnergy * 3.5f + (speechBeat ?: 0f) * 3f)
+        } else 0f
+        val nextTilt = headAngle(expression, expressionAge) + touchTilt + voiceTilt
         headTilt = blend(headTilt, nextTilt, (1 - exp(-elapsed / 54.0)).toFloat())
         canvas.rotate(headTilt, w * 0.5f, h * 0.46f)
         if (rear) canvas.scale(1.07f, 1.07f, w * 0.5f, h * EYE_CENTER_Y)
@@ -753,6 +788,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         } else null
         drawEye(canvas, face.left.shift(gaze), w, h, pupilGaze, codeAge, innerAtEnd = true)
         drawEye(canvas, face.right.shift(gaze), w, h, pupilGaze, codeAge, innerAtEnd = false)
+        if (listening) drawListeningBars(canvas, time, w, h, progress)
+        if (speechBeat != null) drawSpeakingMouth(canvas, w, h, speechBeat, progress)
         canvas.restoreToCount(pose)
         drawDetails(canvas, expression, status, face.palette, time, w, h, progress)
         canvas.restoreToCount(frame)
@@ -777,6 +814,37 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         drawTapParticles(canvas, time)
         if (rearNotice != null) drawRearNotice(canvas, usageWidth, rearNotice, noticeAge)
         postInvalidateOnAnimation()
+    }
+
+    private fun drawListeningBars(canvas: Canvas, time: Long, w: Float, h: Float, progress: Float) {
+        voicePaint.color = 0xFF8CCDFF.toInt()
+        voicePaint.alpha = (progress * (150 + 105 * voiceEnergy)).toInt()
+        for (index in -2..2) {
+            val motion = 0.5f + 0.5f * sin(time / 75f + index * 1.55f)
+            val barHeight = h * (0.013f + voiceEnergy * (0.025f + 0.058f * motion) *
+                (1f - 0.17f * abs(index)))
+            val x = w * 0.5f + h * index * 0.041f
+            val y = h * 0.745f
+            val radius = h * 0.008f
+            canvas.drawRoundRect(x - radius, y - barHeight / 2f, x + radius, y + barHeight / 2f,
+                radius, radius, voicePaint)
+        }
+    }
+
+    private fun drawSpeakingMouth(canvas: Canvas, w: Float, h: Float, beat: Float, progress: Float) {
+        val x = w * 0.5f
+        val y = h * 0.742f
+        val width = h * (0.123f - 0.047f * beat)
+        val opening = h * (0.028f + 0.112f * beat) * progress
+        mouthPath.rewind()
+        mouthPath.moveTo(x - width, y)
+        mouthPath.quadTo(x, y + h * 0.013f, x + width, y)
+        mouthPath.cubicTo(x + width * 0.67f, y + opening,
+            x - width * 0.67f, y + opening, x - width, y)
+        mouthPath.close()
+        voicePaint.color = 0xFFFFC89E.toInt()
+        voicePaint.alpha = (progress * 240f).toInt()
+        canvas.drawPath(mouthPath, voicePaint)
     }
 
     private fun drawRearNotice(canvas: Canvas, leftInset: Float, notice: EyesBus.RearNotice, age: Long) {
@@ -977,7 +1045,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     }
 
     private fun faceFor(expression: Expression, time: Long, blink: Float, canvasAspect: Float,
-                        eyeSpacing: Float = EYE_SPACING): Face {
+                        eyeSpacing: Float = EYE_SPACING, listeningEnergy: Float? = null,
+                        speechBeat: Float? = null): Face {
         val age = time - morphStart
         val swell = if (motionEnabled) pulse(age, 760L) else 0f
         fun openEye(x: Float, y: Float, diameter: Float, height: Float, blink: Float, browY: Float,
@@ -1044,15 +1113,27 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                 Expression.FOCUS -> {
                     val proximity = ((pupilGaze.x * side - 0.045f) / 0.68f).coerceIn(0f, 1f)
                     val near = proximity * proximity * (3f - 2f * proximity)
-                    openEye(x, y, 0.253f * (1f - near * 0.14f), 0.401f * (1f - near * 0.24f),
-                        blink, 0.172f + near * 0.048f, -side * 0.108f, 0.026f)
+                    val voice = listeningEnergy ?: 0f
+                    val raised = if (listeningEnergy != null) 0.024f else 0f
+                    val accent = voice * sin(time / 290f)
+                    openEye(x, y - raised - 0.055f * voice + side * 0.017f * accent,
+                        (0.253f + 0.048f * voice) * (1f - near * 0.14f),
+                        (0.401f + 0.145f * voice) * (1f - near * 0.24f),
+                        blink, 0.172f - raised - 0.054f * voice + near * 0.048f,
+                        -side * (0.108f - 0.068f * voice) + 0.11f * accent, 0.026f + voice * 0.043f)
                 }
                 Expression.HELLO -> {
-                    val hop = if (motionEnabled) pulse(age, 680L) else 0f
-                    val wink = if (left && motionEnabled) 1f - 0.89f * pulse(age - 410L, 520L) else 1f
-                    openEye(x, y - hop * 0.052f + if (left) 0.020f else 0f, 0.29f,
-                        if (left) 0.403f else 0.458f, wink, 0.145f - hop * 0.04f, 0f, 0.035f,
-                        showBrow = false)
+                    if (speechBeat != null) {
+                        openEye(x, y - 0.045f + 0.039f * speechBeat, 0.303f,
+                            0.405f + 0.073f * speechBeat, blink, 0.142f - 0.049f * speechBeat,
+                            -side * 0.12f, 0.060f)
+                    } else {
+                        val hop = if (motionEnabled) pulse(age, 680L) else 0f
+                        val wink = if (left && motionEnabled) 1f - 0.89f * pulse(age - 410L, 520L) else 1f
+                        openEye(x, y - hop * 0.052f + if (left) 0.020f else 0f, 0.29f,
+                            if (left) 0.403f else 0.458f, wink, 0.145f - hop * 0.04f, 0f, 0.035f,
+                            showBrow = false)
+                    }
                 }
             }
         }

@@ -152,6 +152,7 @@ class FlutterHostActivity : FlutterActivity() {
         mobileChannel = null
         interaction?.close()
         interaction = null
+        EyesBus.rearVoice = null
         super.cleanUpFlutterEngine(engine)
     }
 
@@ -254,6 +255,25 @@ class FlutterHostActivity : FlutterActivity() {
                     "syncTicket" to EyesBus.syncedTicket,
                     "rearSupported" to supportsRear(),
                 ))
+            }
+            "rearVoice" -> {
+                val phase = when (call.argument<String>("phase")) {
+                    "listening" -> EyesBus.VoicePhase.LISTENING
+                    "thinking" -> EyesBus.VoicePhase.THINKING
+                    "answering" -> EyesBus.VoicePhase.ANSWERING
+                    "speaking" -> EyesBus.VoicePhase.SPEAKING
+                    else -> null
+                }
+                val previous = EyesBus.rearVoice?.takeIf { it.phase == phase }
+                val now = android.os.SystemClock.elapsedRealtime()
+                val activity = call.argument<Int>("activity") ?: 0
+                val level = call.argument<Double>("level")?.toFloat()?.coerceIn(0f, 1f) ?: 0f
+                val heardAt = if (previous != null && activity != previous.activity) now
+                    else previous?.heardAt
+                EyesBus.rearVoice = phase?.let {
+                    EyesBus.RearVoice(it, previous?.startedAt ?: now, level, activity, heardAt)
+                }
+                result.success(null)
             }
             "rearSettings" -> {
                 val keepOn = call.argument<Boolean>("keepOn")

@@ -4,11 +4,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:robot_eyes_models/robot_eyes_models.dart';
 
 import 'design.dart';
 import 'interaction.dart';
 import 'model_settings_view.dart';
 import 'notice_rules_view.dart';
+import 'reply_frame.dart';
+import 'settings_page.dart';
 
 Future<void> openConversation(
   BuildContext context,
@@ -25,17 +28,105 @@ Future<void> openConversation(
   if (interaction.listening) await interaction.cancelRecording();
 }
 
-Future<void> showNotice(
+Future<void> _showNotice(
   BuildContext context,
   RobotInteraction interaction,
   PhoneNotice item,
 ) async {
-  final draft = await showDialog<String>(
-    context: context,
-    builder: (context) => _NoticeDialog(interaction, item),
+  final navigator = Navigator.of(context, rootNavigator: true);
+  final source = context.findRenderObject()! as RenderBox;
+  final overlay = navigator.overlay!.context.findRenderObject()! as RenderBox;
+  final origin = MatrixUtils.transformRect(
+    source.getTransformTo(overlay),
+    Offset.zero & source.size,
   );
-  if (draft != null && context.mounted) {
-    await openConversation(context, interaction, draft: draft);
+  final reduceMotion = MediaQuery.disableAnimationsOf(context);
+  final route = RawDialogRoute<String>(
+    barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+    barrierColor: backdrop.withValues(alpha: .80),
+    transitionDuration: reduceMotion
+        ? Duration.zero
+        : const Duration(milliseconds: 340),
+    transitionBuilder: (_, _, _, child) => child,
+    pageBuilder: (context, animation, _) => LayoutBuilder(
+      builder: (context, constraints) {
+        final padding =
+            (const EdgeInsets.all(16) +
+                    MediaQuery.viewInsetsOf(context) +
+                    MediaQuery.paddingOf(context))
+                .resolve(Directionality.of(context));
+        final center = padding
+            .deflateRect(Offset.zero & constraints.biggest)
+            .center;
+        return Padding(
+          padding: padding,
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 480),
+              child: SizedBox(
+                width: double.infinity,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: LayoutBuilder(
+                          builder: (context, card) {
+                            final target = Rect.fromCenter(
+                              center: center,
+                              width: card.maxWidth,
+                              height: card.maxHeight,
+                            );
+                            final motion = animation.drive(
+                              CurveTween(curve: Curves.easeInOutCubic),
+                            );
+                            return AnimatedBuilder(
+                              animation: motion,
+                              child: const RepaintBoundary(
+                                child: CustomPaint(painter: _NoticeHudFrame()),
+                              ),
+                              builder: (context, frame) {
+                                final bounds = reduceMotion
+                                    ? target
+                                    : Rect.lerp(origin, target, motion.value)!;
+                                return Transform.translate(
+                                  offset: bounds.center - center,
+                                  child: OverflowBox(
+                                    minWidth: bounds.width,
+                                    maxWidth: bounds.width,
+                                    minHeight: bounds.height,
+                                    maxHeight: bounds.height,
+                                    child: frame,
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    FadeTransition(
+                      opacity: animation.drive(
+                        CurveTween(
+                          curve: const Interval(.38, 1, curve: Curves.easeOut),
+                        ),
+                      ),
+                      child: _NoticeDialog(interaction, item),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    ),
+  );
+  final draft = await navigator.push(route);
+  if (draft == null) return;
+  await route.completed;
+  if (navigator.mounted) {
+    await openConversation(navigator.context, interaction, draft: draft);
   }
 }
 
@@ -50,53 +141,120 @@ class _NoticeDialog extends StatefulWidget {
 }
 
 class _NoticeDialogState extends State<_NoticeDialog> {
-  Future<String?>? details;
+  late final _code = widget.interaction.noticeCode(widget.item);
+  late final _logo = widget.interaction.noticeAppIcon(widget.item);
 
   @override
   Widget build(BuildContext context) {
     final item = widget.item;
-    return AlertDialog(
-      scrollable: true,
-      title: Text(item.title),
-      content: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(item.source, style: const TextStyle(color: secondaryInk)),
-          if (item.text.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            SelectableText(item.text),
-          ],
-          if (details case final request?)
-            FutureBuilder<String?>(
-              future: request,
-              builder: (context, result) {
-                if (result.connectionState != ConnectionState.done) {
-                  return const LinearProgressIndicator();
-                }
-                return SelectableText(result.data ?? '系统未提供可显示的验证码内容。');
-              },
-            ),
-        ],
-      ),
-      actions: [
-        if (item.verification && details == null)
-          TextButton(
-            onPressed: () => setState(
-              () => details = widget.interaction.noticeDetails(item),
-            ),
-            child: const Text('查看验证内容'),
+    const bodyStyle = TextStyle(color: secondaryInk, height: 1.5);
+    final close = IconButton(
+      tooltip: '关闭',
+      onPressed: () => Navigator.pop(context),
+      icon: const Icon(Icons.close_rounded, color: secondaryInk),
+    );
+    return Material(
+      type: MaterialType.transparency,
+      child: Semantics(
+        scopesRoute: true,
+        namesRoute: item.verification,
+        label: item.verification ? '验证码' : null,
+        explicitChildNodes: true,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 16, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: item.verification
+                ? [
+                    Row(
+                      children: [
+                        const SizedBox(width: 44),
+                        Expanded(
+                          child: FutureBuilder<String?>(
+                            future: _code,
+                            builder: (context, result) {
+                              if (result.connectionState !=
+                                  ConnectionState.done) {
+                                return const LinearProgressIndicator();
+                              }
+                              final code = result.data;
+                              if (code == null) {
+                                return const Text(
+                                  '验证码不可用',
+                                  style: bodyStyle,
+                                  textAlign: TextAlign.center,
+                                );
+                              }
+                              return SelectableText(
+                                code,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: cyan,
+                                  fontFamily: 'monospace',
+                                  fontSize: 30,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 2,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        close,
+                      ],
+                    ),
+                  ]
+                : [
+                    Row(
+                      children: [
+                        _NoticeAppLogo(_logo),
+                        Expanded(
+                          child: Text(
+                            item.source,
+                            style: const TextStyle(
+                              color: cyan,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        close,
+                      ],
+                    ),
+                    Semantics(
+                      header: true,
+                      namesRoute: true,
+                      child: Text(
+                        item.title,
+                        style: const TextStyle(
+                          color: primaryInk,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    if (item.text.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      SelectableText(item.text, style: bodyStyle),
+                    ],
+                    if (item.text.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: cyan,
+                            side: const BorderSide(color: borderColor),
+                            minimumSize: const Size(48, 48),
+                          ),
+                          onPressed: () => Navigator.pop(context, item.text),
+                          child: const Text('问 AI'),
+                        ),
+                      ),
+                    ],
+                  ],
           ),
-        if (!item.verification && item.text.isNotEmpty)
-          TextButton(
-            onPressed: () => Navigator.pop(context, item.text),
-            child: const Text('问 AI'),
-          ),
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('关闭'),
         ),
-      ],
+      ),
     );
   }
 }
@@ -226,6 +384,19 @@ class _ConversationPageState extends State<_ConversationPage> {
             onPressed: interaction.listening ? null : _newConversation,
             icon: const Icon(Icons.edit_square),
           ),
+          IconButton(
+            tooltip: '朗读音色',
+            onPressed: () => _openVoiceSettings(context, interaction),
+            icon: const Icon(Icons.record_voice_over_outlined),
+          ),
+          IconButton(
+            tooltip: interaction.readAnswers ? '关闭自动朗读' : '开启自动朗读',
+            isSelected: interaction.readAnswers,
+            onPressed: () =>
+                interaction.setReadAnswers(!interaction.readAnswers),
+            icon: const Icon(Icons.volume_off_outlined),
+            selectedIcon: const Icon(Icons.volume_up_rounded, color: cyan),
+          ),
         ],
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(1),
@@ -312,8 +483,7 @@ class _ConversationPageState extends State<_ConversationPage> {
                   reasoning: interaction.reasoning,
                   label: interaction.replyModel ?? 'Robot Eyes',
                   generating: interaction.generating,
-                  speaking: interaction.spokenText != null,
-                  mute: interaction.muteCurrent,
+                  speaking: interaction.spokenReply != null,
                 ),
               for (final turn in turns.reversed)
                 _ChatMessagePair(
@@ -339,6 +509,25 @@ class _ConversationPageState extends State<_ConversationPage> {
     );
   }
 
+  Future<void> _attachMedia(GgufMediaType type) async {
+    final profile = interaction.phoneModel;
+    try {
+      final media = await pickGgufMedia(type);
+      if (mounted &&
+          media != null &&
+          identical(profile, interaction.phoneModel)) {
+        interaction.setDraftMedia(media);
+      }
+    } catch (failure) {
+      if (!mounted) return;
+      final message = failure is FormatException
+          ? failure.message
+          : '无法读取所选附件。';
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
   Widget _buildComposer({required bool compact}) {
     final field = TextField(
       controller: input,
@@ -349,7 +538,11 @@ class _ConversationPageState extends State<_ConversationPage> {
       maxLength: 4000,
       textInputAction: TextInputAction.newline,
       decoration: InputDecoration(
-        hintText: interaction.listening ? '正在聆听…' : '发消息',
+        hintText: interaction.startingRecording
+            ? '正在准备麦克风…'
+            : interaction.listening
+            ? '正在聆听…'
+            : '发消息',
         counterText: '',
         filled: false,
         border: InputBorder.none,
@@ -378,6 +571,24 @@ class _ConversationPageState extends State<_ConversationPage> {
           _ListeningFeedback(interaction),
           const SizedBox(height: 6),
         ],
+        if (interaction.draftMedia case final media?)
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: InputChip(
+              avatar: Icon(
+                media.type == GgufMediaType.image
+                    ? Icons.image_outlined
+                    : Icons.audiotrack,
+              ),
+              label: Text(
+                media.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              deleteButtonTooltipMessage: '移除附件',
+              onDeleted: () => interaction.setDraftMedia(null),
+            ),
+          ),
         DecoratedBox(
           decoration: BoxDecoration(
             color: panelColor,
@@ -397,6 +608,21 @@ class _ConversationPageState extends State<_ConversationPage> {
                 Row(
                   mainAxisSize: compact ? MainAxisSize.min : MainAxisSize.max,
                   children: [
+                    if (interaction.localMediaTypes.isNotEmpty &&
+                        !interaction.generating &&
+                        !interaction.listening)
+                      PopupMenuButton<GgufMediaType>(
+                        tooltip: '添加附件',
+                        icon: const Icon(Icons.attach_file_outlined),
+                        onSelected: _attachMedia,
+                        itemBuilder: (context) => [
+                          for (final type in interaction.localMediaTypes)
+                            PopupMenuItem(
+                              value: type,
+                              child: Text('选择${type.label}文件'),
+                            ),
+                        ],
+                      ),
                     if (interaction.listening)
                       IconButton(
                         tooltip: '取消录音',
@@ -431,7 +657,9 @@ class _ConversationPageState extends State<_ConversationPage> {
                             generating ||
                             (!interaction.loading &&
                                 !interaction.finishingRecording &&
-                                (listening || value.text.trim().isNotEmpty));
+                                (listening ||
+                                    value.text.trim().isNotEmpty ||
+                                    interaction.draftMedia != null));
                         return Padding(
                           padding: const EdgeInsets.all(2),
                           child: IconButton.filled(
@@ -448,7 +676,9 @@ class _ConversationPageState extends State<_ConversationPage> {
                             onPressed: !enabled
                                 ? null
                                 : generating
-                                ? interaction.cancelAnswer
+                                ? () => interaction.cancelAnswer(
+                                    discardReasoning: true,
+                                  )
                                 : () {
                                     if (!listening) composerFocus.unfocus();
                                     unawaited(interaction.send());
@@ -595,7 +825,6 @@ class _ChatMessagePair extends StatelessWidget {
     required this.label,
     this.generating = false,
     this.speaking = false,
-    this.mute,
   });
 
   final String question;
@@ -604,7 +833,6 @@ class _ChatMessagePair extends StatelessWidget {
   final String label;
   final bool generating;
   final bool speaking;
-  final VoidCallback? mute;
 
   Future<void> _copy(BuildContext context) async {
     await Clipboard.setData(ClipboardData(text: reply));
@@ -656,85 +884,77 @@ class _ChatMessagePair extends StatelessWidget {
         ),
         if (generating || reply.isNotEmpty || reasoning.trim().isNotEmpty) ...[
           const SizedBox(height: 18),
-          Row(
-            children: [
-              const _RobotMark(),
-              const SizedBox(width: 9),
-              Expanded(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: cyan,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          if (reasoning.trim().isNotEmpty)
-            ExpansionTile(
-              title: const Text(
-                '思考过程',
-                style: TextStyle(color: secondaryInk, fontSize: 13),
-              ),
-              tilePadding: const EdgeInsets.symmetric(horizontal: 4),
-              childrenPadding: const EdgeInsets.fromLTRB(12, 0, 8, 12),
-              expandedCrossAxisAlignment: CrossAxisAlignment.start,
-              shape: const Border(),
-              collapsedShape: const Border(),
-              children: [
-                SelectableText(
-                  reasoning.trim(),
-                  style: const TextStyle(color: secondaryInk, height: 1.5),
-                ),
-              ],
+          ReplyFrame(
+            model: label,
+            stage: ReplyStage.fromActivity(
+              generating: generating,
+              hasReply: reply.isNotEmpty,
+              speaking: speaking,
             ),
-          if (reply.isNotEmpty) ...[
-            const SizedBox(height: 9),
-            SelectionArea(
-              child: MarkdownBody(
-                data: reply,
-                imageBuilder: (_, _, alt) => Text(alt ?? ''),
-                styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context))
-                    .copyWith(
-                      p: const TextStyle(
-                        color: primaryInk,
-                        fontSize: 15,
-                        height: 1.55,
-                      ),
-                      codeblockDecoration: BoxDecoration(
-                        color: panelColor,
-                        border: Border.all(color: borderColor),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (reasoning.trim().isNotEmpty)
+                  ExpansionTile(
+                    title: const Text(
+                      '思考过程',
+                      style: TextStyle(color: secondaryInk, fontSize: 13),
                     ),
-              ),
-            ),
-          ] else if (generating)
-            const Padding(
-              padding: EdgeInsets.only(top: 12),
-              child: Text('正在思考…', style: TextStyle(color: secondaryInk)),
-            ),
-          if ((!generating && reply.isNotEmpty) || speaking)
-            Row(
-              children: [
-                if (!generating && reply.isNotEmpty)
-                  IconButton(
-                    tooltip: '复制回复',
-                    onPressed: () => _copy(context),
-                    icon: const Icon(Icons.content_copy_rounded, size: 18),
+                    tilePadding: const EdgeInsets.symmetric(horizontal: 4),
+                    childrenPadding: const EdgeInsets.fromLTRB(12, 0, 8, 12),
+                    expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                    shape: const Border(),
+                    collapsedShape: const Border(),
+                    children: [
+                      SelectableText(
+                        reasoning.trim(),
+                        style: const TextStyle(
+                          color: secondaryInk,
+                          height: 1.5,
+                        ),
+                      ),
+                    ],
                   ),
-                if (speaking)
-                  IconButton(
-                    tooltip: '停止朗读',
-                    onPressed: mute,
-                    icon: const Icon(Icons.volume_off_outlined, size: 20),
+                if (reply.isNotEmpty) ...[
+                  const SizedBox(height: 9),
+                  SelectionArea(
+                    child: MarkdownBody(
+                      data: reply,
+                      imageBuilder: (_, _, alt) => Text(alt ?? ''),
+                      styleSheet:
+                          MarkdownStyleSheet.fromTheme(Theme.of(context))
+                              .copyWith(
+                                p: const TextStyle(
+                                  color: primaryInk,
+                                  fontSize: 15,
+                                  height: 1.55,
+                                ),
+                                codeblockDecoration: BoxDecoration(
+                                  color: panelColor,
+                                  border: Border.all(color: borderColor),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                              ),
+                    ),
+                  ),
+                ] else if (generating)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 12),
+                    child: Text('正在思考…', style: TextStyle(color: secondaryInk)),
+                  ),
+                if (!generating && reply.isNotEmpty)
+                  Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: IconButton(
+                      tooltip: '复制回复',
+                      onPressed: () => _copy(context),
+                      icon: const Icon(Icons.content_copy_rounded, size: 18),
+                    ),
                   ),
               ],
             ),
+          ),
         ],
       ],
     ),
@@ -769,22 +989,7 @@ class InteractionBubbles extends StatelessWidget {
         children: [
           if (notice != null)
             _NoticeHud(interaction, notice, key: ValueKey(notice)),
-          if (showAnswer)
-            _bubble(
-              icon: Icons.chat_bubble_outline,
-              title: interaction.replyModel ?? 'Robot Eyes',
-              text:
-                  interaction.spokenReply ??
-                  (interaction.reply.isEmpty ? '正在思考…' : interaction.reply),
-              open: () => openConversation(context, interaction),
-              trailing: interaction.spokenText == null
-                  ? null
-                  : IconButton(
-                      tooltip: '停止朗读',
-                      icon: const Icon(Icons.volume_off_outlined),
-                      onPressed: interaction.muteCurrent,
-                    ),
-            ),
+          if (showAnswer) ReplyPreview(interaction),
           if (shared != null)
             _bubble(
               icon: Icons.share_outlined,
@@ -913,10 +1118,16 @@ class _NoticeSweep extends CustomPainter {
 }
 
 class _NoticeHud extends StatefulWidget {
-  const _NoticeHud(this.interaction, this.notice, {super.key});
+  const _NoticeHud(
+    this.interaction,
+    this.notice, {
+    this.summaryOnly = false,
+    super.key,
+  });
 
   final RobotInteraction interaction;
   final PhoneNotice notice;
+  final bool summaryOnly;
 
   @override
   State<_NoticeHud> createState() => _NoticeHudState();
@@ -929,81 +1140,93 @@ class _NoticeHudState extends State<_NoticeHud> {
   Widget build(BuildContext context) {
     final notice = widget.notice;
     return Semantics(
-      liveRegion: true,
-      button: true,
-      child: GestureDetector(
-        onTap: () => showNotice(context, widget.interaction, notice),
-        child: CustomPaint(
-          painter: const _NoticeHudFrame(),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(13, 10, 15, 11),
-            child: Row(
-              children: [
-                FutureBuilder<Uint8List?>(
-                  future: _logo,
-                  builder: (context, snapshot) => snapshot.data == null
-                      ? const SizedBox.shrink()
-                      : Padding(
-                          padding: const EdgeInsets.only(right: 10),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(6),
-                            child: Image.memory(
-                              snapshot.data!,
-                              width: 30,
-                              height: 30,
-                              excludeFromSemantics: true,
-                              errorBuilder: (_, _, _) =>
-                                  const SizedBox.shrink(),
-                            ),
-                          ),
-                        ),
-                ),
-                Expanded(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        notice.source,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: cyan,
-                          fontSize: 11,
-                          letterSpacing: 1.3,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        notice.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: primaryInk,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      if (notice.text.isNotEmpty)
+      liveRegion: !widget.summaryOnly,
+      child: CustomPaint(
+        painter: const _NoticeHudFrame(),
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            onTap: () => _showNotice(context, widget.interaction, notice),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(13, 10, 15, 11),
+              child: Row(
+                children: [
+                  _NoticeAppLogo(_logo),
+                  Expanded(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                         Text(
-                          notice.text,
-                          maxLines: 2,
+                          notice.source,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            color: secondaryInk,
-                            fontSize: 12,
+                            color: cyan,
+                            fontSize: 11,
+                            letterSpacing: 1.3,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
-                    ],
+                        Text(
+                          notice.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: primaryInk,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        if (!widget.summaryOnly && notice.text.isNotEmpty)
+                          Text(
+                            notice.text,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: secondaryInk,
+                              fontSize: 12,
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
       ),
     );
   }
+}
+
+class _NoticeAppLogo extends StatelessWidget {
+  const _NoticeAppLogo(this.logo);
+
+  final Future<Uint8List?> logo;
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
+    future: logo,
+    builder: (context, snapshot) {
+      final bytes = snapshot.data;
+      if (bytes == null) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.only(right: 10),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.memory(
+            bytes,
+            width: 30,
+            height: 30,
+            excludeFromSemantics: true,
+            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+          ),
+        ),
+      );
+    },
+  );
 }
 
 class _NoticeHudFrame extends CustomPainter {
@@ -1052,51 +1275,172 @@ class _NoticeHudFrame extends CustomPainter {
   bool shouldRepaint(_NoticeHudFrame oldDelegate) => false;
 }
 
+Future<void> _openVoiceSettings(
+  BuildContext context,
+  RobotInteraction interaction,
+) => openSettingsPage(context, '语音模型管理', (_) => _VoiceSettings(interaction));
+
+class _VoiceSettings extends StatelessWidget {
+  const _VoiceSettings(this.interaction);
+
+  final RobotInteraction interaction;
+
+  Future<void> _removeModel(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除 ZipVoice 模型'),
+        content: const Text('删除后会释放模型占用的空间。需要时可以重新下载。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (context.mounted && confirmed == true) {
+      await interaction.removeOfflineVoice();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: interaction,
+    builder: (context, _) {
+      final installed = interaction.offlineVoiceInstalled;
+      final progress = interaction.voiceDownloadProgress;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (interaction.supportsOfflineVoice)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('ZipVoice Distill INT8'),
+              subtitle: Text(
+                interaction.removingVoice
+                    ? '正在删除…'
+                    : installed
+                    ? '已安装 · 普通话和英语'
+                    : '未安装 · 下载约 163 MB',
+              ),
+            )
+          else
+            const Text('此设备使用系统朗读。'),
+          if (interaction.installingVoice) ...[
+            const SizedBox(height: 12),
+            LinearProgressIndicator(value: progress),
+            const SizedBox(height: 8),
+            Text(
+              progress == null
+                  ? '正在校验并安装模型…'
+                  : '正在下载模型 ${(progress * 100).round()}%',
+            ),
+          ],
+          if (interaction.voiceInstallError case final error?)
+            Text(
+              error,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          Wrap(
+            spacing: 8,
+            children: [
+              if (interaction.supportsOfflineVoice &&
+                  !installed &&
+                  !interaction.removingVoice)
+                OutlinedButton(
+                  onPressed: interaction.installingVoice
+                      ? null
+                      : interaction.installOfflineVoice,
+                  child: const Text('下载模型'),
+                ),
+              if (installed)
+                TextButton.icon(
+                  onPressed: interaction.removingVoice
+                      ? null
+                      : () => _removeModel(context),
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('删除模型'),
+                ),
+              TextButton.icon(
+                onPressed:
+                    interaction.canPreviewVoice &&
+                        !interaction.removingVoice &&
+                        (installed || !interaction.supportsOfflineVoice)
+                    ? interaction.previewVoice
+                    : null,
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('试听'),
+              ),
+            ],
+          ),
+        ],
+      );
+    },
+  );
+}
+
 Future<void> openInteractionSettings(
   BuildContext context,
   RobotInteraction interaction,
-) => showDialog<void>(
-  context: context,
-  builder: (context) => ListenableBuilder(
+) => openSettingsPage(
+  context,
+  '语音与提醒',
+  (route) => ListenableBuilder(
     listenable: interaction,
-    builder: (context, _) => AlertDialog(
-      title: const Text('语音与手机提醒'),
-      scrollable: true,
-      content: SizedBox(
-        width: 420,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('朗读 AI 回复'),
-              value: interaction.readAnswers,
-              onChanged: interaction.setReadAnswers,
-            ),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('播报重要提醒'),
-              value: interaction.readNotices,
-              onChanged: interaction.setReadNotices,
-            ),
-            if (interaction.supportsNotifications) ...[
-              OutlinedButton(
-                onPressed: interaction.openNotificationSettings,
-                child: Text(
-                  interaction.notificationAccess ? '管理通知访问权限' : '开启通知访问权限',
-                ),
-              ),
-              if (interaction.notificationAccess) NoticeRules(interaction),
-            ],
-          ],
-        ),
+    builder: (context, _) => SettingsGroup([
+      SwitchListTile(
+        title: const Text('朗读 AI 回复'),
+        value: interaction.readAnswers,
+        onChanged: interaction.setReadAnswers,
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('完成'),
+      SwitchListTile(
+        title: const Text('播报重要提醒'),
+        value: interaction.readNotices,
+        onChanged: interaction.setReadNotices,
+      ),
+      SettingsEntry(
+        Icons.record_voice_over_outlined,
+        '语音模型管理',
+        () => _openVoiceSettings(route, interaction),
+      ),
+      if (interaction.supportsNotifications)
+        SettingsEntry(
+          Icons.rule,
+          '提醒规则',
+          () => _openNoticeRules(route, interaction),
+          detail: '通知访问权限、关注的 App、联系人和关键词',
         ),
+      SettingsEntry(
+        Icons.history,
+        '最近提醒',
+        () => openRecentNotices(route, interaction),
+      ),
+    ]),
+  ),
+);
+
+Future<void> _openNoticeRules(
+  BuildContext context,
+  RobotInteraction interaction,
+) => openSettingsPage(
+  context,
+  '提醒规则',
+  (_) => ListenableBuilder(
+    listenable: interaction,
+    builder: (context, _) => Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        OutlinedButton(
+          onPressed: interaction.openNotificationSettings,
+          child: Text(interaction.notificationAccess ? '管理通知访问权限' : '开启通知访问权限'),
+        ),
+        if (interaction.notificationAccess) NoticeRules(interaction),
       ],
     ),
   ),
@@ -1105,30 +1449,26 @@ Future<void> openInteractionSettings(
 Future<void> openRecentNotices(
   BuildContext context,
   RobotInteraction interaction,
-) async {
-  final item = await showDialog<PhoneNotice>(
-    context: context,
-    builder: (context) => ListenableBuilder(
-      listenable: interaction,
-      builder: (context, _) => SimpleDialog(
-        title: const Text('最近提醒'),
-        children: [
-          if (interaction.recentNotices.isEmpty)
-            const Padding(padding: EdgeInsets.all(16), child: Text('暂无提醒')),
-          for (final item in interaction.recentNotices)
-            SimpleDialogOption(
-              onPressed: () => Navigator.pop(context, item),
-              child: Text(
-                '${item.source} · ${item.title}',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-        ],
-      ),
+) => openSettingsPage(
+  context,
+  '最近提醒',
+  (_) => ListenableBuilder(
+    listenable: interaction,
+    builder: (context, _) => Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (interaction.recentNotices.isEmpty)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('暂无提醒', style: TextStyle(color: secondaryInk)),
+          ),
+        for (final item in interaction.recentNotices)
+          Padding(
+            key: ValueKey(item),
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _NoticeHud(interaction, item, summaryOnly: true),
+          ),
+      ],
     ),
-  );
-  if (item != null && context.mounted) {
-    await showNotice(context, interaction, item);
-  }
-}
+  ),
+);

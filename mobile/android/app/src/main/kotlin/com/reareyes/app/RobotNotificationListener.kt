@@ -14,6 +14,11 @@ import org.json.JSONObject
 class RobotNotificationListener : NotificationListenerService() {
     private val seen = linkedMapOf<String, Map<String, Any>>()
 
+    @Suppress("DiscouragedApi")
+    private val redactedMessageId by lazy {
+        resources.getIdentifier("redacted_notification_message", "string", "android")
+    }
+
     override fun onListenerConnected() {
         current = this
         activeNotifications.orEmpty().sortedBy { it.postTime }.takeLast(MAX_EVENTS).forEach {
@@ -47,15 +52,18 @@ class RobotNotificationListener : NotificationListenerService() {
             sbn.isOngoing || !isEnabled(this)
         ) return
         val content = content(sbn)
+        val matchesRules = matchesNoticeRules(sbn.packageName, content)
         val event = mapOf(
             "type" to "notification",
             "id" to sbn.key,
             "package" to sbn.packageName,
             "app" to appLabel(sbn.packageName),
+            "sms" to (sbn.packageName == android.provider.Telephony.Sms.getDefaultSmsPackage(this)),
             "sender" to if (content.verification) "" else content.sender,
-            "title" to if (content.verification) "收到验证消息" else content.title.ifBlank { "新提醒" },
+            "title" to if (content.verification) VERIFICATION_TITLE else content.title.ifBlank { "新提醒" },
             "text" to if (content.verification) "" else content.text,
             "verification" to content.verification,
+            "matchesNoticeRules" to matchesRules,
             "timestamp" to sbn.postTime,
         )
         if (seen[sbn.key] == event) return
@@ -63,8 +71,7 @@ class RobotNotificationListener : NotificationListenerService() {
         seen[sbn.key] = event
         if (seen.size > MAX_TRACKED) seen.remove(seen.keys.first())
         val recent = System.currentTimeMillis() - sbn.postTime in 0L..12_000L
-        if ((!initial || recent) && matchesRearRules(sbn.packageName, if (content.verification)
-                content.copy(sender = "", title = "收到验证消息", text = "") else content)) {
+        if ((!initial || recent) && matchesRules) {
             EyesBus.showRearNotice(
                 EyesBus.RearNotice(
                     key = "${sbn.key}:${sbn.postTime}",
@@ -88,7 +95,7 @@ class RobotNotificationListener : NotificationListenerService() {
         }
     }
 
-    private fun matchesRearRules(packageName: String, notice: NotificationContent): Boolean {
+    private fun matchesNoticeRules(packageName: String, notice: NotificationContent): Boolean {
         val raw = getSharedPreferences(RobotInteractionBridge.SETTINGS_PREFS, MODE_PRIVATE)
             .getString(RobotInteractionBridge.SETTINGS_KEY, null) ?: return true
         val settings = runCatching { JSONObject(raw) }.getOrNull() ?: return false
@@ -100,7 +107,8 @@ class RobotNotificationListener : NotificationListenerService() {
             .split(',', '，', '\n').map(String::trim).filter(String::isNotEmpty)
         else (0 until keywords.length()).mapNotNull { keywords.opt(it) as? String }
         if (words.isEmpty() && (contacts?.length() ?: 0) == 0) return (sources?.length() ?: 0) == 0
-        val content = "${notice.sender} ${notice.title} ${notice.text}"
+        val verificationTerms = if (notice.verification) VERIFICATION_SEARCH_TERMS else ""
+        val content = "${notice.sender} ${notice.title} ${notice.text} $verificationTerms"
         if (words.any { it.isNotBlank() && content.contains(it, ignoreCase = true) }) return true
         val sender = notice.sender.trim()
         if (sender.isEmpty() || contacts == null) return false
@@ -130,17 +138,25 @@ class RobotNotificationListener : NotificationListenerService() {
     private fun content(sbn: StatusBarNotification): NotificationContent {
         val notification = sbn.notification
         val extras = notification.extras
+        val summary = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
+        // AOSP substitutes a localized placeholder when the listener cannot read sensitive content.
+        if (Build.VERSION.SDK_INT >= 35 && redactedMessageId != 0 &&
+            summary == resources.getString(redactedMessageId).trim()
+        ) return NotificationContent("", "", "", verification = true)
+
         val message = extras.getParcelableArray(Notification.EXTRA_MESSAGES)?.let {
             Notification.MessagingStyle.Message.getMessagesFromBundleArray(it).lastOrNull()
         }
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
-            ?: extras.getCharSequence(Notification.EXTRA_TEXT)
-            ?: message?.text)?.toString()?.trim().orEmpty()
+        val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim()
+        val messageText = message?.text?.toString()?.trim()
+        val text = listOf(messageText, bigText, summary).firstOrNull { !it.isNullOrEmpty() }.orEmpty()
         val messageSender = if (Build.VERSION.SDK_INT >= 28) message?.senderPerson?.name else message?.sender
         val sender = messageSender?.toString()?.trim()
             ?: title.takeIf { notification.category == Notification.CATEGORY_MESSAGE }.orEmpty()
-        val verification = verificationPattern.containsMatchIn("$title $text $sender")
+        val verification = listOf(title, bigText, summary, messageText, sender).any {
+            it != null && verificationPattern.containsMatchIn(it)
+        }
         return NotificationContent(title.take(200), text.take(1500), sender.take(200), verification)
     }
 
@@ -154,6 +170,8 @@ class RobotNotificationListener : NotificationListenerService() {
     companion object {
         private const val MAX_TRACKED = 128
         private const val MAX_EVENTS = 24
+        private const val VERIFICATION_TITLE = "收到验证消息"
+        private const val VERIFICATION_SEARCH_TERMS = "$VERIFICATION_TITLE 验证码 驗證碼 OTP verification code"
         private val verificationPattern = Regex(
             """验证码|驗證碼|校验码|認証コード|인증번호|동적\s*코드|""" +
                 """\bOTP\b|one[- ]time (?:passcode|password|pin|code)|""" +
