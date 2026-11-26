@@ -18,7 +18,6 @@ internal class EyeStatusBadges(private val context: Context) {
         val rows: List<List<Badge>>,
         val height: Float,
         val gap: Float,
-        val named: Boolean,
         val description: String,
     ) {
         fun top(centerY: Float) = centerY - (rows.size - 1) * (height + gap) - height / 2f
@@ -40,7 +39,8 @@ internal class EyeStatusBadges(private val context: Context) {
     private var lastHeight = 0f
     private var lastState = EyeState.IDLE
 
-    fun layout(state: EyeState, time: Long, w: Float, h: Float, desk: Boolean): Layout? {
+    fun layout(state: EyeState, time: Long, w: Float, h: Float, desk: Boolean,
+               showLocalLoading: Boolean): Layout? {
         if (time >= nextRefresh) {
             nextRefresh = time + 350L
             val current = EyesBus.agentStates().entries.sortedBy { priority.indexOf(it.value) }
@@ -50,7 +50,7 @@ internal class EyeStatusBadges(private val context: Context) {
                 cached = null
             }
         }
-        if (!connected && agents.isEmpty()) return null
+        if (!connected && agents.isEmpty() && !(showLocalLoading && state == EyeState.THINKING)) return null
         val previous = cached
         if (previous != null && lastWidth == w && lastHeight == h && lastState == state) return previous
         lastWidth = w
@@ -100,11 +100,11 @@ internal class EyeStatusBadges(private val context: Context) {
         }
         val description = if (named) agents.joinToString("，") { (name, value) -> "$name：${value.label}" }
         else state.label
-        return Layout(rows, height, gap, named, description).also { cached = it }
+        return Layout(rows, height, gap, description).also { cached = it }
     }
 
     fun draw(canvas: Canvas, layout: Layout, x: Float, width: Float, centerY: Float, desk: Boolean,
-             time: Long, motionEnabled: Boolean, loadingInIcon: Boolean) {
+             time: Long, motionEnabled: Boolean) {
         val h = layout.height
         val radius = h / 2f
         val iconSize = (h * 0.70f).toInt().coerceAtLeast(1)
@@ -133,7 +133,7 @@ internal class EyeStatusBadges(private val context: Context) {
                 val textOffset = iconWidth + if (icon != null && badge.label.isNotEmpty()) spacing else 0f
                 val contentWidth = text.measureText(badge.label) + textOffset
                 val contentLeft = left + (badge.width - contentWidth) / 2f
-                if (badge.state == EyeState.THINKING && loadingInIcon) {
+                if (badge.state == EyeState.THINKING) {
                     background.style = Paint.Style.FILL
                     for (index in 0..2) {
                         val glow = if (motionEnabled) max(0.0, sin(time / 320.0 - index * 0.9)).toFloat() else 0.45f
@@ -147,8 +147,6 @@ internal class EyeStatusBadges(private val context: Context) {
                     val top = (y - iconSize / 2f).toInt()
                     val start = contentLeft.toInt()
                     icon.setBounds(start, top, start + iconSize, top + iconSize)
-                    icon.alpha = if (badge.state == EyeState.THINKING && motionEnabled)
-                        (225 + 25 * sin(time / 275.0)).toInt() else 255
                     icon.draw(canvas)
                 }
                 canvas.drawText(badge.label, contentLeft + textOffset,

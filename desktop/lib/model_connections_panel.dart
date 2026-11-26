@@ -15,6 +15,83 @@ class ModelConnectionsPanel extends StatefulWidget {
 }
 
 class _ModelConnectionsPanelState extends State<ModelConnectionsPanel> {
+  bool _scanning = false;
+
+  Future<void> _scan() async {
+    setState(() => _scanning = true);
+    final connections = widget.connections;
+    connections.refreshAvailability();
+    final models = await connections.discoverLocalModels();
+    if (!mounted) return;
+    setState(() => _scanning = false);
+
+    final selected = await showDialog<LocalModel>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: const Text('选择本地模型'),
+        scrollable: true,
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (models.isEmpty)
+                const Text('未发现本地模型。请确认 Ollama 或 LM Studio 的本地服务已启动，并且有可用模型。'),
+              for (final model in models)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(model.model),
+                  subtitle: Text(model.service),
+                  enabled: !connections.hasLocalModel(
+                    model.address,
+                    model.model,
+                  ),
+                  trailing:
+                      connections.hasLocalModel(model.address, model.model)
+                      ? const Text('已添加')
+                      : const Icon(Icons.add, semanticLabel: '添加连接'),
+                  onTap: () => Navigator.pop(dialog, model),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialog),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted ||
+        selected == null ||
+        connections.hasLocalModel(selected.address, selected.model)) {
+      return;
+    }
+    try {
+      final name = selected.model;
+      connections.save(
+        ModelProfile(
+          id: ModelConnections.newId(),
+          name: name.length <= 80 ? name : name.substring(0, 80),
+          address: selected.address.toString(),
+          model: selected.model,
+          apiKey: '',
+          kind: 'local',
+        ),
+        tested: true,
+      );
+      setState(() {});
+    } on FormatException catch (error) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error.message)));
+    } on FileSystemException {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('无法保存模型连接，请检查文件权限。')));
+    }
+  }
+
   Future<void> _edit([ModelProfile? profile]) async {
     await showDialog<void>(
       context: context,
@@ -37,6 +114,11 @@ class _ModelConnectionsPanelState extends State<ModelConnectionsPanel> {
           runSpacing: 8,
           children: [
             Text('模型连接', style: Theme.of(context).textTheme.titleLarge),
+            OutlinedButton.icon(
+              onPressed: _scanning ? null : _scan,
+              icon: const Icon(Icons.refresh, size: 18),
+              label: Text(_scanning ? '正在扫描…' : '扫描并刷新'),
+            ),
             OutlinedButton.icon(
               onPressed: _edit,
               icon: const Icon(Icons.add, size: 18),

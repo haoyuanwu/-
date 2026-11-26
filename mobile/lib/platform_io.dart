@@ -44,7 +44,7 @@ Future<({int status, String body})> request(
     }
     final bytes = <int>[];
     await for (final chunk in response.timeout(timeout)) {
-      if (bytes.length + chunk.length > 8192) {
+      if (bytes.length + chunk.length > 16384) {
         throw const FormatException('电脑返回的数据过大');
       }
       bytes.addAll(chunk);

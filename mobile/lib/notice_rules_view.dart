@@ -37,17 +37,19 @@ class NoticeRules extends StatelessWidget {
         '关注的 App',
         interaction.selectedApps.map((app) => app.name),
         () => _choose(context, contacts: false),
+        emptyLabel: '全部 App（含短信）',
       ),
       _row(
         context,
         '联系人',
         interaction.selectedContacts.map((contact) => contact.name),
         () => _choose(context, contacts: true),
+        emptyLabel: '全部联系人',
       ),
       _row(context, '关键词', interaction.keywords, () => _keywords(context)),
       const SizedBox(height: 6),
       const Text(
-        '先按关注的 App 筛选。设置联系人或关键词后，匹配任意一项即可提醒。',
+        '选中的 App、联系人和关键词，匹配任一项就会提醒。三项都未设置时提醒全部通知。',
         style: TextStyle(color: secondaryInk, fontSize: 13),
       ),
     ],
@@ -57,8 +59,9 @@ class NoticeRules extends StatelessWidget {
     BuildContext context,
     String label,
     Iterable<String> entries,
-    VoidCallback edit,
-  ) => Padding(
+    VoidCallback edit, {
+    String emptyLabel = '未设置',
+  }) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 6),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -79,7 +82,7 @@ class NoticeRules extends StatelessWidget {
           ],
         ),
         if (entries.isEmpty)
-          const Text('未设置', style: TextStyle(color: secondaryInk))
+          Text(emptyLabel, style: const TextStyle(color: secondaryInk))
         else
           Wrap(
             spacing: 6,
@@ -139,10 +142,16 @@ class _NoticePickerState extends State<_NoticePicker> {
         contacts: widget.contacts,
       );
       if (!mounted) return;
-      setState(() => choices = loaded);
-      for (final option in loaded) {
-        if (selected.containsKey(option.id)) selected[option.id] = option;
-      }
+      setState(() {
+        choices = loaded;
+        if (!widget.contacts) {
+          final available = loaded.map((option) => option.id).toSet();
+          selected.removeWhere((id, _) => !available.contains(id));
+        }
+        for (final option in loaded) {
+          if (selected.containsKey(option.id)) selected[option.id] = option;
+        }
+      });
     } on PlatformException catch (failure) {
       if (mounted) setState(() => error = failure.message ?? '无法读取列表。');
     } on MissingPluginException {
@@ -155,8 +164,10 @@ class _NoticePickerState extends State<_NoticePicker> {
   @override
   Widget build(BuildContext context) {
     final options = {for (final item in choices) item.id: item};
-    for (final item in selected.values) {
-      options.putIfAbsent(item.id, () => item);
+    if (widget.contacts) {
+      for (final item in selected.values) {
+        options.putIfAbsent(item.id, () => item);
+      }
     }
     final visible = options.values.where((entry) {
       final searchable = widget.contacts ? entry.aliases : [entry.id];
@@ -169,7 +180,7 @@ class _NoticePickerState extends State<_NoticePicker> {
         title: Text(widget.contacts ? '选择联系人' : '选择关注的 App'),
         actions: [
           TextButton(
-            onPressed: loading
+            onPressed: loading || error != null
                 ? null
                 : () => Navigator.pop(context, selected.values.toList()),
             child: const Text('保存'),

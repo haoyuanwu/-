@@ -14,17 +14,23 @@ class EyeScene extends StatefulWidget {
     super.key,
     required this.mood,
     this.fullScreen = false,
+    this.noticeCue,
+    this.voiceLevel,
     this.revision = 0,
     this.sleepSeconds = 90,
     this.agents = const {},
     this.connected = false,
+    this.allowVerticalScroll = false,
   });
   final EyeMood mood;
   final bool fullScreen;
+  final Object? noticeCue;
+  final double? voiceLevel;
   final int revision;
   final int sleepSeconds;
   final Map<String, EyeMood> agents;
   final bool connected;
+  final bool allowVerticalScroll;
 
   @override
   State<EyeScene> createState() => _EyeSceneState();
@@ -40,7 +46,8 @@ class _EyeSceneState extends State<EyeScene>
     super.initState();
     model = _Animation(widget.mood)
       ..sleepSeconds = widget.sleepSeconds
-      ..desk = widget.fullScreen;
+      ..desk = widget.fullScreen
+      ..voiceLevel = widget.voiceLevel;
     ticker = createTicker((elapsed) => model.step(elapsed.inMilliseconds))
       ..start();
   }
@@ -56,6 +63,10 @@ class _EyeSceneState extends State<EyeScene>
     super.didUpdateWidget(oldWidget);
     model.sleepSeconds = widget.sleepSeconds;
     model.desk = widget.fullScreen;
+    model.voiceLevel = widget.voiceLevel;
+    if (oldWidget.noticeCue != widget.noticeCue) {
+      model.noticeAt = widget.noticeCue == null ? null : model.time;
+    }
     if (oldWidget.mood != widget.mood ||
         oldWidget.revision != widget.revision) {
       model.update(widget.mood);
@@ -77,6 +88,7 @@ class _EyeSceneState extends State<EyeScene>
         _EyeGesture: GestureRecognizerFactoryWithHandlers<_EyeGesture>(
           _EyeGesture.new,
           (gestures) {
+            gestures.allowVerticalScroll = widget.allowVerticalScroll;
             gestures.onDown = (event) =>
                 model.down(event.localPosition, event.timeStamp.inMilliseconds);
             gestures.onMove = (event) =>
@@ -140,6 +152,9 @@ class _EyeSceneState extends State<EyeScene>
 
 class _EyeGesture extends OneSequenceGestureRecognizer {
   int? _pointer;
+  Offset _origin = Offset.zero;
+  bool _claimed = false;
+  bool allowVerticalScroll = false;
   void Function(PointerDownEvent)? onDown;
   void Function(PointerMoveEvent)? onMove;
   void Function(PointerUpEvent)? onUp;
@@ -149,16 +164,34 @@ class _EyeGesture extends OneSequenceGestureRecognizer {
   void addAllowedPointer(PointerDownEvent event) {
     if (_pointer != null) return;
     _pointer = event.pointer;
+    _origin = event.position;
     startTrackingPointer(event.pointer, event.transform);
-    resolve(GestureDisposition.accepted);
+    _claimed = !allowVerticalScroll;
+    if (_claimed) resolve(GestureDisposition.accepted);
     onDown?.call(event);
   }
 
   @override
   void handleEvent(PointerEvent event) {
     if (event.pointer != _pointer) return;
-    if (event is PointerMoveEvent) onMove?.call(event);
-    if (event is PointerUpEvent) onUp?.call(event);
+    if (event is PointerMoveEvent) {
+      if (!_claimed) {
+        final offset = event.position - _origin;
+        if (offset.dy.abs() > kTouchSlop && offset.dy.abs() > offset.dx.abs()) {
+          resolve(GestureDisposition.rejected);
+          return;
+        }
+        if (offset.dx.abs() > kTouchSlop) {
+          _claimed = true;
+          resolve(GestureDisposition.accepted);
+        }
+      }
+      onMove?.call(event);
+    }
+    if (event is PointerUpEvent) {
+      if (!_claimed) resolve(GestureDisposition.accepted);
+      onUp?.call(event);
+    }
     if (event is PointerCancelEvent) onCancel?.call();
     stopTrackingIfPointerNoLongerDown(event);
   }
@@ -218,6 +251,9 @@ class _Animation extends ChangeNotifier {
   int idleMoodEnd = 0;
   Offset glance = Offset.zero;
   Offset gaze = Offset.zero;
+  int? noticeAt;
+  double? voiceLevel;
+  double voiceEnergy = 0;
   Offset pupil = Offset.zero;
   double spacing = .18;
   double tilt = 0;
@@ -399,6 +435,14 @@ class _Animation extends ChangeNotifier {
   void step(int now) {
     final elapsed = (now - time).clamp(1, 50);
     time = now;
+    final voiceTarget = math.sqrt(_unit(voiceLevel ?? 0));
+    voiceEnergy = motion
+        ? _mix(
+            voiceEnergy,
+            voiceTarget,
+            1 - math.exp(-elapsed / (voiceTarget > voiceEnergy ? 62 : 170)),
+          )
+        : 0;
     final queued = queuedPeek;
     if (queued != null && time >= queued.at) {
       peek = queued;
@@ -530,12 +574,16 @@ class _Animation extends ChangeNotifier {
     if (next == EyeMood.thinking && motion) {
       if (old == null || time >= old.end) thought = _look(old);
       final look = thought!;
-      final ease = _ease((time - look.start) / 320);
-      pupil = Offset.lerp(look.fromPupil, look.target, ease)!;
+      final age = time - look.start;
+      pupil = Offset.lerp(
+        look.fromPupil,
+        look.target,
+        _ease(age / look.moveDuration),
+      )!;
       gaze = Offset.lerp(
         look.fromGaze,
-        Offset(look.target.dx * .105, look.target.dy * .083),
-        ease,
+        Offset(look.target.dx * .083, look.target.dy * .067),
+        _ease((age - 20) / (look.moveDuration + 65)),
       )!;
     } else {
       thought = null;
@@ -594,41 +642,49 @@ class _Animation extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Each stop has its own travel time, dwell range, and optional blink.
+  static const _readingStops = [
+    (Offset(-.86, -.29), 145, 370, 505, null),
+    (Offset(-.18, -.26), 65, 185, 265, null),
+    (Offset(.70, -.22), 95, 510, 680, null),
+    (Offset(-.77, .42), 80, 365, 510, 10),
+    (Offset(.06, .44), 70, 200, 300, null),
+    (Offset(.81, .46), 180, 680, 900, null),
+    (Offset(.40, -.57), 220, 850, 1120, 375),
+  ];
+  static const _codeSettle = 200;
+
   _Look _look(_Look? previous) {
-    final remaining = previous?.beforeCode ?? _range(2, 5);
-    final moveBlink = random.nextBool() ? time + _range(15, 135) : null;
-    if (remaining == 0) {
+    final step = (previous?.step ?? -1) + 1;
+    if (step == _readingStops.length) {
       return _Look(
-        time,
-        time + 2320,
-        _range(2, 5),
         null,
+        time,
+        time + _codeSettle + 2000,
+        105,
         Offset.zero,
         pupil,
         gaze,
-        moveBlink,
         null,
-        false,
       );
     }
-    final direction = previous?.direction;
-    final next = direction == null
-        ? random.nextInt(8)
-        : (direction + _range(2, 7)) % 8;
-    final angle = next * math.pi / 4;
-    final end = time + _range(2320, 3321);
-    final count = random.nextInt(3);
+    final (direction, moveDuration, minHold, maxHold, blinkDelay) =
+        _readingStops[step];
+    final target =
+        direction +
+        Offset(
+          random.nextDouble() * .10 - .05,
+          random.nextDouble() * .08 - .04,
+        );
     return _Look(
+      step,
       time,
-      end,
-      remaining - 1,
-      next,
-      Offset(math.cos(angle), math.sin(angle)),
+      time + _range(minHold, maxHold),
+      moveDuration,
+      target,
       pupil,
       gaze,
-      moveBlink,
-      count == 0 ? null : _range(time + 570, end - 620),
-      count == 2,
+      blinkDelay == null ? null : time + blinkDelay + _range(0, 36),
     );
   }
 
@@ -636,15 +692,11 @@ class _Animation extends ChangeNotifier {
     if (!motion) return 1;
     final look = thought;
     if (look != null) {
-      final moveBlink = look.moveBlink;
-      final holdBlink = look.holdBlink;
-      if (moveBlink != null && time >= moveBlink && time < moveBlink + 185) {
-        return 1 - .92 * _pulse(time - moveBlink, 185);
-      }
-      if (holdBlink == null) return 1;
-      return look.doubleBlink
-          ? _double(time - holdBlink)
-          : 1 - .92 * _pulse(time - holdBlink, 185);
+      final blinkAt = look.blinkAt;
+      if (blinkAt == null) return 1;
+      final age = time - blinkAt;
+      final closure = age < 65 ? _ease(age / 65) : 1 - _ease((age - 65) / 120);
+      return 1 - .92 * closure;
     }
     if (expression != EyeMood.idle &&
         expression != EyeMood.question &&
@@ -667,28 +719,22 @@ class _Animation extends ChangeNotifier {
                 ? _pulse(age - 255, 170)
                 : _pulse(age, 185));
   }
-
-  double _double(int age) =>
-      1 - .91 * (age >= 255 ? _pulse(age - 255, 165) : _pulse(age, 175));
 }
 
 class _Look {
   _Look(
+    this.step,
     this.start,
     this.end,
-    this.beforeCode,
-    this.direction,
+    this.moveDuration,
     this.target,
     this.fromPupil,
     this.fromGaze,
-    this.moveBlink,
-    this.holdBlink,
-    this.doubleBlink,
+    this.blinkAt,
   );
-  final int start, end, beforeCode;
-  final int? direction, moveBlink, holdBlink;
+  final int start, end, moveDuration;
+  final int? step, blinkAt;
   final Offset target, fromPupil, fromGaze;
-  final bool doubleBlink;
 }
 
 class _Particle {
@@ -844,7 +890,8 @@ class _Painter extends CustomPainter {
           }
           return open(y, .275, .432);
         case EyeMood.thinking:
-          return open(y, .30, .405);
+          final reading = _unit(model.pupil.dy * 2);
+          return open(y, .30, .405, inset: reading * .022);
         case EyeMood.idea:
           return open(y - .023, .327, .515 + swell * .039, openness: 1);
         case EyeMood.question:
@@ -900,16 +947,25 @@ class _Painter extends CustomPainter {
             browWidth: .024,
           );
         case EyeMood.sleep:
-          return _Eye(Offset(x, y + .04), .126, .014, bend: -.065);
+          final breath = model.motion
+              ? (1 - math.cos(2 * math.pi * age / 4200)) / 2
+              : 0.0;
+          return _Eye(
+            Offset(x, y + .04 - breath * .018),
+            .126 + breath * .008,
+            .014 + breath * .005,
+            bend: -.065 - breath * .019,
+          );
         case EyeMood.focus:
           final proximity = _ease((model.pupil.dx * side - .045) / .68);
+          final voice = model.followingTouch ? 0.0 : model.voiceEnergy;
           return open(
-            y,
-            .253 * (1 - proximity * .14),
-            .401 * (1 - proximity * .24),
-            brow: .172 + proximity * .048,
-            lean: -side * .108,
-            arch: .026,
+            y - .022 * voice,
+            (.253 + .016 * voice) * (1 - proximity * .14),
+            (.401 + .105 * voice) * (1 - proximity * .24),
+            brow: .172 + proximity * .048 - .045 * voice,
+            lean: -side * (.108 - .072 * voice),
+            arch: .026 + .021 * voice,
           );
         case EyeMood.hello:
           final hop = model.motion ? _pulse(age, 680) : 0.0;
@@ -936,7 +992,18 @@ class _Painter extends CustomPainter {
     final h = frame.height;
     if (w <= 0 || h <= 0) return;
     final expression = model.expression;
-    var face = _face(expression, model.blink(), w / h);
+    final noticeAge = model.time - (model.noticeAt ?? -2000);
+    final reacting =
+        model.motion &&
+        !model.followingTouch &&
+        (expression == EyeMood.idle || expression == EyeMood.stopped) &&
+        noticeAge < 1050;
+    final glance = reacting
+        ? _ease(noticeAge / 180) * (1 - _ease((noticeAge - 520) / 480))
+        : 0.0;
+    final blink =
+        model.blink() * (reacting ? 1 - .88 * _pulse(noticeAge - 320, 210) : 1);
+    var face = _face(expression, blink, w / h);
     final age = model.time - model.expressionAt;
     final morphDuration = expression == EyeMood.done || model.followingTouch
         ? 145
@@ -975,11 +1042,22 @@ class _Painter extends CustomPainter {
     canvas.rotate(model.tilt);
     canvas.translate(-w * .5, -h * .46);
     final thought = model.thought;
-    final code = thought != null && thought.direction == null
-        ? model.time - thought.start - 320
+    final code = thought != null && thought.step == null
+        ? model.time - thought.start - _Animation._codeSettle
         : -1;
-    _eye(canvas, face.left, face.colors, w, h, true, code);
-    _eye(canvas, face.right, face.colors, w, h, false, code);
+    canvas.translate(w * .036 * glance, h * .028 * glance);
+    final eyeColors = glance == 0
+        ? face.colors
+        : List.generate(
+            3,
+            (i) => Color.lerp(
+              face.colors[i],
+              Color(palette[EyeMood.thinking]![i]),
+              glance * .72,
+            )!,
+          );
+    _eye(canvas, face.left, eyeColors, w, h, true, code);
+    _eye(canvas, face.right, eyeColors, w, h, false, code);
     canvas.restore();
     _details(canvas, expression, face.colors[0], w, h, age, progress);
     canvas.restore();
@@ -1029,7 +1107,19 @@ class _Painter extends CustomPainter {
         shape = bent;
       }
 
-      _drawHalo(canvas, shape, colors[1], h * .076);
+      final listening =
+          model.expression == EyeMood.focus && !model.followingTouch;
+      final voice = listening ? model.voiceEnergy : 0.0;
+      final breath = listening && model.voiceLevel != null && model.motion
+          ? .10 * (1 - math.cos(model.time * 2 * math.pi / 2100))
+          : 0.0;
+      _drawHalo(
+        canvas,
+        shape,
+        colors[1],
+        h * (.076 + .022 * voice + .011 * breath),
+        1 + .52 * voice + breath,
+      );
       final paint = Paint()
         ..shader = _ellipticalGradient(
           Offset(cx, cy - eye.bend * h / 4),
@@ -1470,20 +1560,34 @@ class _Painter extends CustomPainter {
         const Color(0xffffe491),
       );
     } else if (mood == EyeMood.sleep) {
-      _text(
-        canvas,
-        'Z',
-        Offset(w * .79, h * .25),
-        h * .11,
-        color.withAlpha(151),
-      );
-      _text(
-        canvas,
-        'z',
-        Offset(w * .865, h * .177),
-        h * .083,
-        color.withAlpha(100),
-      );
+      if (!model.motion) {
+        _text(
+          canvas,
+          'Z',
+          Offset(w * .79, h * .25),
+          h * .11,
+          color.withAlpha(151),
+        );
+        _text(
+          canvas,
+          'z',
+          Offset(w * .865, h * .177),
+          h * .083,
+          color.withAlpha(100),
+        );
+        return;
+      }
+      for (var i = 0; i < 2; i++) {
+        final drift = ((age + 640 + i * 1440) % 3200) / 3200;
+        final alpha = (185 * _pulse(drift, 1) * progress).round();
+        _text(
+          canvas,
+          i == 0 ? 'Z' : 'z',
+          Offset(w * (.76 + drift * .14), h * (.33 - drift * .20)),
+          h * (.077 + drift * .039),
+          color.withAlpha(alpha),
+        );
+      }
     } else if (mood == EyeMood.done && model.motion) {
       final doneAge = model.status == EyeMood.done
           ? model.time - (model.donePresentedAt ?? model.statusAt)

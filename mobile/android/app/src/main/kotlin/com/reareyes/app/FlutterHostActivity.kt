@@ -1,6 +1,7 @@
 package com.reareyes.app
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,6 +9,8 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.net.Uri
+import android.provider.Settings
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
@@ -23,6 +26,7 @@ import rikka.shizuku.Shizuku
 
 class FlutterHostActivity : FlutterActivity() {
     private var interaction: RobotInteractionBridge? = null
+    private var mobileChannel: MethodChannel? = null
     private var pendingRear: Boolean? = null
     private val rearPermission = Shizuku.OnRequestPermissionResultListener { request, granted ->
         if (request == SHIZUKU_REQUEST) {
@@ -94,6 +98,8 @@ class FlutterHostActivity : FlutterActivity() {
 
         switchingRear = false
         if (calibrate) MainActivity.requestRearCalibration()
+        EyesBus.refreshDesktopStatus()
+        mobileChannel?.invokeMethod("rearDisplayReady", null)
     }
 
     private fun reportRearError(error: String) {
@@ -112,11 +118,6 @@ class FlutterHostActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
         pendingRear = savedInstanceState?.getString("pendingRear")?.toBooleanStrictOrNull()
         Shizuku.addRequestPermissionResultListener(rearPermission)
-        if (savedInstanceState == null && Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -141,11 +142,14 @@ class FlutterHostActivity : FlutterActivity() {
                         override fun dispose() = Unit
                     }
             })
-        MethodChannel(engine.dartExecutor.binaryMessenger, "com.reareyes/mobile")
-            .setMethodCallHandler(::onCall)
+        mobileChannel = MethodChannel(engine.dartExecutor.binaryMessenger, "com.reareyes/mobile").apply {
+            setMethodCallHandler(::onCall)
+        }
     }
 
     override fun cleanUpFlutterEngine(engine: FlutterEngine) {
+        mobileChannel?.setMethodCallHandler(null)
+        mobileChannel = null
         interaction?.close()
         interaction = null
         super.cleanUpFlutterEngine(engine)
@@ -166,6 +170,11 @@ class FlutterHostActivity : FlutterActivity() {
         startService(Intent(this, EyesService::class.java))
     }
 
+    override fun onResume() {
+        EyesBus.refreshDesktopStatus()
+        super.onResume()
+    }
+
     override fun onStop() {
         interaction?.suspendListening()
         RemoteConnection.screenStopped()
@@ -176,8 +185,59 @@ class FlutterHostActivity : FlutterActivity() {
         JSONObject().put("url", it.url).put("token", it.token).toString()
     }
 
+    private fun permissionStatus(): Map<String, Boolean?> = buildMap {
+        put("notificationAccess", RobotNotificationListener.isEnabled(this@FlutterHostActivity))
+        put("listenerConnected", RobotNotificationListener.isConnected())
+        put("microphone", checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+        put("contacts", checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            put("notifications", checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+        }
+        if (Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true)) {
+            put("autoStart", null)
+            put("floatingNotifications", null)
+        }
+        if (supportsRear()) {
+            put("shizuku", runCatching {
+                Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            }.getOrDefault(false))
+        }
+    }
+
+    private fun openPermission(id: String) {
+        if (id == "shizuku" && supportsRear()) {
+            if (Shizuku.pingBinder() && !Shizuku.shouldShowRequestPermissionRationale()) {
+                if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                    Shizuku.requestPermission(SHIZUKU_REQUEST)
+                }
+            } else {
+                RearDisplayBridge.offerShizuku(this, "请在 Shizuku 启动服务并允许 Robot Eyes。")
+            }
+            return
+        }
+        val appSettings = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null))
+        val target = when (id) {
+            "notificationAccess" -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+            "autoStart" -> Intent("miui.intent.action.OP_AUTO_START").setPackage("com.miui.securitycenter")
+            "floatingNotifications" -> Intent("android.settings.NOTIFICATION_SETTINGS").setPackage("com.android.settings")
+            else -> appSettings
+        }
+        try {
+            startActivity(target)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(appSettings)
+        }
+    }
+
     private fun onCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "permissionStatus" -> result.success(permissionStatus())
+            "openPermission" -> try {
+                openPermission(call.arguments as? String ?: "")
+                result.success(null)
+            } catch (_: RuntimeException) {
+                result.error("permission_settings", "无法打开权限设置", null)
+            }
             "snapshot" -> {
                 val sources = EyesBus.connectedTransports().map { it.name }
                 val feedback = RemoteConnection.feedback
@@ -185,6 +245,7 @@ class FlutterHostActivity : FlutterActivity() {
                 result.success(mapOf(
                     "state" to EyesBus.state.name, "connections" to sources,
                     "agents" to EyesBus.agentStates().mapValues { it.value.name },
+                    "models" to EyesBus.modelConnections(),
                     "logs" to EyesBus.dumpLog(40),
                     "pairing" to pairingConfig(), "remoteState" to feedback.state?.name,
                     "five" to usage.fiveHour?.usedPercent, "fiveReset" to usage.fiveHour?.resetsAt,
@@ -193,6 +254,15 @@ class FlutterHostActivity : FlutterActivity() {
                     "syncTicket" to EyesBus.syncedTicket,
                     "rearSupported" to supportsRear(),
                 ))
+            }
+            "rearSettings" -> {
+                val keepOn = call.argument<Boolean>("keepOn")
+                val brightness = call.argument<Int>("brightness")
+                if (keepOn != null && brightness != null) {
+                    RearDisplaySettings(keepOn, brightness).save(this)
+                }
+                val settings = RearDisplaySettings.load(this)
+                result.success(mapOf("keepOn" to settings.keepOn, "brightness" to settings.brightness))
             }
             "loadPairing" -> result.success(pairingConfig())
             "savePairing" -> {

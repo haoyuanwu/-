@@ -131,7 +131,8 @@ internal class LanMcpServer(private val context: Context) : Thread("LanMcpServer
             synchronized(LanMcpSettings) {
                 if (!LanMcpSettings.enabled(context)) return respond(socket, "403 Forbidden")
                 EyesBus.setDesktopSnapshot(EyesBus.Transport.LAN, state, EyesBus.Usage(usage("five"), usage("week")),
-                    agents = EyesBus.readAgentStates(message.optJSONObject("agents")))
+                    agents = EyesBus.readAgentStates(message.optJSONObject("agents")),
+                    models = EyesBus.readModelConnections(message.optJSONArray("models")))
             }
             return respond(socket, "200 OK", JSONObject().put("ok", true))
         }

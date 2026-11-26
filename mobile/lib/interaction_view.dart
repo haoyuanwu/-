@@ -746,16 +746,18 @@ class InteractionBubbles extends StatelessWidget {
     this.interaction, {
     super.key,
     this.showReply = false,
+    this.includeNotice = true,
   });
 
   final RobotInteraction interaction;
   final bool showReply;
+  final bool includeNotice;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: interaction,
     builder: (context, _) {
-      final notice = interaction.notice;
+      final notice = includeNotice ? interaction.notice : null;
       final shared = interaction.sharedText;
       final showAnswer =
           showReply && (interaction.generating || interaction.reply.isNotEmpty);
@@ -765,12 +767,14 @@ class InteractionBubbles extends StatelessWidget {
       return Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (notice != null)
+            _NoticeHud(interaction, notice, key: ValueKey(notice)),
           if (showAnswer)
             _bubble(
               icon: Icons.chat_bubble_outline,
               title: interaction.replyModel ?? 'Robot Eyes',
               text:
-                  interaction.spokenText ??
+                  interaction.spokenReply ??
                   (interaction.reply.isEmpty ? '正在思考…' : interaction.reply),
               open: () => openConversation(context, interaction),
               trailing: interaction.spokenText == null
@@ -780,22 +784,6 @@ class InteractionBubbles extends StatelessWidget {
                       icon: const Icon(Icons.volume_off_outlined),
                       onPressed: interaction.muteCurrent,
                     ),
-            ),
-          if (notice != null)
-            _bubble(
-              icon: notice.verification
-                  ? Icons.verified_user_outlined
-                  : Icons.notifications_outlined,
-              title: notice.title,
-              text: notice.text.isEmpty
-                  ? notice.source
-                  : '${notice.source} · ${notice.text}',
-              open: () => showNotice(context, interaction, notice),
-              trailing: IconButton(
-                tooltip: '关闭提醒',
-                icon: const Icon(Icons.close),
-                onPressed: interaction.clearNotice,
-              ),
             ),
           if (shared != null)
             _bubble(
@@ -814,7 +802,7 @@ class InteractionBubbles extends StatelessWidget {
     },
   );
 
-  Widget _bubble({
+  static Widget _bubble({
     required IconData icon,
     required String title,
     required String text,
@@ -835,6 +823,233 @@ class InteractionBubbles extends StatelessWidget {
       trailing: trailing,
     ),
   );
+}
+
+class NoticeSignal extends StatelessWidget {
+  const NoticeSignal(this.interaction, {super.key});
+
+  final RobotInteraction interaction;
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: interaction,
+    builder: (context, _) {
+      final notice = interaction.notice;
+      final duration = MediaQuery.disableAnimationsOf(context)
+          ? Duration.zero
+          : const Duration(milliseconds: 410);
+      return IgnorePointer(
+        ignoring: notice == null,
+        child: AnimatedSwitcher(
+          duration: duration,
+          reverseDuration: duration == Duration.zero
+              ? Duration.zero
+              : const Duration(milliseconds: 180),
+          layoutBuilder: (current, previous) => Stack(
+            alignment: Alignment.bottomCenter,
+            children: [
+              for (final child in previous) IgnorePointer(child: child),
+              ?current,
+            ],
+          ),
+          transitionBuilder: (child, animation) {
+            final ease = animation.drive(
+              CurveTween(curve: Curves.easeOutCubic),
+            );
+            return SlideTransition(
+              position: Tween(
+                begin: const Offset(.035, .12),
+                end: Offset.zero,
+              ).animate(ease),
+              child: FadeTransition(
+                opacity: ease,
+                child: CustomPaint(
+                  foregroundPainter: _NoticeSweep(animation),
+                  child: child,
+                ),
+              ),
+            );
+          },
+          child: notice == null
+              ? const SizedBox.shrink()
+              : _NoticeHud(interaction, notice, key: ValueKey(notice)),
+        ),
+      );
+    },
+  );
+}
+
+class _NoticeSweep extends CustomPainter {
+  _NoticeSweep(this.animation) : super(repaint: animation);
+
+  final Animation<double> animation;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final t = animation.value;
+    if (t <= 0 || t >= 1 || size.isEmpty) return;
+    final x = (size.width + 48) * t - 24;
+    final band = Rect.fromLTRB(x - 24, 0, x + 24, size.height);
+    final strength = 1 - (2 * t - 1).abs();
+    canvas.save();
+    canvas.clipRect((Offset.zero & size).deflate(2));
+    canvas.drawRect(
+      band,
+      Paint()
+        ..shader = LinearGradient(
+          colors: [
+            cyan.withValues(alpha: 0),
+            cyan.withValues(alpha: strength * .20),
+            cyan.withValues(alpha: 0),
+          ],
+        ).createShader(band),
+    );
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_NoticeSweep oldDelegate) =>
+      animation != oldDelegate.animation;
+}
+
+class _NoticeHud extends StatefulWidget {
+  const _NoticeHud(this.interaction, this.notice, {super.key});
+
+  final RobotInteraction interaction;
+  final PhoneNotice notice;
+
+  @override
+  State<_NoticeHud> createState() => _NoticeHudState();
+}
+
+class _NoticeHudState extends State<_NoticeHud> {
+  late final _logo = widget.interaction.noticeAppIcon(widget.notice);
+
+  @override
+  Widget build(BuildContext context) {
+    final notice = widget.notice;
+    return Semantics(
+      liveRegion: true,
+      button: true,
+      child: GestureDetector(
+        onTap: () => showNotice(context, widget.interaction, notice),
+        child: CustomPaint(
+          painter: const _NoticeHudFrame(),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(13, 10, 15, 11),
+            child: Row(
+              children: [
+                FutureBuilder<Uint8List?>(
+                  future: _logo,
+                  builder: (context, snapshot) => snapshot.data == null
+                      ? const SizedBox.shrink()
+                      : Padding(
+                          padding: const EdgeInsets.only(right: 10),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(6),
+                            child: Image.memory(
+                              snapshot.data!,
+                              width: 30,
+                              height: 30,
+                              excludeFromSemantics: true,
+                              errorBuilder: (_, _, _) =>
+                                  const SizedBox.shrink(),
+                            ),
+                          ),
+                        ),
+                ),
+                Expanded(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        notice.source,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: cyan,
+                          fontSize: 11,
+                          letterSpacing: 1.3,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Text(
+                        notice.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: primaryInk,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      if (notice.text.isNotEmpty)
+                        Text(
+                          notice.text,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: secondaryInk,
+                            fontSize: 12,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NoticeHudFrame extends CustomPainter {
+  const _NoticeHudFrame();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+    const corner = 11.0;
+    final frame = Path()
+      ..moveTo(0, corner)
+      ..lineTo(corner, 0)
+      ..lineTo(w, 0)
+      ..lineTo(w, h - corner)
+      ..lineTo(w - corner, h)
+      ..lineTo(0, h)
+      ..close();
+    final paint = Paint()
+      ..shader = const LinearGradient(
+        colors: [Color(0xf0132635), Color(0xf008101c)],
+      ).createShader(Offset.zero & size);
+    canvas.drawPath(frame, paint);
+    paint
+      ..shader = null
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = cyan.withValues(alpha: .34);
+    canvas.drawPath(frame, paint);
+    final corners = Path()
+      ..moveTo(0, 25)
+      ..lineTo(0, corner)
+      ..lineTo(corner, 0)
+      ..lineTo(31, 0)
+      ..moveTo(w - 31, h)
+      ..lineTo(w - corner, h)
+      ..lineTo(w, h - corner)
+      ..lineTo(w, h - 25);
+    paint
+      ..strokeWidth = 1.5
+      ..color = cyan.withValues(alpha: .9);
+    canvas.drawPath(corners, paint);
+  }
+
+  @override
+  bool shouldRepaint(_NoticeHudFrame oldDelegate) => false;
 }
 
 Future<void> openInteractionSettings(
@@ -893,21 +1108,24 @@ Future<void> openRecentNotices(
 ) async {
   final item = await showDialog<PhoneNotice>(
     context: context,
-    builder: (context) => SimpleDialog(
-      title: const Text('最近提醒'),
-      children: [
-        if (interaction.recentNotices.isEmpty)
-          const Padding(padding: EdgeInsets.all(16), child: Text('暂无提醒')),
-        for (final item in interaction.recentNotices)
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, item),
-            child: Text(
-              '${item.source} · ${item.title}',
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
+    builder: (context) => ListenableBuilder(
+      listenable: interaction,
+      builder: (context, _) => SimpleDialog(
+        title: const Text('最近提醒'),
+        children: [
+          if (interaction.recentNotices.isEmpty)
+            const Padding(padding: EdgeInsets.all(16), child: Text('暂无提醒')),
+          for (final item in interaction.recentNotices)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, item),
+              child: Text(
+                '${item.source} · ${item.title}',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
-          ),
-      ],
+        ],
+      ),
     ),
   );
   if (item != null && context.mounted) {

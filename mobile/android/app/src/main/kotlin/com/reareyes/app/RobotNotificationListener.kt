@@ -5,9 +5,11 @@ import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import org.json.JSONObject
 
 class RobotNotificationListener : NotificationListenerService() {
     private val seen = linkedMapOf<String, Map<String, Any>>()
@@ -22,7 +24,6 @@ class RobotNotificationListener : NotificationListenerService() {
     override fun onListenerDisconnected() {
         if (current === this) {
             current = null
-            pending.clear()
         }
         seen.clear()
     }
@@ -38,7 +39,6 @@ class RobotNotificationListener : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         seen.remove(sbn.key)
-        pending.remove(sbn.key)
     }
 
     private fun publish(sbn: StatusBarNotification, initial: Boolean) {
@@ -47,14 +47,13 @@ class RobotNotificationListener : NotificationListenerService() {
             sbn.isOngoing || !isEnabled(this)
         ) return
         val content = content(sbn)
-        if (content.title.isEmpty() && content.text.isEmpty() && !content.verification) return
         val event = mapOf(
             "type" to "notification",
             "id" to sbn.key,
             "package" to sbn.packageName,
             "app" to appLabel(sbn.packageName),
             "sender" to if (content.verification) "" else content.sender,
-            "title" to if (content.verification) "收到验证消息" else content.title,
+            "title" to if (content.verification) "收到验证消息" else content.title.ifBlank { "新提醒" },
             "text" to if (content.verification) "" else content.text,
             "verification" to content.verification,
             "timestamp" to sbn.postTime,
@@ -63,6 +62,21 @@ class RobotNotificationListener : NotificationListenerService() {
         seen.remove(sbn.key)
         seen[sbn.key] = event
         if (seen.size > MAX_TRACKED) seen.remove(seen.keys.first())
+        val recent = System.currentTimeMillis() - sbn.postTime in 0L..12_000L
+        if ((!initial || recent) && matchesRearRules(sbn.packageName, if (content.verification)
+                content.copy(sender = "", title = "收到验证消息", text = "") else content)) {
+            EyesBus.showRearNotice(
+                EyesBus.RearNotice(
+                    key = "${sbn.key}:${sbn.postTime}",
+                    source = event.getValue("app").toString(),
+                    title = event.getValue("title").toString(),
+                    text = event.getValue("text").toString(),
+                    icon = RobotInteractionBridge.appLogo(this, sbn.packageName),
+                    startedAt = SystemClock.elapsedRealtime(),
+                    react = !initial,
+                ),
+            )
+        }
         val payload = event + ("initial" to initial)
         val emit = onEvent
         if (emit != null) {
@@ -72,6 +86,36 @@ class RobotNotificationListener : NotificationListenerService() {
             pending[sbn.key] = payload
             if (pending.size > MAX_EVENTS) pending.remove(pending.keys.first())
         }
+    }
+
+    private fun matchesRearRules(packageName: String, notice: NotificationContent): Boolean {
+        val raw = getSharedPreferences(RobotInteractionBridge.SETTINGS_PREFS, MODE_PRIVATE)
+            .getString(RobotInteractionBridge.SETTINGS_KEY, null) ?: return true
+        val settings = runCatching { JSONObject(raw) }.getOrNull() ?: return false
+        val sources = settings.optJSONObject("sources")
+        if (sources?.has(packageName) == true) return true
+        val keywords = settings.optJSONArray("keywords")
+        val contacts = settings.optJSONArray("contacts")
+        val words = if (keywords == null) settings.optString("filter")
+            .split(',', '，', '\n').map(String::trim).filter(String::isNotEmpty)
+        else (0 until keywords.length()).mapNotNull { keywords.opt(it) as? String }
+        if (words.isEmpty() && (contacts?.length() ?: 0) == 0) return (sources?.length() ?: 0) == 0
+        val content = "${notice.sender} ${notice.title} ${notice.text}"
+        if (words.any { it.isNotBlank() && content.contains(it, ignoreCase = true) }) return true
+        val sender = notice.sender.trim()
+        if (sender.isEmpty() || contacts == null) return false
+        val number = sender.filter(Char::isDigit).takeIf {
+            it.length >= 7 && sender.matches(Regex("""\+?[\d ()-]+"""))
+        }
+        for (i in 0 until contacts.length()) {
+            val contact = contacts.optJSONObject(i) ?: continue
+            if (contact.optString("name").trim().equals(sender, ignoreCase = true)) return true
+            val aliases = contact.optJSONArray("aliases") ?: continue
+            if (number != null && (0 until aliases.length()).any {
+                    aliases.optString(it).filter(Char::isDigit) == number
+                }) return true
+        }
+        return false
     }
 
     @Suppress("DEPRECATION")
@@ -119,7 +163,10 @@ class RobotNotificationListener : NotificationListenerService() {
         )
         private val pending = linkedMapOf<String, Map<String, Any>>()
         private var current: RobotNotificationListener? = null
+        private var lastRebind: Long? = null
         var onEvent: ((Map<String, Any>) -> Unit)? = null
+
+        fun isConnected(): Boolean = current != null
 
         fun isEnabled(context: Context): Boolean {
             val component = ComponentName(context, RobotNotificationListener::class.java)
@@ -132,9 +179,18 @@ class RobotNotificationListener : NotificationListenerService() {
         }
 
         fun drain(context: Context): List<Map<String, Any>> {
-            val entries = if (isEnabled(context)) pending.values.toList() else emptyList()
-            pending.clear()
-            return entries
+            if (!isEnabled(context)) {
+                pending.clear()
+                return emptyList()
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (current == null && (lastRebind?.let { now - it >= 5_000L } != false)) {
+                lastRebind = now
+                runCatching {
+                    requestRebind(ComponentName(context, RobotNotificationListener::class.java))
+                }
+            }
+            return pending.values.toList().also { pending.clear() }
         }
 
         fun details(context: Context, id: String): String? {

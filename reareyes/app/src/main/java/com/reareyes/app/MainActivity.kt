@@ -5,6 +5,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -31,6 +32,8 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import rikka.shizuku.Shizuku
@@ -143,6 +146,10 @@ class MainActivity : Activity() {
     }
     private var rearRoot: FrameLayout? = null
     private var rearEyes: EyesView? = null
+    private val rearPreferences by lazy { RearDisplaySettings.preferences(this) }
+    private val rearSettingsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        if (showingRear && isOnRearDisplay()) applyRearDisplayPower(true)
+    }
     private var calibrationPanel: ViewGroup? = null
     private data class RearTouch(val x: Float, val y: Float, val time: Long) {
         fun isNear(otherX: Float, otherY: Float, slop: Float): Boolean {
@@ -180,6 +187,7 @@ class MainActivity : Activity() {
         enteredRear = savedInstanceState?.getBoolean("enteredRear") ?: false
         stageRearLaunch(intent)
         if (rearOnly) window.decorView.viewTreeObserver.addOnPreDrawListener(rearDisplayPreDraw)
+        rearPreferences.registerOnSharedPreferenceChangeListener(rearSettingsListener)
         calibrateAfterPermission = savedInstanceState?.getString("shizukuAction")?.toBooleanStrictOrNull()
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         startService(Intent(this, EyesService::class.java))
@@ -227,6 +235,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        rearPreferences.unregisterOnSharedPreferenceChangeListener(rearSettingsListener)
         mainHandler.removeCallbacks(syncTimeout)
         mainHandler.removeCallbacks(rearLaunchTimeout)
         if (rearOnly) window.decorView.viewTreeObserver.removeOnPreDrawListener(rearDisplayPreDraw)
@@ -263,7 +272,10 @@ class MainActivity : Activity() {
             openRequestedCalibration()
         }
         if (!showingRear) {
+            EyesBus.refreshDesktopStatus()
             EyesBus.onLog = logListener
+            updateTransportLabels()
+            updateAgentStatuses()
             refreshLog()
         }
     }
@@ -366,8 +378,9 @@ class MainActivity : Activity() {
             if (error != null) {
                 EyesBus.log("Shizuku: $error")
                 Toast.makeText(app, "背屏切换失败，请检查 Shizuku 后重试", Toast.LENGTH_LONG).show()
-            } else if (calibrate) {
-                requestRearCalibration()
+            } else {
+                EyesBus.refreshDesktopStatus()
+                if (calibrate) requestRearCalibration()
             }
         }
     }
@@ -375,7 +388,8 @@ class MainActivity : Activity() {
     private fun offerShizuku(message: String) = RearDisplayBridge.offerShizuku(this, message)
 
     private fun applyRearDisplayPower(onRearDisplay: Boolean) {
-        val brightness = if (onRearDisplay) WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_FULL
+        val settings = RearDisplaySettings.load(this)
+        val brightness = if (onRearDisplay) settings.brightness / 100f
             else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         val attributes = window.attributes
         if (attributes.screenBrightness != brightness) {
@@ -383,18 +397,19 @@ class MainActivity : Activity() {
             window.attributes = attributes
         }
         val keepOn = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-        window.setFlags(if (onRearDisplay) keepOn else 0, keepOn)
-        if (Build.VERSION.SDK_INT >= 27) {
-            // Only the dedicated rear window may remain visible when the main display locks.
-            setShowWhenLocked(onRearDisplay)
-            setTurnScreenOn(onRearDisplay)
-        }
+        window.setFlags(if (onRearDisplay && settings.keepOn) keepOn else 0, keepOn)
+        rearEyes?.keepAwake = onRearDisplay && settings.keepOn
     }
 
     private fun renderDisplay() {
         if (isFinishing) return
         showingRear = isOnRearDisplay()
-        applyRearDisplayPower(showingRear)
+        if (Build.VERSION.SDK_INT >= 27) {
+            // Only the dedicated rear window may remain visible when the main display locks.
+            setShowWhenLocked(showingRear)
+            setTurnScreenOn(showingRear)
+        }
+        if (!showingRear) applyRearDisplayPower(false)
         if (!showingRear && rearOnly) {
             if (!waitingForRear || enteredRear) {
                 if (rearSurface?.get() === rearEyes) rearSurface = null
@@ -432,7 +447,6 @@ class MainActivity : Activity() {
             val eyes = EyesView(this, EyesView.Presentation.REAR)
             val root = FrameLayout(this).apply {
                 setBackgroundColor(Color.BLACK)
-                keepScreenOn = true
             }
             root.addView(eyes, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
@@ -442,6 +456,7 @@ class MainActivity : Activity() {
             rearSurface = WeakReference(eyes)
             EyesBus.onCalibrate = calibrationListener
             setContentView(root)
+            applyRearDisplayPower(true)
             openRequestedCalibration()
         } else {
             @Suppress("DEPRECATION")
@@ -594,6 +609,14 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginEnd = dp(8) })
         rearActions.addView(control("圆环校准", CyberColors.violet) { showOnRearDisplay(true) },
             LinearLayout.LayoutParams(0, dp(46), 1f))
+        if (Build.MODEL == "2509FPN0BC" &&
+            getSystemService(DisplayManager::class.java).getDisplay(REAR_DISPLAY_ID) != null
+        ) {
+            col.addView(space(8))
+            val settingsButton = control(rearSettingsLabel(), CyberColors.cyan) {}
+            settingsButton.setOnClickListener { showRearDisplaySettings(settingsButton) }
+            col.addView(settingsButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)))
+        }
         col.addView(space(6))
         col.addView(text("手机切屏需要 Shizuku。", 12f, color = CyberColors.muted))
         col.addView(space(10))
@@ -693,8 +716,7 @@ class MainActivity : Activity() {
         val dialog = AlertDialog.Builder(this)
             .setTitle("远程连接")
             .setView(content)
-            .setPositiveButton("发消息") { _, _ -> showRemoteMessage(pairing) }
-            .setNegativeButton("关闭", null)
+            .setPositiveButton("关闭", null)
             .setNeutralButton("管理配对") { _, _ -> showRemotePairing() }
             .create()
         val update = object : Runnable {
@@ -780,65 +802,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun showRemoteMessage(pairing: RemoteConnection.Pairing) {
-        val input = EditText(this).apply {
-            hint = "输入消息"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            minLines = 2
-            maxLines = 5
-            filters = arrayOf(android.text.InputFilter.LengthFilter(2000))
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("发消息到电脑")
-            .setView(remoteInput(input))
-            .setPositiveButton("发送", null)
-            .setNegativeButton("取消", null)
-            .create()
-        dialog.show()
-        var previousText: String? = null
-        var messageId = ""
-        val send = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
-        send.setOnClickListener {
-            val message = input.text.toString().trim()
-            if (message.isEmpty()) {
-                input.error = "请输入消息。"
-                return@setOnClickListener
-            }
-            if (message != previousText) {
-                messageId = java.util.UUID.randomUUID().toString()
-                previousText = message
-            }
-            val id = messageId
-            send.isEnabled = false
-            input.isEnabled = false
-            input.error = null
-            send.text = "发送中…"
-            Thread {
-                val result = runCatching { RemoteConnection.send(pairing, id, message) }
-                runOnUiThread {
-                    if (!isFinishing && !isDestroyed && dialog.isShowing) {
-                        result.onSuccess {
-                            dialog.dismiss()
-                            Toast.makeText(this, "已送达电脑", Toast.LENGTH_SHORT).show()
-                        }.onFailure {
-                            input.isEnabled = true
-                            send.isEnabled = true
-                            send.text = "重试"
-                            input.error = RemoteConnection.describe(it as? Exception ?: Exception())
-                        }
-                    }
-                }
-            }.start()
-        }
-    }
-
-    private fun remoteInput(input: EditText) = FrameLayout(this).apply {
-        setPadding(dp(24), dp(8), dp(24), 0)
-        addView(input, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-    }
-
     private fun showLanMcpSettings() {
         val enabled = LanMcpSettings.enabled(this)
         val endpoints = LanMcpSettings.endpoints(this)
@@ -882,6 +845,49 @@ class MainActivity : Activity() {
                 dialog.dismiss()
             }
             .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun rearSettingsLabel() = RearDisplaySettings.load(this).let {
+        "背屏常亮 ${if (it.keepOn) "已开启" else "已关闭"} · 亮度 ${it.brightness}%"
+    }
+
+    private fun showRearDisplaySettings(button: Button) {
+        val saved = RearDisplaySettings.load(this)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), dp(8))
+        }
+        val keepOn = Switch(this).apply {
+            text = "背屏常亮"
+            isChecked = saved.keepOn
+        }
+        val label = text("背屏亮度 ${saved.brightness}%", 14f)
+        val brightness = SeekBar(this).apply {
+            min = RearDisplaySettings.MIN_BRIGHTNESS
+            max = 100
+            progress = saved.brightness
+            contentDescription = "背屏亮度"
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                    label.text = "背屏亮度 $value%"
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) = Unit
+                override fun onStopTrackingTouch(bar: SeekBar) = Unit
+            })
+        }
+        body.addView(keepOn)
+        body.addView(space(12))
+        body.addView(label)
+        body.addView(brightness)
+        AlertDialog.Builder(this)
+            .setTitle("背屏显示设置")
+            .setView(body)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存") { _, _ ->
+                RearDisplaySettings(keepOn.isChecked, brightness.progress).save(this)
+                button.text = rearSettingsLabel()
+            }
             .show()
     }
 

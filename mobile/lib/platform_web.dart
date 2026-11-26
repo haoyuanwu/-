@@ -163,7 +163,7 @@ Future<({int status, String body})> request(
       return (status: result.status, body: '');
     }
     final body = (await result.text().toDart).toDart;
-    if (body.length > 8192) throw const FormatException('电脑返回的数据过大');
+    if (body.length > 16384) throw const FormatException('电脑返回的数据过大');
     return (status: result.status, body: body);
   } finally {
     timeout.cancel();

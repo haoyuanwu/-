@@ -82,6 +82,22 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
           null => '等待检测',
         };
   String? failure;
+  String get lanLabel => server.phoneLinks.lanAddress == null
+      ? '未配置'
+      : !server.running
+      ? '服务已停止'
+      : switch (server.phoneLinks.lanReachable) {
+          true => '已连接',
+          false => '连接失败',
+          null => '等待检测',
+        };
+  String get adbLabel => switch (server.phoneLinks.adbTransport) {
+    'USB' => 'USB 已连接',
+    'LAN' => '无线调试已连接',
+    _ => server.running ? '未连接' : '服务已停止',
+  };
+  Timer? _endpointRefresh;
+  bool _detectingEndpoint = false;
   bool busy = false;
   bool checking = false;
   List<String> _publishedRows = const [];
@@ -103,7 +119,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
           ? '启动失败'
           : '已停止'}',
       'Tailscale · $tailscaleLabel',
-      '手机局域网 · ${server.phoneLinks.lanAddress == null ? '未配置' : '已配置'}',
+      '手机局域网 · $lanLabel',
       'Web App · ${!server.webApp.available
           ? '未安装'
           : server.running
@@ -155,12 +171,17 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       if (mounted) {
         unawaited(toggleService());
         unawaited(detectEndpoint());
+        _endpointRefresh = Timer.periodic(
+          const Duration(seconds: 5),
+          (_) => unawaited(detectEndpoint(background: true)),
+        );
       }
     });
   }
 
   @override
   void dispose() {
+    _endpointRefresh?.cancel();
     if (Platform.isMacOS || Platform.isWindows) {
       desktopChannel.setMethodCallHandler(null);
     }
@@ -206,15 +227,19 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     }
   }
 
-  Future<void> detectEndpoint() async {
-    if (checking) return;
-    setState(() => checking = true);
-    publishTray();
+  Future<void> detectEndpoint({bool background = false}) async {
+    if (!background && !checking) {
+      setState(() => checking = true);
+      publishTray();
+    }
+    if (_detectingEndpoint) return;
+    _detectingEndpoint = true;
     TailscaleStatus? result;
     try {
       result = await detectTailscale(RemoteServer.port, RemoteServer.servePort);
     } finally {
-      if (mounted) {
+      _detectingEndpoint = false;
+      if (mounted && (checking || tailscale != result)) {
         setState(() {
           tailscale = result;
           checking = false;
@@ -464,6 +489,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                   onPressed: () {
                     try {
                       server.phoneLinks.configureLan('');
+                      server.refreshPhoneLinks();
                       Navigator.pop(context);
                     } on FileSystemException {
                       update(() => error = '无法移除配置，请检查文件权限。');
@@ -481,6 +507,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                     : () {
                         try {
                           server.phoneLinks.configureLan(config);
+                          server.refreshPhoneLinks();
                           Navigator.pop(context);
                         } on FormatException {
                           update(() => error = '请粘贴手机复制的完整 MCP 配置。');
@@ -515,10 +542,13 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
             ],
           ),
           const SizedBox(height: 8),
-          if (address == null)
-            const Text('未配置', style: TextStyle(color: muted))
-          else
+          StatusPill(lanLabel, active: server.phoneLinks.lanReachable == true),
+          if (address != null) ...[
+            const SizedBox(height: 8),
             SelectableText(address, style: const TextStyle(color: cyan)),
+          ],
+          const SizedBox(height: 8),
+          Text('ADB · $adbLabel', style: const TextStyle(color: muted)),
         ],
       ),
     );
@@ -660,21 +690,24 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
   );
 
   Widget connectedPanel() {
-    final clients = server.agentMcp.connectedClients();
-    final states = server.agentMcp.states();
+    final clients = {
+      for (final client in server.agentMcp.connectedClients())
+        client.name.toLowerCase(),
+    };
+    final states = server.agentStates;
     return panel(
       Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           heading(Icons.hub_outlined, 'AI 工具连接', violet),
           const SizedBox(height: 14),
-          if (clients.isEmpty)
+          if (states.isEmpty)
             Text(
               server.agentMcp.running ? '等待 AI 工具连接本机 MCP。' : '桌面 MCP 当前不可用。',
               style: const TextStyle(color: muted),
             )
           else
-            for (final client in clients)
+            for (final MapEntry(:key, :value) in states.entries)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
                 child: DecoratedBox(
@@ -685,12 +718,20 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                   child: ListTile(
                     dense: true,
                     title: Text(
-                      client.name,
+                      key,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
+                    subtitle: Text(
+                      clients.contains(key.toLowerCase())
+                          ? 'MCP 已连接'
+                          : key == 'Codex'
+                          ? '本机状态'
+                          : '状态上报',
+                    ),
                     trailing: StatusPill(
-                      RemoteServer.labels[states[client.name]] ?? '待机',
+                      RemoteServer.labels[value] ?? '待机',
+                      active: value == 'THINKING' || value == 'QUESTION',
                     ),
                   ),
                 ),

@@ -2,8 +2,12 @@ package com.reareyes.app
 
 import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,6 +23,7 @@ import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.Executors
 
@@ -29,7 +34,7 @@ internal class RobotInteractionBridge(
     private val methods = MethodChannel(messenger, "com.reareyes/interaction")
     private val events = EventChannel(messenger, "com.reareyes/interactionEvents")
     private val main = Handler(Looper.getMainLooper())
-    private val settings = activity.getSharedPreferences("interaction", 0)
+    private val settings = activity.getSharedPreferences(SETTINGS_PREFS, 0)
     private var sink: EventChannel.EventSink? = null
     private val receiveNotification: (Map<String, Any>) -> Unit = { sink?.success(it) }
     private var permissionResult: MethodChannel.Result? = null
@@ -63,11 +68,28 @@ internal class RobotInteractionBridge(
                 result.error("notification_settings", "无法打开通知使用权设置。", null)
             }
             "pendingEvents" -> result.success(RobotNotificationListener.drain(activity))
-            "notificationApps" -> readCatalog(result, ::installedApps)
+            "notificationApps" -> readCatalog(result, ::launchableApps)
+            "notificationAppIcon" -> {
+                val packageName = call.arguments as? String
+                catalog.execute {
+                    val icon = packageName?.let(::loadAppIcon)
+                    main.post { if (!closed) result.success(icon) }
+                }
+            }
             "notificationContacts" -> requestContacts(result)
             "notificationDetails" -> {
                 val id = call.arguments as? String ?: call.argument<String>("id")
                 result.success(id?.let { RobotNotificationListener.details(activity, it) })
+            }
+            "loadRecentNotices" -> result.success(settings.getString("recentNotices", null))
+            "saveRecentNotices" -> {
+                val json = call.arguments as? String
+                if (json == null || json.toByteArray(Charsets.UTF_8).size > 160_000) {
+                    result.error("notice_history", "提醒记录超过大小限制。", null)
+                } else {
+                    settings.edit().putString("recentNotices", json).apply()
+                    result.success(null)
+                }
             }
             "loadSettings" -> result.success(settings.getString(SETTINGS_KEY, null))
             "saveSettings" -> {
@@ -179,12 +201,34 @@ internal class RobotInteractionBridge(
         }
     }
 
+    private fun loadAppIcon(packageName: String): ByteArray? {
+        return try {
+            val drawable = appLogo(activity, packageName) ?: return null
+            val bitmap = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888)
+            try {
+                drawable.setBounds(0, 0, bitmap.width, bitmap.height)
+                drawable.draw(Canvas(bitmap))
+                ByteArrayOutputStream().use { output ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                    output.toByteArray()
+                }
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (_: RuntimeException) {
+            null
+        }
+    }
+
     @Suppress("DEPRECATION")
-    private fun installedApps(): List<Map<String, Any>> {
+    private fun launchableApps(): List<Map<String, Any>> {
         val manager = activity.packageManager
-        return manager.getInstalledApplications(0)
-            .filter { it.packageName != activity.packageName }
-            .map { mapOf("id" to it.packageName, "name" to manager.getApplicationLabel(it).toString()) }
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return manager.queryIntentActivities(launcher, 0)
+            .map { it.activityInfo }
+            .filter { it.exported && it.packageName != activity.packageName }
+            .distinctBy { it.packageName }
+            .map { mapOf("id" to it.packageName, "name" to manager.getApplicationLabel(it.applicationInfo).toString()) }
     }
 
     private fun contacts(): List<Map<String, Any>> {
@@ -360,8 +404,17 @@ internal class RobotInteractionBridge(
     }
 
     companion object {
+        @Suppress("DEPRECATION")
+        internal fun appLogo(context: Context, packageName: String): Drawable? =
+            runCatching {
+                val manager = context.packageManager
+                val info = manager.getApplicationInfo(packageName, 0)
+                if (info.icon == 0) null else manager.getApplicationIcon(info)
+            }.getOrNull()
+
         private const val MICROPHONE_PERMISSION = 3
         private const val CONTACTS_PERMISSION = 4
-        private const val SETTINGS_KEY = "preferences"
+        const val SETTINGS_PREFS = "interaction"
+        const val SETTINGS_KEY = "preferences"
     }
 }

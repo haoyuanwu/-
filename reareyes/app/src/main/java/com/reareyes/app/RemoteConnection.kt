@@ -79,7 +79,8 @@ internal object RemoteConnection {
                 if (load(context) == pairing && !Thread.currentThread().isInterrupted) {
                     EyesBus.setDesktopSnapshot(EyesBus.Transport.TAILSCALE, state,
                         EyesBus.Usage(usage("five"), usage("week")), ticket,
-                        EyesBus.readAgentStates(snapshot.optJSONObject("agents")))
+                        EyesBus.readAgentStates(snapshot.optJSONObject("agents")),
+                        EyesBus.readModelConnections(snapshot.optJSONArray("models")))
                     feedback = Feedback(updatedAt = System.currentTimeMillis(), state = state)
                 }
             }
@@ -130,7 +131,7 @@ internal object RemoteConnection {
                 while (true) {
                     val count = reader.read(buffer)
                     if (count < 0) break
-                    if (result.length + count > 8192) throw IOException("Response too large")
+                    if (result.length + count > 16_384) throw IOException("Response too large")
                     result.append(buffer, 0, count)
                 }
                 JSONObject(result.toString())

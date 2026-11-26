@@ -91,6 +91,7 @@ class Snapshot {
     this.ticket,
     this.rearSupported = false,
     this.agents = const {},
+    this.models = const [],
     this.logs = const [],
     this.nativePairing,
     this.remoteState,
@@ -125,6 +126,7 @@ class Snapshot {
     return Snapshot(
       state: state,
       agents: agents,
+      models: DesktopModel.readList(json['models']),
       logs: (json['logs'] as List? ?? []).whereType<String>().toList(),
       nativePairing: json['pairing'] as String?,
       remoteState: remote ? state : EyeMood.statusFromWire(json['remoteState']),
@@ -153,6 +155,7 @@ class Snapshot {
   final String? ticket;
   final bool rearSupported;
   final Map<String, EyeMood> agents;
+  final List<DesktopModel> models;
   final List<String> logs;
   final String? nativePairing;
   final EyeMood? remoteState;
@@ -214,16 +217,7 @@ class RemoteClient {
     final json = await _request(pairing, '/ai/models');
     final models = json['models'];
     if (models is! List) throw const FormatException('电脑返回的模型列表无效');
-    return [
-      for (final model in models)
-        if (model is Map && model['id'] is String && model['name'] is String)
-          DesktopModel(
-            id: model['id'] as String,
-            name: model['name'] as String,
-            local: model['kind'] == 'local',
-            available: model['available'] != false,
-          ),
-    ];
+    return DesktopModel.readList(models);
   }
 
   Stream<ChatChunk> chat(
@@ -339,7 +333,27 @@ class DesktopModel {
   final String id;
   final String name;
   final bool local;
-  final bool available;
+  final bool? available;
+
+  static List<DesktopModel> readList(Object? models) {
+    if (models is! List) return const [];
+    return [
+      for (final model in models.take(20))
+        if (model is Map &&
+            model['id'] is String &&
+            model['name'] is String &&
+            (model['name'] as String).trim().isNotEmpty)
+          DesktopModel(
+            id: model['id'] as String,
+            name: model['name'] as String,
+            local: model['kind'] == 'local',
+            available: switch (model['available']) {
+              final bool available => available,
+              _ => null,
+            },
+          ),
+    ];
+  }
 }
 
 class RemoteFailure implements Exception {

@@ -27,16 +27,19 @@ class RemoteServer {
 
   final Directory directory;
   late final webApp = WebApp(Directory('${directory.path}/web'));
-  late final phoneLinks = PhoneLinks(directory, _usbPairing);
+  late final phoneLinks = PhoneLinks(directory, _usbPairing, () {
+    if (running) onChanged(false);
+  });
   late final modelConnections = ModelConnections(directory);
   final void Function(bool newMessage) onChanged;
-  late final agentMcp = AgentMcp(_refreshAgents);
+  late final agentMcp = AgentMcp(_publishStatus);
   final _codex = CodexStatus();
   HttpServer? _server;
   Timer? _refresh;
   String token = '';
   String? agentMcpError;
   Map<String, Object?> status = const {'state': 'IDLE'};
+  Map<String, String> agentStates = const {};
   List<Map<String, dynamic>> messages = [];
 
   bool get running => _server != null;
@@ -113,11 +116,11 @@ class RemoteServer {
       _server = server;
       server.listen(_handle);
       unawaited(phoneLinks.push(status));
-      _refresh = Timer.periodic(const Duration(seconds: 3), (_) {
-        _update();
-        unawaited(phoneLinks.push(status));
-        onChanged(false);
-      });
+      _refresh = Timer.periodic(
+        const Duration(seconds: 3),
+        (_) => _publishStatus(),
+      );
+      modelConnections.startMonitoring(_publishStatus);
     } catch (_) {
       await agentMcp.stop();
       await server.close(force: true);
@@ -129,6 +132,8 @@ class RemoteServer {
     _refresh?.cancel();
     final server = _server;
     _server = null;
+    agentStates = const {};
+    phoneLinks.stop();
     modelConnections.stop();
     await agentMcp.stop();
     await server?.close(force: true);
@@ -140,10 +145,14 @@ class RemoteServer {
     return jsonEncode({'url': address, 'token': token});
   }
 
-  void _refreshAgents() {
+  void refreshPhoneLinks() {
+    if (running) unawaited(phoneLinks.push(status));
+  }
+
+  void _publishStatus() {
     if (!running) return;
     _update();
-    unawaited(phoneLinks.push(status));
+    refreshPhoneLinks();
     onChanged(false);
   }
 
@@ -194,9 +203,11 @@ class RemoteServer {
             .compareTo(AgentMcp.priority.indexOf(agents[b]!));
         return byState != 0 ? byState : a.compareTo(b);
       });
+    agentStates = {for (final name in ordered) name: agents[name]!};
     status = {
       ...snapshot,
       'agents': {for (final name in ordered.take(24)) name: agents[name]!},
+      'models': modelConnections.publishedModels(),
       'at': DateTime.now().toUtc().toIso8601String(),
     };
   }

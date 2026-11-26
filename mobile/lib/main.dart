@@ -14,6 +14,7 @@ import 'eye_scene.dart';
 import 'interaction.dart';
 import 'interaction_view.dart';
 import 'model_settings_view.dart';
+import 'permission_settings_view.dart';
 import 'remote.dart';
 import 'status_strip.dart';
 import 'platform_io.dart'
@@ -23,8 +24,11 @@ import 'platform_io.dart'
 const native = MethodChannel('com.reareyes/mobile');
 final android = platform.isAndroid;
 
-void main() {
+const _homeOrientation = [DeviceOrientation.portraitUp];
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (!kIsWeb) await SystemChrome.setPreferredOrientations(_homeOrientation);
   runApp(const RearEyesMobile());
 }
 
@@ -88,10 +92,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (android) native.setMethodCallHandler(_handleNativeEvent);
     interaction.addListener(_updateScene);
     unawaited(interaction.initialize());
     timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
     unawaited(load());
+  }
+
+  Future<void> _handleNativeEvent(MethodCall call) async {
+    if (call.method == 'rearDisplayReady') await refresh(force: true);
   }
 
   Future<void> load() async {
@@ -125,6 +134,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (android) native.setMethodCallHandler(null);
     timer.cancel();
     previewTimer?.cancel();
     interaction.removeListener(_updateScene);
@@ -136,7 +146,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _updateScene() {
     final mood = interaction.mood ?? preview ?? snapshot.state;
-    if (scene.value.$1 != mood) scene.value = (mood, ++revision);
+    if (scene.value.$1 != mood) {
+      scene.value = (mood, ++revision);
+    }
     interaction.updateActivity(
       interaction.generating ? EyeMood.thinking : snapshot.state,
     );
@@ -182,7 +194,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               snapshot.links.isNotEmpty ||
               snapshot.five != null ||
               snapshot.week != null ||
-              snapshot.agents.isNotEmpty)) {
+              snapshot.agents.isNotEmpty ||
+              snapshot.models.isNotEmpty)) {
         setState(() {
           snapshot = Snapshot(
             updatedAt: last,
@@ -244,6 +257,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             five: snapshot.five,
             week: snapshot.week,
             agents: snapshot.agents,
+            models: snapshot.models,
             updatedAt: snapshot.updatedAt,
             remoteState: snapshot.remoteState,
             error: failure,
@@ -355,16 +369,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             onPressed: () => Navigator.pop(dialog),
             child: const Text('关闭'),
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialog, 'message'),
-            child: const Text('发消息'),
-          ),
         ],
       ),
     );
     if (!mounted) return;
     if (action == 'pair') await pair();
-    if (action == 'message') await message();
   }
 
   Future<void> remoteHelp(BuildContext context) => showDialog<void>(
@@ -481,87 +490,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> message() async {
-    final saved = pairing;
-    if (saved == null) {
-      await pair();
-      return;
-    }
-    String text = '';
-    String id = '';
-    String? previous;
-    String? error;
-    var sending = false;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (dialogContext, update) => AlertDialog(
-          title: const Text('发消息到电脑'),
-          content: TextField(
-            autofocus: true,
-            enabled: !sending,
-            minLines: 3,
-            maxLines: 5,
-            maxLength: 2000,
-            decoration: InputDecoration(labelText: '消息', errorText: error),
-            onChanged: (value) => text = value,
-          ),
-          actions: [
-            TextButton(
-              onPressed: sending ? null : () => Navigator.pop(dialogContext),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: sending
-                  ? null
-                  : () async {
-                      final value = text.trim();
-                      if (value.isEmpty) {
-                        update(() => error = '请输入消息');
-                        return;
-                      }
-                      if (value.length > 2000) {
-                        update(() => error = '消息超过 2000 字符，请缩短后重试。');
-                        return;
-                      }
-                      if (value != previous) {
-                        id = RemoteClient.messageId();
-                        previous = value;
-                      }
-                      update(() {
-                        sending = true;
-                        error = null;
-                      });
-                      try {
-                        await client.send(saved, id, value);
-                        if (dialogContext.mounted) Navigator.pop(dialogContext);
-                        if (mounted) {
-                          if (!android) setState(() => addLog('消息已送达电脑'));
-                          notice('已送达电脑');
-                        }
-                      } catch (failure) {
-                        if (dialogContext.mounted) {
-                          update(() {
-                            sending = false;
-                            error = RemoteClient.describe(failure);
-                          });
-                        }
-                      }
-                    },
-              child: Text(
-                sending
-                    ? '发送中…'
-                    : error != null
-                    ? '重试'
-                    : '发送',
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   void notice(String message) =>
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(message)));
@@ -592,9 +520,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+  bool _deskOpen = false;
+
   Future<void> fullscreen() async {
-    await platform.keepScreenOn(true);
+    if (_deskOpen) return;
+    _deskOpen = true;
     try {
+      await platform.keepScreenOn(true);
       if (!kIsWeb) {
         await SystemChrome.setPreferredOrientations([
           DeviceOrientation.landscapeLeft,
@@ -616,12 +548,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
       }
     } finally {
-      if (interaction.listening) await interaction.cancelRecording();
-      if (!kIsWeb) {
-        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-        await SystemChrome.setPreferredOrientations([]);
+      try {
+        if (!kIsWeb) {
+          await SystemChrome.setPreferredOrientations(_homeOrientation);
+          await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        }
+        if (interaction.listening) await interaction.cancelRecording();
+      } finally {
+        _deskOpen = false;
+        await platform.keepScreenOn(false);
       }
-      await platform.keepScreenOn(false);
     }
   }
 
@@ -708,6 +644,65 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (mounted && saved != null) setState(() => sleepSeconds = saved);
   }
 
+  Future<void> rearDisplaySettings() async {
+    try {
+      final saved = await native.invokeMapMethod<String, Object?>(
+        'rearSettings',
+      );
+      if (!mounted || saved == null) return;
+      var keepOn = saved['keepOn'] as bool;
+      var brightness = (saved['brightness'] as int).toDouble();
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialog) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('背屏显示设置'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('背屏常亮'),
+                  value: keepOn,
+                  onChanged: (value) => update(() => keepOn = value),
+                ),
+                const SizedBox(height: 12),
+                Text('背屏亮度 ${brightness.round()}%'),
+                Slider(
+                  min: 10,
+                  max: 100,
+                  divisions: 90,
+                  value: brightness,
+                  semanticFormatterCallback: (value) =>
+                      '背屏亮度 ${value.round()}%',
+                  onChanged: (value) => update(() => brightness = value),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialog),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(dialog, true),
+                child: const Text('保存'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (confirmed != true) return;
+      await native.invokeMapMethod<String, Object?>('rearSettings', {
+        'keepOn': keepOn,
+        'brightness': brightness.round(),
+      });
+    } on PlatformException {
+      if (mounted) notice('无法读取或保存背屏显示设置。');
+    }
+  }
+
   String sleepLabel(int seconds) =>
       seconds % 60 == 0 ? '${seconds ~/ 60} 分钟' : '$seconds 秒';
 
@@ -743,32 +738,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       borderRadius: BorderRadius.circular(18),
       child: ValueListenableBuilder(
         valueListenable: scene,
-        child: android
-            ? AndroidView(
-                viewType: 'com.reareyes/eyes-preview',
-                layoutDirection: TextDirection.ltr,
-                gestureRecognizers: {
-                  Factory<EagerGestureRecognizer>(EagerGestureRecognizer.new),
-                },
-              )
-            : null,
-        builder: (_, value, nativePreview) => Stack(
-          fit: StackFit.expand,
-          children: [
-            if (nativePreview != null)
-              Offstage(
-                offstage: interaction.mood != null,
-                child: nativePreview,
-              ),
-            if (nativePreview == null || interaction.mood != null)
-              EyeScene(
-                mood: value.$1,
-                revision: value.$2,
-                sleepSeconds: sleepSeconds,
-                agents: snapshot.agents,
-                connected: snapshot.links.isNotEmpty,
-              ),
-          ],
+        builder: (_, value, _) => EyeScene(
+          mood: value.$1,
+          revision: value.$2,
+          sleepSeconds: sleepSeconds,
+          agents: snapshot.agents,
+          connected: snapshot.links.isNotEmpty,
+          allowVerticalScroll: true,
         ),
       ),
     ),
@@ -789,6 +765,50 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               Expanded(
                 child: Text(
                   '${entry.key} · ${entry.value.label}',
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+            ],
+          ),
+        ),
+    ],
+  );
+
+  Widget modelStatuses() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const SectionTitle('桌面模型连接'),
+      const SizedBox(height: 8),
+      for (final (index, model) in snapshot.models.indexed)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            children: [
+              StatusGlyph(
+                snapshot.links.isEmpty
+                    ? EyeMood.stopped
+                    : switch (model.available) {
+                        true => EyeMood.done,
+                        false => EyeMood.error,
+                        null => EyeMood.idle,
+                      },
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  [
+                    model.name,
+                    model.local ? '本地' : '云端',
+                    if (index == 0) '默认',
+                    if (snapshot.links.isEmpty)
+                      '桌面连接中断'
+                    else
+                      switch (model.available) {
+                        true => '已连接',
+                        false => '连接失败',
+                        null => '未验证',
+                      },
+                  ].join(' · '),
                   style: const TextStyle(fontSize: 13),
                 ),
               ),
@@ -847,6 +867,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ],
                     ),
                   ),
+                  if (android ||
+                      (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS))
+                    IconButton(
+                      tooltip: '权限设置',
+                      icon: const Icon(Icons.settings_outlined),
+                      onPressed: () => Navigator.of(context).push<void>(
+                        MaterialPageRoute(
+                          builder: (_) => const PermissionSettingsPage(),
+                        ),
+                      ),
+                    ),
                 ],
               ),
               const SizedBox(height: 17),
@@ -869,7 +900,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           interaction,
                           record: interaction.speechEnabled,
                         ),
-                        label: interaction.speechEnabled ? '说话' : 'AI 对话',
+                        label: '对话',
                       ),
                     ),
                     TextButton(
@@ -920,6 +951,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     ),
                   ],
                 ),
+                const SizedBox(height: 8),
+                control('背屏常亮与亮度', rearDisplaySettings),
                 const SizedBox(height: 6),
                 const Text(
                   '手机切屏需要 Shizuku。',
@@ -973,8 +1006,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 const SizedBox(height: 8),
               ],
               control('远程连接', remoteConnection),
-              const SizedBox(height: 8),
-              control('发消息', message),
+              if (snapshot.models.isNotEmpty) ...[
+                const SizedBox(height: 18),
+                modelStatuses(),
+              ],
               if (snapshot.agents.isNotEmpty) ...[
                 const SizedBox(height: 18),
                 agentStatuses(),
@@ -1147,16 +1182,36 @@ class _DeskPageState extends State<DeskPage> {
               Positioned.fill(
                 child: ValueListenableBuilder(
                   valueListenable: widget.telemetry,
-                  builder: (_, data, _) => ValueListenableBuilder(
-                    valueListenable: widget.scene,
-                    builder: (_, value, _) => EyeScene(
-                      mood: value.$1,
-                      revision: value.$2,
-                      fullScreen: true,
-                      sleepSeconds: widget.sleepSeconds,
-                      agents: data.agents,
-                      connected: data.links.isNotEmpty,
-                    ),
+                  builder: (_, data, _) => ListenableBuilder(
+                    listenable: Listenable.merge([
+                      widget.scene,
+                      widget.interaction,
+                    ]),
+                    builder: (_, _) {
+                      final (mood, revision) = widget.scene.value;
+                      final interaction = widget.interaction;
+                      final listening = interaction?.listening == true;
+                      final recognizing =
+                          interaction?.finishingRecording == true;
+                      return EyeScene(
+                        mood: recognizing
+                            ? EyeMood.thinking
+                            : _inlineVoice &&
+                                  interaction?.error != null &&
+                                  !listening
+                            ? EyeMood.error
+                            : mood,
+                        revision: revision,
+                        fullScreen: true,
+                        noticeCue: interaction?.noticeReaction,
+                        voiceLevel: listening && !recognizing
+                            ? interaction?.inputLevel
+                            : null,
+                        sleepSeconds: widget.sleepSeconds,
+                        agents: data.agents,
+                        connected: data.links.isNotEmpty,
+                      );
+                    },
                   ),
                 ),
               ),
@@ -1199,68 +1254,74 @@ class _DeskPageState extends State<DeskPage> {
                               : 0),
                       right: insets.right + 16,
                       width: math.min(330, constraints.maxWidth * .50),
-                      child: ConstrainedBox(
-                        constraints: BoxConstraints(
-                          maxHeight: constraints.maxHeight * .48,
-                        ),
-                        child: SingleChildScrollView(
-                          child: InteractionBubbles(
-                            interaction,
-                            showReply: !_inlineVoice,
+                      bottom: insets.bottom + 76,
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: Align(
+                              alignment: Alignment.topCenter,
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  maxHeight: constraints.maxHeight * .48,
+                                ),
+                                child: SingleChildScrollView(
+                                  hitTestBehavior: HitTestBehavior.deferToChild,
+                                  child: InteractionBubbles(
+                                    interaction,
+                                    showReply: !_inlineVoice,
+                                    includeNotice: false,
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
-                        ),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 300),
+                              child: NoticeSignal(interaction),
+                            ),
+                          ),
+                        ],
                       ),
                     );
                   },
                 ),
-                if (_inlineVoice)
-                  Positioned(
-                    bottom:
-                        insets.bottom + (constraints.maxWidth < 600 ? 64 : 16),
-                    left: insets.left,
-                    right: insets.right,
-                    child: IgnorePointer(
-                      child: Center(
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(
-                            maxWidth: math.min(344, constraints.maxWidth * .54),
-                          ),
-                          child: ListenableBuilder(
-                            listenable: interaction,
-                            builder: (_, _) => DeskVoiceFeedback(interaction),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
                 Positioned(
                   bottom: insets.bottom + 16,
-                  right: insets.right + 16,
-                  child: ListenableBuilder(
-                    listenable: interaction,
-                    builder: (context, _) => DeskVoiceButton(
-                      listening: interaction.listening,
-                      speechEnabled: interaction.speechEnabled,
-                      onPressed: interaction.finishingRecording
-                          ? null
-                          : () {
-                              if (!interaction.speechEnabled) {
-                                unawaited(
-                                  openConversation(context, interaction),
-                                );
-                              } else if (interaction.listening) {
-                                unawaited(
-                                  interaction.stopRecording(sendAfter: true),
-                                );
-                              } else {
-                                if (!_inlineVoice) {
-                                  setState(() => _inlineVoice = true);
-                                }
-                                unawaited(
-                                  interaction.startRecording(sendAfter: true),
-                                );
+                  left: insets.left,
+                  right: insets.right,
+                  child: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: math.min(344, constraints.maxWidth * .54),
+                      ),
+                      child: ListenableBuilder(
+                        listenable: interaction,
+                        builder: (context, _) => DeskVoiceControl(
+                          interaction,
+                          showCaption: _inlineVoice,
+                          onPressed: () {
+                            if (!interaction.speechEnabled) {
+                              unawaited(openConversation(context, interaction));
+                            } else if (interaction.finishingRecording) {
+                              unawaited(interaction.cancelRecording());
+                            } else if (interaction.listening) {
+                              unawaited(
+                                interaction.stopRecording(sendAfter: true),
+                              );
+                            } else {
+                              if (!_inlineVoice) {
+                                setState(() => _inlineVoice = true);
                               }
-                            },
+                              unawaited(
+                                interaction.startRecording(sendAfter: true),
+                              );
+                            }
+                          },
+                        ),
+                      ),
                     ),
                   ),
                 ),

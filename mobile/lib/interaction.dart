@@ -25,6 +25,8 @@ typedef PhoneNotice = ({
   String text,
   bool verification,
   String? id,
+  String? eventKey,
+  String? packageName,
 });
 
 class NoticeChoice {
@@ -81,13 +83,16 @@ class RobotInteraction extends ChangeNotifier {
   bool _replyCompleted = false;
   String? turnId;
   ({Pairing pairing, String id})? _activeRequest;
+  ({PhoneNotice notice, bool initial})? _unshownNotice;
   Timer? _noticeTimer;
+  Timer? _noticeReactionTimer;
   Timer? _speakingTimer;
   Timer? _recordingDeadline;
   bool _disposed = false;
   bool _initialized = false;
   bool _foreground = true;
   bool _speechPending = false;
+  bool _speakingNotice = false;
   String? _speechId;
   int _nextSpeechId = 0;
   bool _stopSpeechPending = false;
@@ -128,6 +133,8 @@ class RobotInteraction extends ChangeNotifier {
   String? sharedText;
   PhoneNotice? notice;
 
+  String? get spokenReply => _speakingNotice ? null : spokenText;
+
   bool get nativeEnabled => _initialized;
   bool get speechEnabled => _speechEnabled;
   bool get supportsNotifications => _canRead;
@@ -144,14 +151,25 @@ class RobotInteraction extends ChangeNotifier {
       List.unmodifiable(_contacts.values);
   List<String> get keywords => List.unmodifiable(_keywords);
 
+  PhoneNotice? get noticeReaction =>
+      phase == InteractionPhase.idle &&
+          spokenReply == null &&
+          _noticeReactionTimer?.isActive == true
+      ? notice
+      : null;
+
+  Future<Uint8List?> noticeAppIcon(PhoneNotice notice) {
+    final packageName = notice.packageName;
+    return packageName == null
+        ? Future.value(null)
+        : _invoke<Uint8List>('notificationAppIcon', packageName);
+  }
+
   EyeMood? get mood => switch (phase) {
     InteractionPhase.listening => EyeMood.focus,
     InteractionPhase.thinking => EyeMood.thinking,
     InteractionPhase.answering => EyeMood.hello,
-    InteractionPhase.idle =>
-      spokenText != null
-          ? EyeMood.hello
-          : _expression ?? (notice == null ? null : EyeMood.idea),
+    InteractionPhase.idle => spokenReply != null ? EyeMood.hello : _expression,
   };
 
   DesktopModel? get model => models.firstOrNull;
@@ -178,6 +196,10 @@ class RobotInteraction extends ChangeNotifier {
       _liveActivity = capabilities?['liveActivity'] == true;
       _initialized = true;
       await _loadSettings();
+      if (_canRead) {
+        notificationAccess = await _invoke<bool>('notificationAccess') ?? false;
+        await _loadRecentNotices();
+      }
       if (_disposed) return;
       _events = events.receiveBroadcastStream().listen(
         _handleEvent,
@@ -245,6 +267,62 @@ class RobotInteraction extends ChangeNotifier {
     }
   }
 
+  Future<void> _loadRecentNotices() async {
+    final raw = await _invoke<String>('loadRecentNotices');
+    if (raw == null || _disposed) return;
+    try {
+      final data = jsonDecode(raw);
+      if (data is! List) return;
+      for (final item in data.take(20)) {
+        if (item is! Map ||
+            item['source'] is! String ||
+            item['title'] is! String ||
+            item['text'] is! String) {
+          continue;
+        }
+        final verification = item['verification'] == true;
+        final eventKey = item['eventKey'] is String
+            ? item['eventKey'] as String
+            : null;
+        if (eventKey != null && !_seenEvents.add(eventKey)) continue;
+        _recentNotices.add((
+          source: item['source'] as String,
+          title: verification ? '收到验证消息' : item['title'] as String,
+          text: verification ? '' : item['text'] as String,
+          verification: verification,
+          id: item['id'] is String ? item['id'] as String : null,
+          eventKey: eventKey,
+          packageName: item['packageName'] is String
+              ? item['packageName'] as String
+              : null,
+        ));
+      }
+    } on FormatException {
+      // Ignore a damaged local history.
+    }
+  }
+
+  void _saveRecentNotices() {
+    if (!_canRead) return;
+    unawaited(
+      _invoke<void>(
+        'saveRecentNotices',
+        jsonEncode([
+          for (final item in _recentNotices)
+            {
+              'source': item.source,
+              'title': item.title,
+              'text': item.text,
+              'verification': item.verification,
+              'id': item.id,
+              'eventKey': item.eventKey,
+              'packageName': item.packageName,
+            },
+        ]),
+      ),
+    );
+  }
+
   void _saveSettings() {
     unawaited(
       _invoke<void>(
@@ -280,15 +358,25 @@ class RobotInteraction extends ChangeNotifier {
     _foreground = true;
     if (!_initialized) return;
     if (_canRead) {
-      notificationAccess = await _invoke<bool>('notificationAccess') ?? false;
+      notificationAccess =
+          await _invoke<bool>('notificationAccess') ?? notificationAccess;
       if (!notificationAccess) {
-        _recentNotices.clear();
+        if (_recentNotices.isNotEmpty) {
+          _recentNotices.clear();
+          _seenEvents.clear();
+          _saveRecentNotices();
+        }
         _pendingNotice = null;
+        _unshownNotice = null;
         clearNotice();
       }
     }
     final pending = await _invoke<List<dynamic>>('pendingEvents');
     if (!_disposed) {
+      if (_unshownNotice case final deferred? when _foreground) {
+        _unshownNotice = null;
+        _showNotice(deferred.notice, initial: deferred.initial);
+      }
       for (final event in pending ?? const []) {
         _handleEvent(event);
       }
@@ -378,11 +466,7 @@ class RobotInteraction extends ChangeNotifier {
     final raw = await bridge.invokeListMethod<Object?>(
       contacts ? 'notificationContacts' : 'notificationApps',
     );
-    final choices = <String, NoticeChoice>{
-      if (!contacts)
-        for (final entry in _sources.entries)
-          entry.key: NoticeChoice(entry.key, entry.value),
-    };
+    final choices = <String, NoticeChoice>{};
     for (final item in raw ?? const []) {
       if (NoticeChoice.parse(item) case final entry?) choices[entry.id] = entry;
     }
@@ -668,6 +752,7 @@ class RobotInteraction extends ChangeNotifier {
     final wasSpeaking = _speechPending || spokenText != null;
     _speechPending = false;
     _speechId = null;
+    _speakingNotice = false;
     spokenText = null;
     _speakingTimer?.cancel();
     if (wasSpeaking && !_stopSpeechPending) {
@@ -718,6 +803,7 @@ class RobotInteraction extends ChangeNotifier {
     }
     final utterance = _utterances.removeFirst();
     _speechPending = true;
+    _speakingNotice = utterance.notice;
     _speechId = (++_nextSpeechId).toString();
     spokenText = utterance.text;
     _speakingTimer = Timer(const Duration(seconds: 40), _speechDone);
@@ -740,6 +826,7 @@ class RobotInteraction extends ChangeNotifier {
     _speakingTimer?.cancel();
     _speechPending = false;
     _speechId = null;
+    _speakingNotice = false;
     spokenText = null;
     _queueNotice();
     _playNext();
@@ -761,6 +848,7 @@ class RobotInteraction extends ChangeNotifier {
   void clearNotice() {
     notice = null;
     _noticeTimer?.cancel();
+    _noticeReactionTimer?.cancel();
     notifyListeners();
   }
 
@@ -829,23 +917,29 @@ class RobotInteraction extends ChangeNotifier {
       if (_sources.length < 64 || _sources.containsKey(key)) {
         _sources[key] = source;
       }
-      if (!_allowedSources.contains(key)) return;
-      final content = [
-        sender,
-        title,
-        text,
-      ].whereType<String>().join(' ').toLowerCase();
-      if (!verification &&
-          (_keywords.isNotEmpty || _contacts.isNotEmpty) &&
-          !_keywords.any((term) => content.contains(term.toLowerCase())) &&
-          !(sender is String &&
-              _contacts.values.any((entry) => entry.matchesSender(sender)))) {
-        return;
+      final hasRules =
+          _allowedSources.isNotEmpty ||
+          _keywords.isNotEmpty ||
+          _contacts.isNotEmpty;
+      if (hasRules && !_allowedSources.contains(key)) {
+        final content = [
+          sender,
+          title,
+          text,
+        ].whereType<String>().join(' ').toLowerCase();
+        final matchesKeyword = _keywords.any(
+          (term) => content.contains(term.toLowerCase()),
+        );
+        final matchesContact =
+            sender is String &&
+            _contacts.values.any((entry) => entry.matchesSender(sender));
+        if (!matchesKeyword && !matchesContact) return;
       }
     }
-    if (event['id'] case final String id) {
-      final received = '$id:${event['timestamp'] ?? ''}';
-      if (!_seenEvents.add(received)) return;
+    final id = event['id'];
+    final eventKey = id is String ? '$id:${event['timestamp'] ?? ''}' : null;
+    if (eventKey != null) {
+      if (!_seenEvents.add(eventKey)) return;
       if (_seenEvents.length > 96) _seenEvents.remove(_seenEvents.first);
     }
     final received = (
@@ -861,19 +955,35 @@ class RobotInteraction extends ChangeNotifier {
           ? text
           : '',
       verification: verification,
-      id: event['id'] is String ? event['id'] as String : null,
+      id: id is String ? id : null,
+      eventKey: eventKey,
+      packageName: package is String ? package : null,
     );
     if (_recentNotices.firstOrNull == received) return;
     _recentNotices.insert(0, received);
     if (_recentNotices.length > 20) _recentNotices.removeLast();
+    _saveRecentNotices();
+    final initial = event['initial'] == true;
+    if (!_foreground) {
+      _unshownNotice = (notice: received, initial: initial);
+      return;
+    }
+    _showNotice(received, initial: initial);
+  }
+
+  void _showNotice(PhoneNotice received, {required bool initial}) {
     notice = received;
     _expression = null;
     _noticeTimer?.cancel();
     _noticeTimer = Timer(const Duration(seconds: 9), clearNotice);
-    if (_foreground &&
-        readNotices &&
-        !verification &&
-        event['initial'] != true) {
+    _noticeReactionTimer?.cancel();
+    if (!initial && phase == InteractionPhase.idle) {
+      _noticeReactionTimer = Timer(
+        const Duration(milliseconds: 1050),
+        notifyListeners,
+      );
+    }
+    if (readNotices && !received.verification && !initial) {
       _pendingNotice = '${received.source}，${received.title}';
       _queueNotice();
     }
@@ -905,6 +1015,7 @@ class RobotInteraction extends ChangeNotifier {
     if (listening) unawaited(_invoke<void>('cancelListening'));
     _disposed = true;
     _noticeTimer?.cancel();
+    _noticeReactionTimer?.cancel();
     _speakingTimer?.cancel();
     unawaited(_events?.cancel());
     unawaited(_answer?.cancel());

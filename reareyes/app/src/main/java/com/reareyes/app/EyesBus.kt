@@ -1,10 +1,12 @@
 package com.reareyes.app
 
+import android.graphics.drawable.Drawable
 import android.os.SystemClock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import org.json.JSONArray
 import org.json.JSONObject
 
 object EyesBus {
@@ -28,6 +30,7 @@ object EyesBus {
 
     private data class DesktopSnapshot(
         val state: EyeState, val usage: Usage, val expiresAt: Long, val agents: Map<String, EyeState>,
+        val models: List<Map<String, Any>>,
     )
     private val desktop = mutableMapOf<Transport, DesktopSnapshot>()
 
@@ -47,9 +50,12 @@ object EyesBus {
     fun setDesktopSnapshot(
         source: Transport, value: EyeState?, usage: Usage, ticket: String = syncTicket,
         agents: Map<String, EyeState> = emptyMap(),
+        models: List<Map<String, Any>> = emptyList(),
     ) {
         val now = SystemClock.elapsedRealtime()
-        desktop[source] = DesktopSnapshot(value ?: desktop[source]?.state ?: localState, usage, now + 12_000L, agents)
+        desktop[source] = DesktopSnapshot(
+            value ?: desktop[source]?.state ?: localState, usage, now + 12_000L, agents, models,
+        )
         refreshState(now, source.label)
         if (ticket == syncTicket && ticket != syncedTicket && activeDesktop(now)?.first == source) {
             syncedTicket = ticket
@@ -81,25 +87,58 @@ object EyesBus {
     var syncedTicket: String? = null
         private set
 
+    private var syncRequestedAt: Long? = null
+
+    @Synchronized
     fun requestSync(): String {
         val ticket = UUID.randomUUID().toString()
         syncTicket = ticket
+        syncRequestedAt = SystemClock.elapsedRealtime()
         return ticket
+    }
+
+    @Synchronized
+    fun refreshDesktopStatus() {
+        val requestedAt = syncRequestedAt
+        if (requestedAt != null && syncTicket != syncedTicket &&
+            SystemClock.elapsedRealtime() - requestedAt < 10_000L
+        ) return
+        requestSync()
     }
 
     fun syncFromCodex(
         ticket: String, state: EyeState?, snapshot: Usage, source: Transport?,
         agents: Map<String, EyeState> = emptyMap(),
+        models: List<Map<String, Any>> = emptyList(),
     ) {
         if (ticket != syncTicket) return
         if (source != null) {
-            setDesktopSnapshot(source, state, snapshot, ticket, agents)
+            setDesktopSnapshot(source, state, snapshot, ticket, agents, models)
             return
         }
         updateUsage(snapshot)
         state?.let { set(it, "Codex") }
         syncedTicket = ticket
         log("Codex 已同步")
+    }
+
+    internal data class RearNotice(
+        val key: String,
+        val source: String,
+        val title: String,
+        val text: String,
+        val icon: Drawable?,
+        val startedAt: Long,
+        val react: Boolean,
+    )
+
+    @Volatile
+    internal var rearNotice: RearNotice? = null
+        private set
+
+    internal fun showRearNotice(notice: RearNotice) {
+        if (rearNotice?.key == notice.key) return
+        rearNotice = notice
     }
 
     @Volatile
@@ -145,6 +184,27 @@ object EyesBus {
     private val agents = mutableMapOf<Pair<String, String>, AgentState>()
     private val priority = listOf(EyeState.QUESTION, EyeState.THINKING, EyeState.ERROR, EyeState.DONE)
     private val agentPriority = priority + listOf(EyeState.STOPPED, EyeState.IDLE, EyeState.SLEEP)
+
+    @Synchronized
+    fun modelConnections(): List<Map<String, Any>> =
+        activeDesktop(SystemClock.elapsedRealtime())?.second?.models.orEmpty()
+
+    internal fun readModelConnections(json: JSONArray?): List<Map<String, Any>> = buildList {
+        for (index in 0 until minOf(json?.length() ?: 0, 20)) {
+            val item = json?.optJSONObject(index) ?: continue
+            val id = item.opt("id") as? String ?: continue
+            val name = item.opt("name") as? String ?: continue
+            val kind = item.opt("kind") as? String ?: continue
+            if (id.isBlank() || id.length > 64 || name.isBlank() || name.length > 80 ||
+                (kind != "local" && kind != "cloud")) continue
+            add(buildMap {
+                put("id", id)
+                put("name", name)
+                put("kind", kind)
+                (item.opt("available") as? Boolean)?.let { put("available", it) }
+            })
+        }
+    }
 
     internal fun readAgentStates(json: JSONObject?): Map<String, EyeState> = buildMap {
         json?.keys()?.asSequence()?.take(24)?.forEach { name ->

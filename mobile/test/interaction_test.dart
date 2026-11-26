@@ -61,6 +61,32 @@ class _Desktop extends RemoteClient {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('notice signal animates in and dismisses', (tester) async {
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: NoticeSignal(interaction))),
+    );
+    interaction.notice = (
+      source: '测试应用',
+      title: '首页新通知',
+      text: '测试正文',
+      verification: false,
+      id: 'test',
+      eventKey: 'test:1',
+      packageName: null,
+    );
+    interaction.notifyListeners();
+    await tester.pump();
+    final title = find.text('首页新通知');
+    final during = tester.getTopLeft(title).dy;
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(title).dy, lessThan(during));
+    interaction.clearNotice();
+    await tester.pumpAndSettle();
+    expect(title, findsNothing);
+  });
+
   testWidgets('chat opens as a page with reasoning collapsed', (tester) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = const Size(390, 844);
@@ -113,6 +139,91 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+
+  test(
+    'a followed app notification received in background is shown on resume',
+    () async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final channel = MethodChannel(RobotInteraction.events.name);
+      String? savedNotices;
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        if (call.method == 'saveRecentNotices') {
+          savedNotices = call.arguments as String;
+          return null;
+        }
+        return switch (call.method) {
+          'capabilities' => {'notifications': true},
+          'notificationAccess' => true,
+          'loadRecentNotices' => savedNotices,
+          _ => null,
+        };
+      });
+      messenger.setMockMethodCallHandler(channel, (_) async => null);
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+        messenger.setMockMethodCallHandler(channel, null);
+      });
+      final interaction = RobotInteraction(RemoteClient(), () => null);
+      addTearDown(interaction.dispose);
+      await interaction.initialize();
+
+      Future<void> emit(
+        String package,
+        String title, {
+        String? id,
+        String? sender,
+      }) => messenger.handlePlatformMessage(
+        channel.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'notification',
+          'app': package,
+          'package': package,
+          'id': id ?? package,
+          'sender': sender ?? '',
+          'title': title,
+        }),
+        (_) {},
+      );
+      await emit('sms.app', '默认接收短信');
+      await emit('other.app', '默认接收其他应用');
+      expect(interaction.recentNotices.map((item) => item.title), [
+        '默认接收其他应用',
+        '默认接收短信',
+      ]);
+
+      interaction.saveNoticeChoices(const [
+        NoticeChoice('followed.app', '关注应用'),
+      ], contacts: false);
+      interaction.saveKeywords(['匹配词']);
+      interaction.clearNotice();
+      interaction.pause();
+
+      await emit('followed.app', '新通知');
+      await emit('unfollowed.app', '忽略此通知');
+      expect(interaction.notice, isNull);
+      expect(interaction.recentNotices.first.title, '新通知');
+      expect(interaction.recentNotices.length, 3);
+
+      await interaction.resume();
+      expect(interaction.notice?.title, '新通知');
+
+      await emit('another.app', '含匹配词的提醒', id: 'matching');
+      expect(interaction.recentNotices.first.title, '含匹配词的提醒');
+      interaction.saveNoticeChoices(const [
+        NoticeChoice('contact', '测试联系人'),
+      ], contacts: true);
+      await emit('another.app', '联系人提醒', id: 'contact', sender: '测试联系人');
+      expect(interaction.recentNotices.first.title, '联系人提醒');
+
+      final reopened = RobotInteraction(RemoteClient(), () => null);
+      addTearDown(reopened.dispose);
+      await reopened.initialize();
+      expect(reopened.recentNotices.first.title, '联系人提醒');
+      expect(reopened.recentNotices.length, 5);
+      expect(reopened.notice, isNull);
+    },
+  );
 
   test(
     'recording waits for the final transcript before sending once',

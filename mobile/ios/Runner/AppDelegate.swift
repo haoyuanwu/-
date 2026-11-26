@@ -1,5 +1,7 @@
+import AVFoundation
 import Flutter
 import Security
+import Speech
 import UIKit
 
 @main
@@ -33,6 +35,23 @@ import UIKit
           UserDefaults.standard.set(seconds, forKey: "reareyes.sleepSeconds")
         }
         reply(UserDefaults.standard.object(forKey: "reareyes.sleepSeconds") as? Int ?? 90)
+      case "permissionStatus":
+        reply([
+          "microphone": AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+          "speech": SFSpeechRecognizer.authorizationStatus() == .authorized,
+        ])
+      case "openPermission":
+        switch call.arguments as? String {
+        case "microphone" where AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined:
+          AVCaptureDevice.requestAccess(for: .audio) { _ in DispatchQueue.main.async { reply(nil) } }
+        case "speech" where SFSpeechRecognizer.authorizationStatus() == .notDetermined:
+          SFSpeechRecognizer.requestAuthorization { _ in DispatchQueue.main.async { reply(nil) } }
+        default:
+          if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+          }
+          reply(nil)
+        }
       case "keepScreenOn":
         UIApplication.shared.isIdleTimerDisabled = call.arguments as? Bool ?? false
         reply(nil)

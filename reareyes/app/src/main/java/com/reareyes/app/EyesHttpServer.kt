@@ -101,7 +101,10 @@ class EyesHttpServer(private val port: Int) : Thread("EyesHttpServer") {
                             val agents = params["agents"]?.takeIf { it.length <= 8192 }?.let {
                                 runCatching { EyesBus.readAgentStates(org.json.JSONObject(it)) }.getOrDefault(emptyMap())
                             }.orEmpty()
-                            EyesBus.syncFromCodex(params.getValue("ticket"), state, snapshot, source, agents)
+                            val models = params["models"]?.takeIf { it.length <= 8192 }?.let {
+                                runCatching { EyesBus.readModelConnections(org.json.JSONArray(it)) }.getOrDefault(emptyList())
+                            }.orEmpty()
+                            EyesBus.syncFromCodex(params.getValue("ticket"), state, snapshot, source, agents, models)
                             "ok sync\n"
                         } catch (_: IllegalArgumentException) {
                             status = "400 Bad Request"

@@ -1,4 +1,5 @@
 // ignore: deprecated_member_use
+import 'dart:convert';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -13,12 +14,120 @@ import 'package:rear_eyes_mobile/remote.dart';
 import 'package:rear_eyes_mobile/status_strip.dart';
 
 void main() {
+  testWidgets('landscape shows new reminders below the conversation overlay', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(760, 300);
+    addTearDown(tester.view.reset);
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    final events = MethodChannel(RobotInteraction.events.name);
+    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+      return switch (call.method) {
+        'capabilities' => {'notifications': true, 'speech': true},
+        'notificationAccess' => true,
+        'notificationAppIcon' when call.arguments == 'test.app' => base64Decode(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+W3ioAAAAASUVORK5CYII=',
+        ),
+        _ => null,
+      };
+    });
+    messenger.setMockMethodCallHandler(events, (_) async => null);
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+      messenger.setMockMethodCallHandler(events, null);
+    });
+
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    final scene = ValueNotifier((EyeMood.idle, 0));
+    final telemetry = ValueNotifier(Snapshot());
+    addTearDown(interaction.dispose);
+    addTearDown(scene.dispose);
+    addTearDown(telemetry.dispose);
+    final initialization = interaction.initialize();
+    await tester.pump();
+    await initialization;
+    interaction.readNotices = true;
+    interaction.reply = '已有对话回复';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DeskPage(
+          scene: scene,
+          telemetry: telemetry,
+          sleepSeconds: 90,
+          interaction: interaction,
+        ),
+      ),
+    );
+
+    await messenger.handlePlatformMessage(
+      events.name,
+      const StandardMethodCodec().encodeSuccessEnvelope({
+        'type': 'notification',
+        'app': '测试应用',
+        'package': 'test.app',
+        'title': '横屏新提醒',
+        'text': '通知内容',
+      }),
+      (_) {},
+    );
+    await tester.pump();
+
+    expect(interaction.spokenText, '测试应用，横屏新提醒');
+    expect(interaction.mood, isNull);
+    expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNotNull);
+    await tester.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(find.byIcon(Icons.notifications_outlined), findsNothing);
+    final notice = find.text('横屏新提醒');
+    expect(notice.hitTestable(), findsOneWidget);
+    expect(
+      tester.getTopLeft(notice).dy,
+      greaterThan(tester.getTopLeft(find.text('已有对话回复')).dy),
+    );
+    await tester.pump(const Duration(milliseconds: 1100));
+    expect(interaction.mood, isNull);
+    expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNull);
+    expect(notice, findsOneWidget);
+    interaction.clearNotice();
+    await interaction.muteCurrent();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('the homepage eye preview allows vertical scrolling', (
+    tester,
+  ) async {
+    final scroll = ScrollController();
+    addTearDown(scroll.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ListView(
+          controller: scroll,
+          children: const [
+            SizedBox(
+              height: 240,
+              child: EyeScene(mood: EyeMood.idle, allowVerticalScroll: true),
+            ),
+            SizedBox(height: 1200),
+          ],
+        ),
+      ),
+    );
+    await tester.drag(find.byType(EyeScene), const Offset(0, -100));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(scroll.offset, greaterThan(0));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets(
     'fullscreen speech stays with the eyes and sends the transcript',
     (tester) async {
       final messenger =
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final nativeActions = <String>[];
       messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        nativeActions.add(call.method);
         return call.method == 'capabilities' ? {'speech': true} : null;
       });
       const events = MethodChannel('com.reareyes/interactionEvents');
@@ -53,21 +162,78 @@ void main() {
         ),
       );
 
-      final mic = find.byTooltip('说话');
+      final mic = find.byTooltip('对话');
       final screen = tester.getRect(find.byType(DeskPage));
-      expect(tester.getCenter(mic).dx, greaterThan(screen.center.dx));
-      expect(tester.getCenter(mic).dy, greaterThan(screen.center.dy));
-      expect(find.text('说话'), findsNothing);
+      final controlCenter = tester.getCenter(mic);
+      expect(controlCenter.dx, screen.center.dx);
+      expect(controlCenter.dy, greaterThan(screen.center.dy));
+      expect(find.text('对话'), findsNothing);
       await tester.tap(mic);
       await tester.pump();
-      expect(find.byType(DeskVoiceFeedback), findsOneWidget);
+      expect(find.byType(DeskVoiceControl), findsOneWidget);
+      expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
       expect(find.text('正在聆听'), findsNothing);
-      expect(find.byTooltip('结束录音'), findsOneWidget);
+      final stop = find.byTooltip('结束录音');
+      expect(
+        find.descendant(
+          of: stop,
+          matching: find.byWidgetPredicate(
+            (widget) => widget is CustomPaint && !widget.size.isEmpty,
+          ),
+        ),
+        findsOneWidget,
+      );
+      expect(stop, findsOneWidget);
+      expect(find.text('结束录音'), findsNothing);
+      expect(tester.getCenter(stop), controlCenter);
       expect(find.text('和 Robot Eyes 对话'), findsNothing);
       expect(
         tester.widget<EyeScene>(find.byType(EyeScene)).mood,
         EyeMood.focus,
       );
+
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'speechLevel',
+          'level': .64,
+        }),
+        (_) {},
+      );
+      await tester.pump();
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).voiceLevel, .64);
+
+      expect(nativeActions, contains('startListening'));
+      await tester.tap(stop);
+      await tester.pump();
+      expect(nativeActions, contains('stopListening'));
+      final processing = find.byTooltip('取消识别');
+      expect(tester.getCenter(processing), controlCenter);
+      final recognizingEyes = tester.widget<EyeScene>(find.byType(EyeScene));
+      expect(recognizingEyes.mood, EyeMood.thinking);
+      expect(recognizingEyes.voiceLevel, isNull);
+      await tester.tap(processing);
+      await tester.pump();
+      expect(nativeActions, contains('cancelListening'));
+      expect(tester.getCenter(mic), controlCenter);
+
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'speech',
+          'text': '已取消的识别结果',
+          'final': true,
+        }),
+        (_) {},
+      );
+      await tester.pump();
+      expect(interaction.error, isNull);
+      expect(interaction.draft, isEmpty);
+
+      await tester.tap(mic);
+      await tester.pump();
+      await tester.tap(stop);
+      await tester.pump();
 
       await messenger.handlePlatformMessage(
         events.name,
@@ -79,10 +245,79 @@ void main() {
         (_) {},
       );
       await tester.pump();
-      expect(find.textContaining('请先配对电脑'), findsOneWidget);
+      expect(interaction.error, contains('请先配对电脑'));
+      expect(find.textContaining('请先配对电脑'), findsNothing);
+      expect(find.byTooltip('重试'), findsOneWidget);
+      expect(
+        tester.widget<EyeScene>(find.byType(EyeScene)).mood,
+        EyeMood.error,
+      );
+      expect(tester.getCenter(find.byTooltip('重试')), controlCenter);
       expect(find.byType(DeskPage), findsOneWidget);
     },
   );
+
+  testWidgets('speaking raises the listening eyes and they settle in silence', (
+    tester,
+  ) async {
+    final level = ValueNotifier<double>(0);
+    final boundary = GlobalKey();
+    addTearDown(level.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: RepaintBoundary(
+            key: boundary,
+            child: SizedBox(
+              width: 375,
+              height: 210,
+              child: ValueListenableBuilder(
+                valueListenable: level,
+                builder: (_, value, _) =>
+                    EyeScene(mood: EyeMood.focus, voiceLevel: value),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Future<int> topOfEyes() async {
+      final box =
+          boundary.currentContext!.findRenderObject()! as RenderRepaintBoundary;
+      final frame = box.toImageSync();
+      try {
+        final bytes = await tester.runAsync(
+          () => frame.toByteData(format: ui.ImageByteFormat.rawRgba),
+        );
+        final rgba = bytes!.buffer.asUint8List();
+        // Sample the left eye only, below the eyebrow.
+        for (var y = 40; y < 104; y++) {
+          final pixel = (y * frame.width + 148) * 4;
+          if (rgba[pixel + 2] > 220 && rgba[pixel] > 105) return y;
+        }
+        throw StateError('No bright pixels in the listening eye');
+      } finally {
+        frame.dispose();
+      }
+    }
+
+    await tester.pump(const Duration(milliseconds: 16));
+    final quiet = await topOfEyes();
+    level.value = .81;
+    for (var index = 0; index < 6; index++) {
+      await tester.pump(const Duration(milliseconds: 45));
+    }
+    final speaking = await topOfEyes();
+    expect(speaking, lessThan(quiet - 3));
+
+    level.value = 0;
+    for (var index = 0; index < 14; index++) {
+      await tester.pump(const Duration(milliseconds: 45));
+    }
+    expect(await topOfEyes(), closeTo(quiet, 2));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   testWidgets('the latest AI expression waits until the drag ends', (
     tester,

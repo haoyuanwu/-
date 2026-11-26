@@ -90,12 +90,20 @@ class ModelProfile {
   }
 }
 
+typedef LocalModel = ({String service, Uri address, String model});
+
 class ModelConnections {
   ModelConnections(this.directory);
 
   final Directory directory;
   late List<ModelProfile> _profiles = _load();
   final _available = <String, bool>{};
+  final _probes = <String, HttpClient>{};
+  final _nextProbe = <String, DateTime>{};
+  Timer? _monitor;
+  void Function()? _onChanged;
+  static const _probeTimeout = Duration(seconds: 4);
+  static const _pollInterval = Duration(seconds: 5);
   final _active = <String, HttpClient>{};
   final _cancelled = <HttpClient>{};
   String? loadError;
@@ -128,31 +136,37 @@ class ModelConnections {
   void save(ModelProfile profile, {bool? tested}) {
     final next = [..._profiles];
     final index = next.indexWhere((value) => value.id == profile.id);
-    if (index == -1) {
+    final previous = index == -1 ? null : next[index];
+    if (previous == null) {
       if (next.length >= 20) throw const FormatException('最多保存 20 个模型连接。');
       next.add(profile);
     } else {
-      final previous = next[index];
       next[index] = profile;
-      if (previous.endpoint != profile.endpoint ||
-          previous.model != profile.model ||
-          previous.apiKey != profile.apiKey) {
-        _available.remove(profile.id);
-      }
     }
     _write(next);
+    _resetProbe(profile.id);
+    if (previous?.endpoint != profile.endpoint ||
+        previous?.model != profile.model ||
+        previous?.apiKey != profile.apiKey) {
+      _available.remove(profile.id);
+    }
     if (tested != null) _available[profile.id] = tested;
+    _onChanged?.call();
+    _poll();
   }
 
   void remove(String id) {
     _write(_profiles.where((value) => value.id != id).toList());
     _available.remove(id);
+    _resetProbe(id);
+    _onChanged?.call();
   }
 
   void setDefault(String id) {
     final profile = _profiles.where((value) => value.id == id).firstOrNull;
     if (profile == null || identical(profile, _profiles.firstOrNull)) return;
     _write([profile, ..._profiles.where((value) => value.id != id)]);
+    _onChanged?.call();
   }
 
   void _write(List<ModelProfile> next) {
@@ -176,6 +190,52 @@ class ModelConnections {
   }
 
   bool? availability(String id) => _available[id];
+
+  Future<List<LocalModel>> discoverLocalModels() async {
+    final results = await Future.wait([
+      for (final (service, port) in [('Ollama', 11434), ('LM Studio', 1234)])
+        _discoverService(service, port),
+    ]);
+    return results.expand((models) => models).toList();
+  }
+
+  Future<List<LocalModel>> _discoverService(String service, int port) async {
+    final address = Uri.parse('http://127.0.0.1:$port/v1');
+    final client = HttpClient()
+      ..connectionTimeout = _probeTimeout
+      ..findProxy = (_) => 'DIRECT';
+    try {
+      final (_, ids) = await _readCatalog(
+        address.replace(path: '${address.path}/models'),
+        client,
+      ).timeout(_probeTimeout);
+      return [
+        for (final model in ids ?? const <String>{})
+          (service: service, address: address, model: model),
+      ];
+    } on IOException {
+      return [];
+    } on TimeoutException {
+      return [];
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  bool hasLocalModel(Uri address, String model) => _profiles.any(
+    (profile) =>
+        profile.kind == 'local' &&
+        profile.model == model &&
+        profile.endpoint.scheme == address.scheme &&
+        const {'127.0.0.1', 'localhost'}.contains(profile.endpoint.host) &&
+        profile.endpoint.port == address.port &&
+        profile.endpoint.path == '${address.path}/chat/completions',
+  );
+
+  void refreshAvailability() {
+    _nextProbe.clear();
+    _poll();
+  }
 
   List<Map<String, Object>> publishedModels() => [
     for (final profile in _profiles)
@@ -201,7 +261,131 @@ class ModelConnections {
     }
   }
 
+  void startMonitoring(void Function() onChanged) {
+    if (_monitor != null) return;
+    _onChanged = onChanged;
+    _monitor = Timer.periodic(const Duration(seconds: 1), (_) => _poll());
+    _poll();
+  }
+
+  void _resetProbe(String id) {
+    _probes.remove(id)?.close(force: true);
+    _nextProbe.remove(id);
+  }
+
+  void _poll() {
+    if (_monitor == null) return;
+    final now = DateTime.now();
+    for (final profile in _profiles) {
+      final next = _nextProbe[profile.id];
+      if (_probes.containsKey(profile.id) ||
+          (next != null && now.isBefore(next))) {
+        continue;
+      }
+      _nextProbe[profile.id] = now.add(
+        profile.kind == 'local' ? _pollInterval : const Duration(seconds: 30),
+      );
+      final client = HttpClient()..connectionTimeout = _probeTimeout;
+      _probes[profile.id] = client;
+      unawaited(_probe(profile, client));
+    }
+  }
+
+  Future<void> _probe(ModelProfile profile, HttpClient client) async {
+    bool? available;
+    try {
+      available = await _checkConnection(
+        profile,
+        client,
+      ).timeout(_probeTimeout);
+    } on IOException {
+      available = false;
+    } on TimeoutException {
+      available = false;
+    } finally {
+      client.close(force: true);
+    }
+    if (!identical(_probes[profile.id], client)) return;
+    _probes.remove(profile.id);
+    if (available != null) _setAvailability(profile.id, available);
+  }
+
+  Future<bool?> _checkConnection(
+    ModelProfile profile,
+    HttpClient client,
+  ) async {
+    final endpoint = profile.endpoint.replace(
+      path: profile.endpoint.path.replaceFirst(
+        RegExp(r'/chat/completions$'),
+        '/models',
+      ),
+    );
+    final (status, ids) = await _readCatalog(endpoint, client, profile.apiKey);
+    // Some compatible gateways expose completions without a model catalog.
+    if (const {404, 405, 429, 501}.contains(status)) return null;
+    if (status != HttpStatus.ok) return false;
+    return ids?.contains(profile.model);
+  }
+
+  Future<(int, Set<String>?)> _readCatalog(
+    Uri endpoint,
+    HttpClient client, [
+    String apiKey = '',
+  ]) async {
+    final request = await client.getUrl(endpoint);
+    request.followRedirects = false;
+    request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (apiKey.isNotEmpty) {
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $apiKey');
+    }
+    final response = await request.close();
+    final status = response.statusCode;
+    if (status != HttpStatus.ok) return (status, null);
+
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in response) {
+      if (bytes.length + chunk.length > 1024 * 1024) return (status, null);
+      bytes.add(chunk);
+    }
+    try {
+      final json = jsonDecode(utf8.decode(bytes.takeBytes()));
+      if (json is! Map || json['data'] is! List) return (status, null);
+      return (
+        status,
+        {
+          for (final entry in json['data'] as List)
+            if (entry case {'id': final String id}
+                when id.isNotEmpty && id == id.trim() && id.length <= 200)
+              id,
+        },
+      );
+    } on FormatException {
+      return (status, null);
+    }
+  }
+
+  void _setAvailability(String id, bool available) {
+    if (_available[id] == available) return;
+    _available[id] = available;
+    _onChanged?.call();
+  }
+
+  void _recordChatResult(ModelProfile profile, bool available) {
+    if (!_profiles.any((current) => identical(current, profile))) return;
+    _probes.remove(profile.id)?.close(force: true);
+    _setAvailability(profile.id, available);
+  }
+
   void stop() {
+    _monitor?.cancel();
+    _monitor = null;
+    _onChanged = null;
+    for (final client in _probes.values) {
+      client.close(force: true);
+    }
+    _probes.clear();
+    _nextProbe.clear();
+    _available.clear();
     for (final client in _active.values) {
       _cancelled.add(client);
       client.close(force: true);
@@ -282,12 +466,12 @@ class ModelConnections {
         await response.flush();
       }
       if (!_cancelled.contains(client)) {
-        _available[profile.id] = true;
+        _recordChatResult(profile, true);
         response.writeln(jsonEncode({'done': true}));
       }
     } on ModelFailure catch (error) {
       if (!_cancelled.contains(client)) {
-        _available[profile.id] = false;
+        _recordChatResult(profile, false);
         response.writeln(jsonEncode({'error': error.message}));
       }
     } finally {

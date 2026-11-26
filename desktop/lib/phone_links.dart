@@ -4,10 +4,11 @@ import 'dart:io';
 
 /// Sends snapshots over the phone's existing ADB and same-subnet MCP listeners.
 class PhoneLinks {
-  PhoneLinks(this.directory, this._readRemotePairing);
+  PhoneLinks(this.directory, this._readRemotePairing, this._onChanged);
 
   final Directory directory;
   final Future<String?> Function() _readRemotePairing;
+  final void Function() _onChanged;
   ({Uri url, String authorization})? _lan;
   String? _adb;
   ({String serial, int port, bool owned})? _forward;
@@ -16,11 +17,25 @@ class PhoneLinks {
   bool _usbRemoteHandled = false;
   bool _inFlight = false;
   Map<String, Object?>? _pendingSnapshot;
+  int _generation = 0;
+  int _lanRevision = 0;
+  bool? _lanReachable;
+  String? _adbTransport;
 
   File get _lanFile => File('${directory.path}/phone-lan.json');
   String? get lanAddress => _lan?.url.replace(path: '/mcp').toString();
+  bool? get lanReachable => _lanReachable;
+  String? get adbTransport => _adbTransport;
+
+  void stop() {
+    _generation++;
+    _pendingSnapshot = null;
+    _lanReachable = null;
+    _adbTransport = null;
+  }
 
   void load() {
+    _lan = null;
     if (!_lanFile.existsSync()) return;
     try {
       _lan = _parse(_lanFile.readAsStringSync());
@@ -39,15 +54,17 @@ class PhoneLinks {
     if (config.trim().isEmpty) {
       if (_lanFile.existsSync()) _lanFile.deleteSync();
       _lan = null;
-      return;
+    } else {
+      final parsed = _parse(config);
+      directory.createSync(recursive: true);
+      _lanFile.writeAsStringSync(config, flush: true);
+      if (!Platform.isWindows) {
+        Process.runSync('/bin/chmod', ['600', _lanFile.path]);
+      }
+      _lan = parsed;
     }
-    final parsed = _parse(config);
-    directory.createSync(recursive: true);
-    _lanFile.writeAsStringSync(config, flush: true);
-    if (!Platform.isWindows) {
-      Process.runSync('/bin/chmod', ['600', _lanFile.path]);
-    }
-    _lan = parsed;
+    _lanRevision++;
+    _lanReachable = null;
   }
 
   ({Uri url, String authorization}) _parse(String config) {
@@ -98,16 +115,31 @@ class PhoneLinks {
         final next = _pendingSnapshot;
         if (next == null) break;
         _pendingSnapshot = null;
-        await _sendAdb(next, _sendLan(next));
+        final generation = _generation;
+        await _sendAdb(next, _sendLan(next, generation), generation);
       }
     } finally {
       _inFlight = false;
     }
   }
 
-  Future<bool> _sendLan(Map<String, Object?> snapshot) async {
+  Future<bool> _sendLan(Map<String, Object?> snapshot, int generation) async {
     final lan = _lan;
     if (lan == null) return false;
+    final revision = _lanRevision;
+    final reachable = await _postSnapshot(snapshot, lan);
+    if (generation != _generation || revision != _lanRevision) return false;
+    if (_lanReachable != reachable) {
+      _lanReachable = reachable;
+      _onChanged();
+    }
+    return reachable;
+  }
+
+  Future<bool> _postSnapshot(
+    Map<String, Object?> snapshot,
+    ({Uri url, String authorization}) lan,
+  ) async {
     final client = _client();
     try {
       final request = await client.postUrl(lan.url).timeout(_timeout);
@@ -119,7 +151,7 @@ class PhoneLinks {
       request.add(body);
       final response = await request.close().timeout(_timeout);
       await response.drain<void>().timeout(_timeout);
-      return response.statusCode == HttpStatus.ok && _lan == lan;
+      return response.statusCode == HttpStatus.ok;
     } on IOException {
       return false;
     } on TimeoutException {
@@ -132,7 +164,9 @@ class PhoneLinks {
   Future<void> _sendAdb(
     Map<String, Object?> snapshot,
     Future<bool> lanConnected,
+    int generation,
   ) async {
+    String? transport;
     try {
       final devices = await _devices();
       final usb = _usbTransport;
@@ -141,30 +175,42 @@ class PhoneLinks {
       }
       final serial = await _selectDevice(devices);
       final device = devices[serial];
-      if (serial == null || device == null) return;
+      if (serial == null || device == null || generation != _generation) return;
       if (device.kind == 'USB') {
-        final transport = (serial: serial, id: device.id);
-        if (_usbTransport != transport) {
-          _usbTransport = transport;
+        final usbTransport = (serial: serial, id: device.id);
+        if (_usbTransport != usbTransport) {
+          _usbTransport = usbTransport;
           _usbLanHandled = false;
           _usbRemoteHandled = false;
           await _removeForward();
         }
         await Future.wait([
-          _syncAdb(serial, device.kind, snapshot),
-          _repairUsbLan(serial, snapshot, lanConnected),
+          _syncAdb(serial, device.kind, snapshot).then((synced) {
+            if (synced) transport = device.kind;
+            _updateAdbTransport(transport, generation);
+          }),
+          _repairUsbLan(serial, snapshot, lanConnected, generation),
           _repairUsbTailscale(serial),
         ]);
       } else {
-        await _syncAdb(serial, device.kind, snapshot);
+        if (await _syncAdb(serial, device.kind, snapshot)) {
+          transport = device.kind;
+        }
       }
     } on IOException {
       await _removeForward();
     } on TimeoutException {
       await _removeForward();
     } finally {
+      _updateAdbTransport(transport, generation);
       await lanConnected;
     }
+  }
+
+  void _updateAdbTransport(String? transport, int generation) {
+    if (generation != _generation || _adbTransport == transport) return;
+    _adbTransport = transport;
+    _onChanged();
   }
 
   Future<String?> _selectDevice(
@@ -198,14 +244,17 @@ class PhoneLinks {
     String serial,
     Map<String, Object?> snapshot,
     Future<bool> lanConnected,
+    int generation,
   ) async {
     if (_usbLanHandled) return;
     if (await lanConnected) {
       _usbLanHandled = true;
       return;
     }
-    if (_usbLanHandled) return;
-    if (await _importUsbLan(serial)) await _sendLan(snapshot);
+    if (_usbLanHandled || generation != _generation) return;
+    if (await _importUsbLan(serial, generation)) {
+      await _sendLan(snapshot, generation);
+    }
   }
 
   Future<void> _repairUsbTailscale(String serial) async {
@@ -226,7 +275,7 @@ class PhoneLinks {
     await _pairOverUsb(serial);
   }
 
-  Future<void> _syncAdb(
+  Future<bool> _syncAdb(
     String serial,
     String kind,
     Map<String, Object?> snapshot,
@@ -247,14 +296,14 @@ class PhoneLinks {
             'tcp:8788',
           ]);
           final port = int.tryParse((result.stdout as String).trim());
-          if (result.exitCode != 0 || port == null) return;
+          if (result.exitCode != 0 || port == null) return false;
           _forward = (serial: serial, port: port, owned: true);
         }
       }
       final uri = Uri.parse('http://127.0.0.1:${_forward!.port}/codex-sync');
       final reply = (await _get(client, uri)).trim();
-      if (!reply.startsWith('sync ')) return;
-      await _get(
+      if (!reply.startsWith('sync ')) return false;
+      final result = await _get(
         client,
         uri.replace(
           queryParameters: {
@@ -263,15 +312,20 @@ class PhoneLinks {
             'state': '${snapshot['state']}',
             if (snapshot['agents'] != null)
               'agents': jsonEncode(snapshot['agents']),
+            if (snapshot['models'] != null)
+              'models': jsonEncode(snapshot['models']),
             for (final name in ['five', 'week', 'fiveReset', 'weekReset'])
               name: snapshot[name]?.toString() ?? '-',
           },
         ),
       );
+      return result.trim() == 'ok sync';
     } on IOException {
       await _removeForward();
+      return false;
     } on TimeoutException {
       await _removeForward();
+      return false;
     } finally {
       client.close(force: true);
     }
@@ -289,10 +343,12 @@ class PhoneLinks {
     method,
   ]);
 
-  Future<bool> _importUsbLan(String serial) async {
+  Future<bool> _importUsbLan(String serial, int generation) async {
     try {
       final result = await _usbCall(serial, 'getConfig');
-      if (_usbLanHandled || result.exitCode != 0) return false;
+      if (_usbLanHandled || generation != _generation || result.exitCode != 0) {
+        return false;
+      }
       final encoded = RegExp(
         r'^Result: Bundle\[\{lan_config=([A-Za-z0-9+/=]+)\}\]$',
       ).firstMatch((result.stdout as String).trim())?.group(1);
@@ -306,7 +362,7 @@ class PhoneLinks {
     } on FormatException {
       return false;
     } finally {
-      _usbLanHandled = true;
+      if (generation == _generation) _usbLanHandled = true;
     }
   }
 
