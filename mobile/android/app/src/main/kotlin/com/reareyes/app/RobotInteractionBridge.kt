@@ -77,9 +77,17 @@ internal class RobotInteractionBridge(
             "notificationAppIcon" -> {
                 val packageName = call.arguments as? String
                 catalog.execute {
-                    val icon = packageName?.let(::loadAppIcon)
+                    val icon = packageName?.let { appIconBytes(activity, it) }
                     main.post { if (!closed) result.success(icon) }
                 }
+            }
+            "openNoticeApp" -> result.success(openNoticeApp(call))
+            "openNoticeOverlaySettings" -> {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.fromParts("package", activity.packageName, null),
+                )
+                result.success(runCatching { activity.startActivity(intent) }.isSuccess)
             }
             "notificationContacts" -> requestContacts(result)
             "notificationDetails" -> {
@@ -210,23 +218,22 @@ internal class RobotInteractionBridge(
         }
     }
 
-    private fun loadAppIcon(packageName: String): ByteArray? {
-        return try {
-            val drawable = appLogo(activity, packageName) ?: return null
-            val bitmap = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888)
-            try {
-                drawable.setBounds(0, 0, bitmap.width, bitmap.height)
-                drawable.draw(Canvas(bitmap))
-                ByteArrayOutputStream().use { output ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
-                    output.toByteArray()
-                }
-            } finally {
-                bitmap.recycle()
-            }
-        } catch (_: RuntimeException) {
-            null
+    private fun openNoticeApp(call: MethodCall): String {
+        val source = call.argument<String>("package")
+        if (source.isNullOrBlank() || source == activity.packageName) return "unavailable"
+        val id = call.argument<String>("id")
+        val launch = activity.packageManager.getLaunchIntentForPackage(source)
+        val target = id?.let {
+            runCatching { RobotNotificationListener.openIntent(activity, it, source) }.getOrNull()
         }
+        if (target == null && launch == null) return "unavailable"
+        val withShortcut = call.argument<Boolean>("withShortcut") != false
+        if (withShortcut && !Settings.canDrawOverlays(activity)) return "permission"
+        if (withShortcut) activity.noticeReturnShortcut.show()
+        val opened = (target != null && runCatching { target.send() }.isSuccess) ||
+            (launch != null && runCatching { activity.startActivity(launch) }.isSuccess)
+        if (!opened) activity.noticeReturnShortcut.dismiss()
+        return if (opened) "opened" else "unavailable"
     }
 
     @Suppress("DEPRECATION")
@@ -373,8 +380,16 @@ internal class RobotInteractionBridge(
             return
         }
         speech.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) = Unit
+            override fun onStart(utteranceId: String?) {
+                main.post {
+                    val item = utterance?.takeIf { it.token == utteranceId } ?: return@post
+                    emit("speechStarted", mapOf("id" to item.id))
+                }
+            }
             override fun onDone(utteranceId: String?) {
+                main.post { finishUtterance(utteranceId) }
+            }
+            override fun onStop(utteranceId: String?, interrupted: Boolean) {
                 main.post { finishUtterance(utteranceId) }
             }
             @Deprecated("Android TTS callback")
@@ -443,6 +458,25 @@ internal class RobotInteractionBridge(
                 val info = manager.getApplicationInfo(packageName, 0)
                 if (info.icon == 0) null else manager.getApplicationIcon(info)
             }.getOrNull()
+
+        internal fun appIconBytes(context: Context, packageName: String): ByteArray? {
+            return try {
+                val drawable = appLogo(context, packageName) ?: return null
+                val bitmap = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888)
+                try {
+                    drawable.setBounds(0, 0, bitmap.width, bitmap.height)
+                    drawable.draw(Canvas(bitmap))
+                    ByteArrayOutputStream().use { output ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                        output.toByteArray()
+                    }
+                } finally {
+                    bitmap.recycle()
+                }
+            } catch (_: RuntimeException) {
+                null
+            }
+        }
 
         private const val MICROPHONE_PERMISSION = 3
         private const val CONTACTS_PERMISSION = 4

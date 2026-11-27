@@ -28,7 +28,6 @@ class UsbLanConfigProvider : ContentProvider() {
             return Bundle().apply { putBoolean("paired", true) }
         }
         require(method == "getConfig")
-        if (!LanMcpSettings.enabled(app)) return Bundle()
         val endpoint = LanMcpSettings.endpoints(app).firstOrNull() ?: return Bundle()
         val config = LanMcpSettings.config(app, endpoint)
         return Bundle().apply {

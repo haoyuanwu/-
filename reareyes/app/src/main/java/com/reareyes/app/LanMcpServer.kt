@@ -53,8 +53,7 @@ internal class LanMcpServer(private val context: Context) : Thread("LanMcpServer
     fun shutdown() = listener.close()
 
     private fun handle(socket: Socket) {
-        if (!LanMcpSettings.enabled(context) ||
-            !LanMcpSettings.allows(context, socket.localAddress, socket.inetAddress)) {
+        if (!LanMcpSettings.allows(context, socket.localAddress, socket.inetAddress)) {
             respond(socket, "403 Forbidden")
             return
         }
@@ -83,6 +82,7 @@ internal class LanMcpServer(private val context: Context) : Thread("LanMcpServer
     private fun handleRequest(socket: Socket, input: BufferedInputStream, deadline: Long,
                               method: String, target: String, headers: Map<String, String>) {
         if (target != "/mcp" && target != "/status-sync") return respond(socket, "404 Not Found")
+        if (target == "/mcp" && !LanMcpSettings.enabled(context)) return respond(socket, "403 Forbidden")
         if (headers["origin"] != null) return respond(socket, "403 Forbidden")
         val expected = "Bearer $token".toByteArray()
         val actual = headers["authorization"].orEmpty().toByteArray()
@@ -121,20 +121,12 @@ internal class LanMcpServer(private val context: Context) : Thread("LanMcpServer
             return respond(socket, "400 Bad Request", error(JSONObject.NULL, -32600, "Invalid request"))
         }
         if (target == "/status-sync") {
-            val state = EyeState.entries.firstOrNull { it.name == message.opt("state") }
-                ?: return respond(socket, "400 Bad Request")
-            fun usage(key: String): EyesBus.UsageWindow? {
-                val used = message.optInt(key, -1)
-                val reset = message.optLong(key + "Reset", -1L)
-                return if (used in 0..100 && reset > 0) EyesBus.UsageWindow(used, reset) else null
+            if (!LanMcpSettings.receiveDesktopStatus(context, socket.inetAddress, message)) {
+                return respond(socket, "400 Bad Request")
             }
-            synchronized(LanMcpSettings) {
-                if (!LanMcpSettings.enabled(context)) return respond(socket, "403 Forbidden")
-                EyesBus.setDesktopSnapshot(EyesBus.Transport.LAN, state, EyesBus.Usage(usage("five"), usage("week")),
-                    agents = EyesBus.readAgentStates(message.optJSONObject("agents")),
-                    models = EyesBus.readModelConnections(message.optJSONArray("models")))
-            }
-            return respond(socket, "200 OK", JSONObject().put("ok", true))
+            val desktopId = message.optString("desktopId")
+            val active = desktopId.isEmpty() || DesktopProfiles.active(context)?.key == desktopId
+            return respond(socket, "200 OK", JSONObject().put("ok", true).put("active", active))
         }
         val id = message.opt("id")
         val rpcMethod = message.opt("method") as? String

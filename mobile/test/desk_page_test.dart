@@ -7,6 +7,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rear_eyes_mobile/desk_voice_feedback.dart';
+import 'package:rear_eyes_mobile/design.dart';
 import 'package:rear_eyes_mobile/eye_scene.dart';
 import 'package:rear_eyes_mobile/interaction.dart';
 import 'package:rear_eyes_mobile/main.dart';
@@ -14,89 +15,223 @@ import 'package:rear_eyes_mobile/remote.dart';
 import 'package:rear_eyes_mobile/status_strip.dart';
 
 void main() {
-  testWidgets('landscape shows new reminders below the conversation overlay', (
-    tester,
-  ) async {
-    tester.view.devicePixelRatio = 1;
-    tester.view.physicalSize = const Size(760, 300);
-    addTearDown(tester.view.reset);
-    final messenger =
-        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    final events = MethodChannel(RobotInteraction.events.name);
-    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
-      return switch (call.method) {
-        'capabilities' => {'notifications': true, 'speech': true},
-        'notificationAccess' => true,
-        'notificationAppIcon' when call.arguments == 'test.app' => base64Decode(
-          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+W3ioAAAAASUVORK5CYII=',
+  testWidgets(
+    'landscape streams at a reading pace and dismisses after speech',
+    (tester) async {
+      final interaction = RobotInteraction(RemoteClient(), () => null)
+        ..phase = InteractionPhase.answering
+        ..turnId = 'first-turn'
+        ..reply = '一二三四五六七八';
+      addTearDown(interaction.dispose);
+      Future<void> showControl() => tester.pumpWidget(
+        MaterialApp(
+          home: ListenableBuilder(
+            listenable: interaction,
+            builder: (_, _) =>
+                Center(child: DeskVoiceControl(interaction, onPressed: () {})),
+          ),
         ),
-        _ => null,
-      };
-    });
-    messenger.setMockMethodCallHandler(events, (_) async => null);
-    addTearDown(() {
-      messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
-      messenger.setMockMethodCallHandler(events, null);
-    });
+      );
+      await showControl();
+      final wholeReply = find.text(interaction.reply, findRichText: true);
+      expect(wholeReply, findsNothing);
+      expect(find.text('一'), findsOneWidget);
+      expect(tester.widget<Text>(find.text('一')).style?.color, primaryInk);
+      expect(find.byType(Text), findsOneWidget);
+      await tester.pump(const Duration(milliseconds: 700));
+      expect(wholeReply, findsOneWidget);
+      await tester.pump(const Duration(seconds: 6));
+      expect(wholeReply, findsOneWidget);
 
-    final interaction = RobotInteraction(RemoteClient(), () => null);
-    final scene = ValueNotifier((EyeMood.idle, 0));
-    final telemetry = ValueNotifier(Snapshot());
-    addTearDown(interaction.dispose);
-    addTearDown(scene.dispose);
-    addTearDown(telemetry.dispose);
-    final initialization = interaction.initialize();
-    await tester.pump();
-    await initialization;
-    interaction.readNotices = true;
-    interaction.reply = '已有对话回复';
-    await tester.pumpWidget(
-      MaterialApp(
-        home: DeskPage(
-          scene: scene,
-          telemetry: telemetry,
-          sleepSeconds: 90,
-          interaction: interaction,
+      interaction
+        ..phase = InteractionPhase.idle
+        ..spokenText = interaction.reply
+        ..notifyListeners();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 6));
+      expect(wholeReply, findsOneWidget);
+
+      interaction
+        ..spokenText = null
+        ..notifyListeners();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 9));
+      expect(wholeReply, findsOneWidget);
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(const Duration(milliseconds: 450));
+      expect(wholeReply, findsNothing);
+      expect(interaction.reply, '一二三四五六七八');
+
+      interaction
+        ..spokenText = interaction.reply
+        ..notifyListeners();
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(wholeReply, findsNothing);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await showControl();
+      expect(wholeReply, findsNothing);
+
+      interaction
+        ..spokenText = null
+        ..phase = InteractionPhase.answering
+        ..turnId = 'new-turn'
+        ..reply = '下一条回复'
+        ..notifyListeners();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 700));
+      expect(find.text('下一条回复'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'landscape shows new reminders without restoring a previous reply',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(760, 300);
+      addTearDown(tester.view.reset);
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final events = MethodChannel(RobotInteraction.events.name);
+      String? utteranceId;
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+        if (call.method == 'speak') {
+          utteranceId = (call.arguments as Map)['id'] as String?;
+        }
+        return switch (call.method) {
+          'capabilities' => {'notifications': true, 'speech': true},
+          'notificationAccess' => true,
+          'notificationAppIcon' when call.arguments == 'test.app' =>
+            base64Decode(
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+W3ioAAAAASUVORK5CYII=',
+            ),
+          _ => null,
+        };
+      });
+      messenger.setMockMethodCallHandler(events, (_) async => null);
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+        messenger.setMockMethodCallHandler(events, null);
+      });
+
+      final interaction = RobotInteraction(RemoteClient(), () => null);
+      final scene = ValueNotifier((EyeMood.idle, 0));
+      final telemetry = ValueNotifier(Snapshot());
+      addTearDown(interaction.dispose);
+      addTearDown(scene.dispose);
+      addTearDown(telemetry.dispose);
+      final initialization = interaction.initialize();
+      await tester.pump();
+      await initialization;
+      interaction.readNotices = true;
+      interaction.reply = '已有对话回复';
+      await tester.pumpWidget(
+        MaterialApp(
+          home: DeskPage(
+            scene: scene,
+            telemetry: telemetry,
+            sleepSeconds: 90,
+            interaction: interaction,
+          ),
         ),
-      ),
-    );
+      );
 
-    await messenger.handlePlatformMessage(
-      events.name,
-      const StandardMethodCodec().encodeSuccessEnvelope({
-        'type': 'notification',
-        'app': '测试应用',
-        'package': 'test.app',
-        'title': '横屏新提醒',
-        'text': '通知内容',
-      }),
-      (_) {},
-    );
-    await tester.pump();
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'notification',
+          'app': '测试应用',
+          'package': 'test.app',
+          'title': '横屏新提醒',
+          'text': '通知内容',
+        }),
+        (_) {},
+      );
+      await tester.pump();
 
-    expect(interaction.spokenText, '你在测试应用收到一条消息，内容是：通知内容');
-    expect(interaction.mood, isNull);
-    expect(tester.widget<EyeScene>(find.byType(EyeScene)).speaking, isTrue);
-    expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNotNull);
-    await tester.pump();
-    expect(find.byType(Image), findsOneWidget);
-    expect(find.byIcon(Icons.notifications_outlined), findsNothing);
-    final notice = find.text('横屏新提醒');
-    expect(notice.hitTestable(), findsOneWidget);
-    expect(
-      tester.getTopLeft(notice).dy,
-      greaterThan(tester.getTopLeft(find.text('已有对话回复')).dy),
-    );
-    await tester.pump(const Duration(milliseconds: 1100));
-    expect(interaction.mood, isNull);
-    expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNull);
-    expect(notice, findsOneWidget);
-    interaction.clearNotice();
-    await interaction.muteCurrent();
-    await tester.pump();
-    expect(tester.widget<EyeScene>(find.byType(EyeScene)).speaking, isFalse);
-    await tester.pumpWidget(const SizedBox.shrink());
-  });
+      expect(interaction.spokenText, isNull);
+      expect(interaction.mood, isNull);
+      expect(
+        tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue,
+        isNotNull,
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump();
+      expect(find.byType(Image), findsOneWidget);
+      expect(find.byIcon(Icons.notifications_outlined), findsNothing);
+      final notice = find.text('横屏新提醒');
+      expect(notice.hitTestable(), findsOneWidget);
+      expect(find.text('已有对话回复'), findsNothing);
+      await tester.pump(const Duration(milliseconds: 1200));
+      expect(interaction.spokenText, '你在测试应用收到一条消息，内容是：通知内容');
+      expect(interaction.speechPlaying, isFalse);
+      expect(utteranceId, isNotNull);
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'speechStarted',
+          'id': utteranceId,
+        }),
+        (_) {},
+      );
+      await tester.pump();
+      expect(interaction.speechPlaying, isTrue);
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).mood, EyeMood.idle);
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).speaking, isFalse);
+      final buttonPaint = tester.renderObject<RenderRepaintBoundary>(
+        find
+            .descendant(
+              of: find.byTooltip('对话'),
+              matching: find.byType(RepaintBoundary),
+            )
+            .first,
+      );
+      Future<List<int>> mouthFrame() async {
+        final image = buttonPaint.toImageSync();
+        try {
+          final bytes = await tester.runAsync(() => image.toByteData());
+          return bytes!.buffer.asUint8List();
+        } finally {
+          image.dispose();
+        }
+      }
+
+      final firstMouth = await mouthFrame();
+      await tester.pump(const Duration(milliseconds: 90));
+      expect(await mouthFrame(), isNot(firstMouth));
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).noticeCue, isNull);
+      expect(notice, findsOneWidget);
+      await interaction.muteCurrent();
+      await tester.pump();
+      expect(interaction.speechPlaying, isFalse);
+
+      await tester.tap(notice);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+      final close = find.byTooltip('关闭');
+      expect(close, findsOneWidget);
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'expression',
+          'expression': 'IDEA',
+        }),
+        (_) {},
+      );
+      expect(interaction.mood, EyeMood.idea);
+      await tester.pump(const Duration(seconds: 10));
+      expect(interaction.mood, isNull);
+      expect(interaction.notice?.title, '横屏新提醒');
+      expect(close, findsOneWidget);
+
+      await tester.tap(close);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(notice.hitTestable(), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   testWidgets('the homepage eye preview allows vertical scrolling', (
     tester,
@@ -257,6 +392,22 @@ void main() {
 
       await tester.tap(mic);
       await tester.pump();
+      await messenger.handlePlatformMessage(
+        events.name,
+        const StandardMethodCodec().encodeSuccessEnvelope({
+          'type': 'speechError',
+          'text': '麦克风不可用',
+        }),
+        (_) {},
+      );
+      await tester.pump();
+      expect(find.text('麦克风不可用'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 4));
+      expect(find.text('麦克风不可用'), findsNothing);
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).mood, EyeMood.idle);
+
+      await tester.tap(mic);
+      await tester.pump();
       await tester.pump(const Duration(milliseconds: 650));
       await tester.tap(stop);
       await tester.pump();
@@ -284,6 +435,10 @@ void main() {
       final starts = nativeActions
           .where((action) => action == 'startListening')
           .length;
+      await tester.pump(const Duration(seconds: 4));
+      expect(find.textContaining('请先配对电脑'), findsNothing);
+      expect(tester.widget<EyeScene>(find.byType(EyeScene)).mood, EyeMood.idle);
+      expect(find.text('测试全屏说话'), findsOneWidget);
       await tester.tap(find.byTooltip('重试'));
       await tester.pump();
       expect(
@@ -443,7 +598,7 @@ void main() {
     },
   );
 
-  testWidgets('the latest AI expression waits until the drag ends', (
+  testWidgets('the latest AI expression waits for the drag release pose', (
     tester,
   ) async {
     final mood = ValueNotifier(EyeMood.idle);
@@ -485,6 +640,16 @@ void main() {
       }
     }
 
+    int donePixels(List<int> rgba) {
+      var count = 0;
+      for (var i = 0; i < rgba.length; i += 4) {
+        if (rgba[i + 1] > rgba[i] + 24 && rgba[i + 1] > rgba[i + 2] + 24) {
+          count++;
+        }
+      }
+      return count;
+    }
+
     final finger = await tester.startGesture(
       tester.getCenter(find.byType(EyeScene)),
     );
@@ -503,14 +668,11 @@ void main() {
     await tester.pump(const Duration(milliseconds: 70));
     final released = await pixels();
     expect(released, isNot(orderedEquals(tracking)));
-    var greenPixels = 0;
-    for (var i = 0; i < released.length; i += 4) {
-      if (released[i + 1] > released[i] + 24 &&
-          released[i + 1] > released[i + 2] + 24) {
-        greenPixels++;
-      }
-    }
-    expect(greenPixels, greaterThan(100));
+    expect(donePixels(released), 0);
+    await tester.pump(const Duration(milliseconds: 879));
+    expect(donePixels(await pixels()), 0);
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(donePixels(await pixels()), greaterThan(100));
 
     await tester.pumpWidget(const SizedBox.shrink());
   });

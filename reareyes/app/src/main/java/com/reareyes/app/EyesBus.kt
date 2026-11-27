@@ -50,7 +50,7 @@ object EyesBus {
 
     private data class DesktopSnapshot(
         val state: EyeState, val usage: Usage, val expiresAt: Long, val agents: Map<String, EyeState>,
-        val models: List<Map<String, Any>>,
+        val models: List<Map<String, Any>>, val stateSince: Long,
     )
     private val desktop = mutableMapOf<Transport, DesktopSnapshot>()
 
@@ -73,8 +73,11 @@ object EyesBus {
         models: List<Map<String, Any>> = emptyList(),
     ) {
         val now = SystemClock.elapsedRealtime()
+        val previous = desktop[source]
+        val next = value ?: previous?.state ?: localState
         desktop[source] = DesktopSnapshot(
-            value ?: desktop[source]?.state ?: localState, usage, now + 12_000L, agents, models,
+            next, usage, now + 12_000L, agents, models,
+            previous?.takeIf { it.state == next && it.expiresAt > now }?.stateSince ?: now,
         )
         refreshState(now, source.label)
         if (ticket == syncTicket && ticket != syncedTicket && activeDesktop(now)?.first == source) {
@@ -126,6 +129,7 @@ object EyesBus {
         requestSync()
     }
 
+    @Synchronized
     fun syncFromCodex(
         ticket: String, state: EyeState?, snapshot: Usage, source: Transport?,
         agents: Map<String, EyeState> = emptyMap(),
@@ -150,15 +154,35 @@ object EyesBus {
         val icon: Drawable?,
         val startedAt: Long,
         val react: Boolean,
+        val packageName: String,
+        val verification: Boolean,
+        val receivedAt: Long,
     )
 
     @Volatile
     internal var rearNotice: RearNotice? = null
         private set
 
+    private val rearNotices = ArrayDeque<RearNotice>()
+
+    @Synchronized
     internal fun showRearNotice(notice: RearNotice) {
         if (rearNotice?.key == notice.key) return
         rearNotice = notice
+        trimRearNotices(notice.startedAt)
+        rearNotices.addLast(notice)
+    }
+
+    @Synchronized
+    internal fun recentRearNotices(now: Long): List<RearNotice> {
+        trimRearNotices(now)
+        return rearNotices.toList()
+    }
+
+    private fun trimRearNotices(now: Long) {
+        while (rearNotices.firstOrNull()?.let { now - it.startedAt >= 12_000 } == true) {
+            rearNotices.removeFirst()
+        }
     }
 
     @Volatile
@@ -181,6 +205,7 @@ object EyesBus {
     private var localState = EyeState.IDLE
     private var localStateSince = stateSince
     @Volatile private var idleTimeout = 90_000L
+    private var idleStartedAt: Long? = null
     private var desktopWakeAt: Long? = null
     private var preview: Pair<EyeState, Long>? = null
 
@@ -200,8 +225,11 @@ object EyesBus {
         }
         refreshState(now, "表情预览")
     }
+    private const val COMPLETION_DURATION = 5_000L
+    private const val TERMINAL_DURATION = 30_000L
     private data class AgentState(val state: EyeState, val expiresAt: Long)
     private val agents = mutableMapOf<Pair<String, String>, AgentState>()
+    private var lastAgentCompletionAt: Long? = null
     private val priority = listOf(EyeState.QUESTION, EyeState.THINKING, EyeState.ERROR, EyeState.DONE)
     private val agentPriority = priority + listOf(EyeState.STOPPED, EyeState.IDLE, EyeState.SLEEP)
 
@@ -271,12 +299,12 @@ object EyesBus {
     fun sleepIfInactive(idleTimeoutMs: Long) {
         idleTimeout = idleTimeoutMs
         val now = SystemClock.elapsedRealtime()
-        val timeout = when (localState) {
-            EyeState.DONE, EyeState.ERROR, EyeState.STOPPED -> 30_000L
-            EyeState.IDLE -> idleTimeoutMs
-            else -> Long.MAX_VALUE
+        val terminal = localState == EyeState.DONE || localState == EyeState.ERROR ||
+            localState == EyeState.STOPPED
+        if (terminal && now - localStateSince >= TERMINAL_DURATION) {
+            localState = EyeState.IDLE
+            localStateSince = now
         }
-        if (now - localStateSince >= timeout) localState = EyeState.SLEEP
         refreshState(now, "auto-idle")
     }
 
@@ -289,7 +317,10 @@ object EyesBus {
             EyeState.IDLE, EyeState.SLEEP -> agents.remove(key)
             else -> {
                 if (key !in agents && agents.size >= 128) return null
-                val lifetime = if (value == EyeState.QUESTION || value == EyeState.THINKING) 900_000L else 30_000L
+                val lifetime = if (value == EyeState.QUESTION || value == EyeState.THINKING) 900_000L else TERMINAL_DURATION
+                if (value == EyeState.DONE && agents[key]?.state != EyeState.DONE) {
+                    lastAgentCompletionAt = now
+                }
                 agents[key] = AgentState(value, now + lifetime)
             }
         }
@@ -300,6 +331,7 @@ object EyesBus {
     @Synchronized
     fun clearAgentStates() {
         agents.clear()
+        lastAgentCompletionAt = null
         refreshState(SystemClock.elapsedRealtime(), "MCP")
     }
 
@@ -316,19 +348,32 @@ object EyesBus {
         val now = SystemClock.elapsedRealtime()
         localState = s
         localStateSince = now
+        if (s == EyeState.IDLE) idleStartedAt = null
         refreshState(now, src, refreshTime = true)
     }
 
     private fun refreshState(now: Long, source: String, refreshTime: Boolean = false) {
         agents.values.removeAll { it.expiresAt <= now }
-        val desktopState = activeDesktop(now)?.second?.state
+        val desktopStatus = activeDesktop(now)?.second
+        val desktopState = desktopStatus?.state
         if (desktopState != EyeState.SLEEP) desktopWakeAt = null
         val wokeFromDesktopSleep = desktopWakeAt?.let { now - it < idleTimeout } == true
         val sourceState = if (wokeFromDesktopSleep) EyeState.IDLE else desktopState ?: localState
         if (preview?.let { it.second <= now } == true) preview = null
-        val next = preview?.first ?: priority.firstOrNull { candidate ->
+        val combined = priority.firstOrNull { candidate ->
             candidate == sourceState || agents.values.any { it.state == candidate }
         } ?: sourceState
+        val recentCompletion = combined == EyeState.THINKING && (
+            (desktopStatus?.state == EyeState.DONE && now - desktopStatus.stateSince < COMPLETION_DURATION) ||
+            (localState == EyeState.DONE && now - localStateSince < COMPLETION_DURATION) ||
+            lastAgentCompletionAt?.let { now - it < COMPLETION_DURATION } == true
+        )
+        val displayed = preview?.first ?: if (recentCompletion) EyeState.DONE else combined
+        val idleSince = if (displayed == EyeState.IDLE && rearVoice == null) {
+            idleStartedAt ?: now
+        } else null
+        idleStartedAt = idleSince
+        val next = if (idleSince != null && now - idleSince >= idleTimeout) EyeState.SLEEP else displayed
         if (state == next) {
             if (refreshTime && sourceState == localState && localState == next) {
                 stateRevision++

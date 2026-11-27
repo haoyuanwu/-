@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'agent_mcp.dart';
 import 'desktop_chrome.dart';
 import 'model_connections_panel.dart';
+import 'phone_links.dart';
 import 'remote_server.dart';
 import 'tailscale_endpoint.dart';
 
@@ -69,13 +70,21 @@ enum _DashboardPage {
   overview('概览', Icons.space_dashboard_outlined, Icons.space_dashboard_rounded),
   models('模型', Icons.tune_outlined, Icons.tune_rounded),
   phone('手机连接', Icons.phone_android_outlined, Icons.phone_android_rounded),
-  tools('AI 工具', Icons.hub_outlined, Icons.hub_rounded),
-  inbox('收件箱', Icons.inbox_outlined, Icons.inbox_rounded);
+  tools('AI 工具', Icons.hub_outlined, Icons.hub_rounded);
 
   const _DashboardPage(this.label, this.icon, this.selectedIcon);
   final String label;
   final IconData icon;
   final IconData selectedIcon;
+}
+
+enum _PhonePage {
+  lan('手机局域网', Icons.wifi),
+  tailscale('Tailscale 连接', Icons.link_rounded);
+
+  const _PhonePage(this.label, this.icon);
+  final String label;
+  final IconData icon;
 }
 
 class _DesktopDashboardState extends State<DesktopDashboard> {
@@ -95,15 +104,15 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
           null => '等待检测',
         };
   String? failure;
-  String get lanLabel => server.phoneLinks.lanAddress == null
-      ? '未配置'
-      : !server.running
-      ? '服务已停止'
-      : switch (server.phoneLinks.lanReachable) {
-          true => '已连接',
-          false => '连接失败',
-          null => '等待检测',
-        };
+  String get lanLabel => _phoneStatus(server.phoneLinks.lanDevices);
+
+  String _phoneStatus(List<PhoneDevice> devices) {
+    final count = devices.where((device) => device.connected).length;
+    if (!server.running) return '服务已停止';
+    if (count > 0) return '$count 台已连接';
+    return devices.isEmpty ? '未配对' : '未连接';
+  }
+
   String get adbLabel => switch (server.phoneLinks.adbTransport) {
     'USB' => 'USB 已连接',
     'LAN' => '无线调试已连接',
@@ -120,6 +129,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
   bool? _publishedBusy;
   bool? _publishedRunning;
   _DashboardPage _page = _DashboardPage.overview;
+  _PhonePage? _phonePage;
 
   void publishTray() {
     final rows = [
@@ -256,7 +266,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     } on SocketException {
       failure = '启动失败，请检查本机端口 ${RemoteServer.port} 是否被占用。';
     } on FileSystemException {
-      failure = '无法访问本地配置或收件箱，请检查文件权限。';
+      failure = '无法访问本地数据，请检查文件权限。';
     } on FormatException {
       failure = '本地配对密钥无效，请检查 pairing.key。';
     } finally {
@@ -303,7 +313,12 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       final address = endpoint;
       if (!server.running || address == null) return false;
       await copy(
-        jsonEncode({'url': address, 'token': server.token}),
+        jsonEncode({
+          'url': address,
+          'token': server.token,
+          'desktopId': server.desktopId,
+          'desktopName': server.desktopName,
+        }),
         '已复制配对配置',
       );
       return true;
@@ -426,7 +441,7 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
       Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          heading(Icons.link_rounded, 'Tailscale 连接'),
+          heading(Icons.link_rounded, 'Tailscale 服务'),
           const SizedBox(height: 14),
           if (endpoint == null) ...[
             Text(tailscaleLabel, style: const TextStyle(color: muted)),
@@ -486,122 +501,173 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     );
   }
 
-  Future<void> editLan() async {
-    String config = '';
-    String? error;
+  Future<void> showLanCode() async {
+    var code = server.createLanCode();
     await showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
-        builder: (context, update) {
-          final address = server.phoneLinks.lanAddress;
-          return AlertDialog(
-            title: const Text('手机局域网配置'),
-            scrollable: true,
-            content: SizedBox(
-              width: 460,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (address != null) ...[
-                    const Text('当前配置 · Streamable HTTP'),
-                    const SizedBox(height: 6),
-                    SelectableText(
-                      address,
-                      style: const TextStyle(color: cyan),
-                    ),
-                    const SizedBox(height: 4),
-                    const Text(
-                      'Authorization · Bearer ••••••••',
-                      style: TextStyle(color: muted),
-                    ),
-                    const SizedBox(height: 16),
-                  ],
-                  TextField(
-                    decoration: InputDecoration(
-                      labelText: address == null
-                          ? '粘贴手机的局域网 MCP 配置'
-                          : '粘贴新配置以替换',
-                      errorText: error,
-                      helperText: '手机在「局域网 MCP」开启后可以复制配置。',
-                    ),
-                    obscureText: true,
-                    onChanged: (value) => update(() {
-                      config = value;
-                      error = null;
-                    }),
+        builder: (context, update) => AlertDialog(
+          title: const Text('局域网配对码'),
+          content: SizedBox(
+            width: 360,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(
+                  code,
+                  style: const TextStyle(
+                    color: cyan,
+                    fontSize: 28,
+                    letterSpacing: 4,
+                    fontFeatures: [FontFeature.tabularFigures()],
                   ),
-                ],
-              ),
-            ),
-            actions: [
-              if (address != null)
-                TextButton(
-                  onPressed: () {
-                    try {
-                      server.phoneLinks.configureLan('');
-                      server.refreshPhoneLinks();
-                      Navigator.pop(context);
-                    } on FileSystemException {
-                      update(() => error = '无法移除配置，请检查文件权限。');
-                    }
-                  },
-                  child: const Text('移除配置'),
                 ),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('取消'),
-              ),
-              FilledButton(
-                onPressed: config.trim().isEmpty
-                    ? null
-                    : () {
-                        try {
-                          server.phoneLinks.configureLan(config);
-                          server.refreshPhoneLinks();
-                          Navigator.pop(context);
-                        } on FormatException {
-                          update(() => error = '请粘贴手机复制的完整 MCP 配置。');
-                        } on FileSystemException {
-                          update(() => error = '无法保存配置，请检查文件权限。');
-                        }
-                      },
-                child: const Text('保存'),
-              ),
-            ],
-          );
-        },
+                const SizedBox(height: 12),
+                const Text('在手机 App 的「局域网」搜索并选择这台电脑，然后输入配对码。配对码 5 分钟内可用一次。'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => update(() => code = server.createLanCode()),
+              child: const Text('重新生成'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('完成'),
+            ),
+          ],
+        ),
       ),
     );
-    if (mounted) {
-      setState(() {});
-      publishTray();
+  }
+
+  List<PhoneDevice> _phoneDevices(_PhonePage page) => switch (page) {
+    _PhonePage.lan => server.phoneLinks.lanDevices,
+    _PhonePage.tailscale => server.phoneLinks.tailscaleDevices,
+  };
+
+  Widget _phoneEntry(_PhonePage page) {
+    final devices = _phoneDevices(page);
+    final online = devices.where((device) => device.connected).toList();
+    return panel(
+      ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(page.icon, color: cyan),
+        title: Text(page.label),
+        subtitle: online.isEmpty
+            ? null
+            : Text(online.map((device) => device.name).join('、')),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            StatusPill(_phoneStatus(devices), active: online.isNotEmpty),
+            const SizedBox(width: 8),
+            const Icon(Icons.chevron_right_rounded, size: 19),
+          ],
+        ),
+        onTap: () => setState(() => _phonePage = page),
+      ),
+    );
+  }
+
+  Future<void> _forgetLanPhone(PhoneDevice device) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('移除 ${device.name} 的局域网配对？'),
+        content: Text('${device.detail} · 移除后可以重新配对。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('移除'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    try {
+      device.forget?.call();
+    } on FileSystemException {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('无法移除配对，请检查文件权限。')),
+      );
     }
   }
 
-  Widget lanPanel() {
-    final address = server.phoneLinks.lanAddress;
+  Widget _phoneList(_PhonePage page) {
+    final devices = _phoneDevices(page);
     return panel(
       Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              Expanded(child: heading(Icons.phone_android_rounded, '手机局域网')),
-              const SizedBox(width: 8),
-              OutlinedButton(onPressed: editLan, child: const Text('管理配置')),
+              heading(Icons.phone_android_rounded, '手机设备'),
+              StatusPill(
+                _phoneStatus(devices),
+                active: devices.any((device) => device.connected),
+              ),
+              if (page == _PhonePage.lan)
+                FilledButton.icon(
+                  onPressed: server.running ? showLanCode : null,
+                  icon: const Icon(Icons.link, size: 18),
+                  label: const Text('生成配对码'),
+                ),
             ],
           ),
-          const SizedBox(height: 8),
-          StatusPill(lanLabel, active: server.phoneLinks.lanReachable == true),
-          if (address != null) ...[
+          const SizedBox(height: 12),
+          if (devices.isEmpty)
+            const Text('暂无已配对手机', style: TextStyle(color: muted)),
+          for (final connected in [true, false])
+            for (final device in devices.where((row) => row.connected == connected))
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.phone_android_outlined, size: 20),
+                title: Text(device.name),
+                subtitle: Text(device.detail),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    StatusPill(
+                      device.connected ? '已连接' : '未连接',
+                      active: device.connected,
+                    ),
+                    if (device.forget != null)
+                      IconButton(
+                        tooltip: '移除局域网配对',
+                        onPressed: () => _forgetLanPhone(device),
+                        icon: const Icon(Icons.link_off, size: 19),
+                      ),
+                  ],
+                ),
+              ),
+          if (page == _PhonePage.lan) ...[
             const SizedBox(height: 8),
-            SelectableText(address, style: const TextStyle(color: cyan)),
+            Text('ADB · $adbLabel', style: const TextStyle(color: muted)),
           ],
-          const SizedBox(height: 8),
-          Text('ADB · $adbLabel', style: const TextStyle(color: muted)),
         ],
       ),
     );
+  }
+
+  Widget _phoneContent() {
+    final page = _phonePage;
+    if (page == null) {
+      return stack([for (final item in _PhonePage.values) _phoneEntry(item)]);
+    }
+    return stack([
+      _phoneList(page),
+      if (page == _PhonePage.tailscale) pairingPanel(),
+    ]);
   }
 
   Future<void> showAiConfiguration() async {
@@ -694,49 +760,6 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     );
   }
 
-  Widget inboxPanel() => panel(
-    Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        heading(Icons.inbox_outlined, '手机消息', violet),
-        const SizedBox(height: 14),
-        if (server.messages.isEmpty)
-          const Text('暂无消息', style: TextStyle(color: muted))
-        else
-          Expanded(
-            child: ListView.separated(
-              primary: false,
-              itemCount: server.messages.length,
-              separatorBuilder: (_, _) => const Divider(color: line),
-              itemBuilder: (context, index) {
-                final message =
-                    server.messages[server.messages.length - 1 - index];
-                final time = DateTime.tryParse(message['at'] as String)
-                    ?.toLocal();
-                final date = time == null
-                    ? ''
-                    : time.toString().substring(0, 16);
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        date,
-                        style: const TextStyle(color: muted, fontSize: 13),
-                      ),
-                      const SizedBox(height: 6),
-                      SelectableText(message['text'] as String),
-                    ],
-                  ),
-                );
-              },
-            ),
-          ),
-      ],
-    ),
-  );
-
   Widget connectedPanel() {
     final clients = {
       for (final client in server.agentMcp.connectedClients())
@@ -801,11 +824,19 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     padding: const EdgeInsets.symmetric(vertical: 14),
     child: Row(
       children: [
+        if (_page == _DashboardPage.phone && _phonePage != null)
+          IconButton(
+            tooltip: '返回手机连接',
+            onPressed: () => setState(() => _phonePage = null),
+            icon: const Icon(Icons.arrow_back),
+          ),
         Expanded(
           child: Semantics(
             header: true,
             child: Text(
-              _page.label,
+              _page == _DashboardPage.phone
+                  ? _phonePage?.label ?? _page.label
+                  : _page.label,
               style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700),
             ),
           ),
@@ -839,9 +870,8 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
     _DashboardPage.models => panel(
       ModelConnectionsPanel(server.modelConnections, server.phoneModels),
     ),
-    _DashboardPage.phone => stack([pairingPanel(), lanPanel()]),
+    _DashboardPage.phone => _phoneContent(),
     _DashboardPage.tools => stack([agentMcpPanel(), connectedPanel()]),
-    _DashboardPage.inbox => inboxPanel(),
   };
 
   @override
@@ -884,7 +914,10 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                     ),
                     unselectedLabelTextStyle: const TextStyle(color: muted),
                     onDestinationSelected: (index) =>
-                        setState(() => _page = _DashboardPage.values[index]),
+                        setState(() {
+                          _page = _DashboardPage.values[index];
+                          _phonePage = null;
+                        }),
                     destinations: [
                       for (final page in _DashboardPage.values)
                         NavigationRailDestination(
@@ -920,21 +953,14 @@ class _DesktopDashboardState extends State<DesktopDashboard> {
                                   ),
                                 ),
                               Expanded(
-                                child: _page == _DashboardPage.inbox
-                                    ? Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          vertical: 16,
-                                        ),
-                                        child: _pageContent(),
-                                      )
-                                    : SingleChildScrollView(
-                                        key: PageStorageKey(_page),
-                                        padding: const EdgeInsets.only(
-                                          top: 16,
-                                          bottom: 24,
-                                        ),
-                                        child: _pageContent(),
-                                      ),
+                                child: SingleChildScrollView(
+                                  key: PageStorageKey((_page, _phonePage)),
+                                  padding: const EdgeInsets.only(
+                                    top: 16,
+                                    bottom: 24,
+                                  ),
+                                  child: _pageContent(),
+                                ),
                               ),
                             ],
                           ),

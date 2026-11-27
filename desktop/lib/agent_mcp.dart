@@ -7,6 +7,21 @@ class AgentMcp {
   AgentMcp(this.onChanged);
 
   static const port = 18793;
+  static const completionDuration = Duration(seconds: 5);
+
+  static String displayState(
+    Set<String> states, {
+    required String fallback,
+    required bool recentlyCompleted,
+  }) {
+    if (recentlyCompleted &&
+        states.contains('THINKING') &&
+        !states.contains('QUESTION')) {
+      return 'DONE';
+    }
+    return priority.take(4).firstWhere(states.contains, orElse: () => fallback);
+  }
+
   static const versions = ['2025-11-25', '2025-06-18', '2025-03-26'];
   static const priority = [
     'QUESTION',
@@ -81,6 +96,7 @@ class AgentMcp {
     await server?.close(force: true);
     _clients.clear();
     _recentlyClosed.clear();
+    lastCompletion = null;
   }
 
   String _randomId() =>
@@ -167,6 +183,8 @@ ${skill.trimRight()}
     return clients.values.toList()
       ..sort((a, b) => b.lastSeen.compareTo(a.lastSeen));
   }
+
+  DateTime? lastCompletion;
 
   Map<String, String> states() {
     final now = DateTime.now();
@@ -426,6 +444,9 @@ ${skill.trimRight()}
       final lifetime = state == 'QUESTION' || state == 'THINKING'
           ? const Duration(minutes: 15)
           : const Duration(seconds: 30);
+      if (state == 'DONE' && client.tasks[task]?.state != 'DONE') {
+        lastCompletion = now;
+      }
       client.tasks[task] = (state: state, until: now.add(lifetime));
     }
     if (!client.reportingVerified) {

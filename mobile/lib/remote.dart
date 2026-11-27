@@ -1,9 +1,10 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:robot_eyes_models/lan_crypto.dart';
+
 import 'package:robot_eyes_models/robot_eyes_models.dart';
 
-import 'chat_reasoning.dart';
 import 'phone_model.dart';
 import 'platform_io.dart'
     if (dart.library.js_interop) 'platform_web.dart'
@@ -44,10 +45,64 @@ enum EyeMood {
 }
 
 class Pairing {
-  Pairing._(this.url, this.token);
+  Pairing._(
+    this.url,
+    this.token, {
+    this.desktopId,
+    this.desktopName,
+    this.lanKey,
+  });
 
   final Uri url;
   final String token;
+  final String? desktopId;
+  final String? desktopName;
+  final String? lanKey;
+
+  static Pairing? readLan(String? raw) {
+    if (raw == null) return null;
+    final Object? data;
+    try {
+      data = jsonDecode(raw);
+    } on FormatException {
+      return null;
+    }
+    final url = data is Map ? data['url'] : null;
+    final token = data is Map ? data['token'] : null;
+    final uri = url is String ? Uri.tryParse(url) : null;
+    if (uri == null ||
+        uri.scheme != 'http' ||
+        uri.port != 18794 ||
+        uri.path.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment ||
+        uri.userInfo.isNotEmpty ||
+        !_localIp(uri.host) ||
+        token is! String ||
+        !RegExp(r'^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$')
+            .hasMatch(token)) {
+      return null;
+    }
+    final key = data is Map ? data['lanKey'] : null;
+    return Pairing._(
+      uri,
+      token,
+      lanKey: LanCrypto.validKey(key) ? key as String : null,
+    );
+  }
+
+  static bool _localIp(String host) {
+    final bytes = host.split('.').map(int.tryParse).toList();
+    if (bytes.length != 4 ||
+        bytes.any((part) => part == null || part < 0 || part > 255)) {
+      return false;
+    }
+    final a = bytes[0]!, b = bytes[1]!;
+    return a == 10 ||
+        (a == 172 && b >= 16 && b <= 31) ||
+        (a == 192 && b == 168) ||
+        (a == 169 && b == 254);
+  }
 
   factory Pairing.parse(String raw) {
     final json = jsonDecode(raw);
@@ -67,10 +122,25 @@ class Pairing {
         !RegExp(r'^[A-Za-z0-9_-]{43}$').hasMatch(token)) {
       throw const FormatException('请粘贴完整的 Tailscale 配对配置');
     }
-    return Pairing._(uri.replace(path: ''), token);
+    return Pairing._(
+      uri.replace(path: ''),
+      token,
+      desktopId: json is Map && json['desktopId'] is String
+          ? json['desktopId']
+          : null,
+      desktopName: json is Map && json['desktopName'] is String
+          ? json['desktopName']
+          : null,
+    );
   }
 
-  String encode() => jsonEncode({'url': url.toString(), 'token': token});
+  String encode() => jsonEncode({
+    'url': url.toString(),
+    'token': token,
+    'desktopId': ?desktopId,
+    'desktopName': ?desktopName,
+    'lanKey': ?lanKey,
+  });
 }
 
 class UsageWindow {
@@ -96,6 +166,12 @@ class Snapshot {
     this.models = const [],
     this.logs = const [],
     this.nativePairing,
+    this.lanPairing,
+    this.lanModelReady = false,
+    this.lanSettingsReady = false,
+    this.lanTailHint,
+    this.desktopKey,
+    this.desktopName,
     this.remoteState,
   });
 
@@ -131,6 +207,12 @@ class Snapshot {
       models: DesktopModel.readList(json['models']),
       logs: (json['logs'] as List? ?? []).whereType<String>().toList(),
       nativePairing: json['pairing'] as String?,
+      lanPairing: json['lanPairing'] as String?,
+      lanModelReady: json['lanModelReady'] == true,
+      lanSettingsReady: json['lanSettingsReady'] == true,
+      lanTailHint: json['lanTailHint'] as String?,
+      desktopKey: json['desktopKey'] as String?,
+      desktopName: json['desktopName'] as String?,
       remoteState: remote ? state : EyeMood.statusFromWire(json['remoteState']),
       five: quota('five'),
       week: quota('week'),
@@ -160,6 +242,12 @@ class Snapshot {
   final List<DesktopModel> models;
   final List<String> logs;
   final String? nativePairing;
+  final String? lanPairing;
+  final bool lanModelReady;
+  final bool lanSettingsReady;
+  final String? lanTailHint;
+  final String? desktopKey;
+  final String? desktopName;
   final EyeMood? remoteState;
 
   int? get fiveRemaining => links.isEmpty ? null : five?.remaining;
@@ -167,6 +255,52 @@ class Snapshot {
 }
 
 class RemoteClient {
+  LanCrypto? lanCrypto;
+
+  Future<Map<String, Object?>> _encryptedLanRequest(
+    Pairing peer,
+    String path,
+    Map<String, Object?> payload, {
+    Uri? endpoint,
+  }) async {
+    final crypto = lanCrypto;
+    final key = peer.lanKey;
+    if (crypto == null || key == null) {
+      throw const FormatException('请在电脑列表重新配对以同步局域网配置。');
+    }
+    final box = await crypto.withPeer(key);
+    final id = messageId();
+    final context = 'Robot Eyes $path $id';
+    final body = await box.seal({
+      ...payload,
+      'at': DateTime.now().millisecondsSinceEpoch,
+    }, '$context request');
+    final result = await platform.request(
+      (endpoint ?? peer.url).replace(path: path),
+      peer.token,
+      {'id': id, ...body},
+      maxBytes: 3 * 1024 * 1024,
+    );
+    if (result.status != 200) throw RemoteFailure(result.status);
+    return box.open(jsonDecode(result.body), '$context response');
+  }
+
+  Future<Pairing> claimTailscale(Pairing lan, String hint, String key) async {
+    final candidate = Pairing.parse(
+      jsonEncode({'url': hint, 'token': 'a' * 43}),
+    );
+    final result = await _encryptedLanRequest(
+      lan,
+      '/lan/tailscale-pairing',
+      const {},
+      endpoint: candidate.url,
+    );
+    if (result['desktopId'] != key) throw const FormatException('电脑身份已变化');
+    return Pairing.parse(
+      jsonEncode({'url': hint, 'token': result['token'], 'desktopId': key}),
+    );
+  }
+
   Future<List<String>> cloudModelIds(String address, String key) async {
     final profile = PhoneModel(ModelSource.cloud, address, 'catalog', key);
     final url = profile.endpoint.replace(
@@ -212,48 +346,13 @@ class RemoteClient {
       }
       return;
     }
-    var received = false;
-    var length = 0;
-    var finished = false;
-    await for (final line in platform.modelChat(profile.endpoint, profile.key, {
-      'model': profile.model,
-      'messages': messages,
-      'stream': true,
-    })) {
-      if (!line.startsWith('data:')) continue;
-      final data = line.substring(5).trim();
-      if (data == '[DONE]') {
-        finished = true;
-        break;
-      }
-      if (data.isEmpty) continue;
-      final value = jsonDecode(data);
-      if (value is Map && value['error'] != null) {
-        throw const FormatException('模型服务返回错误，请检查配置。');
-      }
-      final choices = value is Map ? value['choices'] : null;
-      final choice = choices is List ? choices.firstOrNull : null;
-      if (choice is! Map) continue;
-      finished = finished || choice['finish_reason'] != null;
-      final delta = choice['delta'];
-      final text = delta is Map ? delta['content'] : null;
-      final reasoning = delta is Map
-          ? delta['reasoning_content'] ?? delta['reasoning']
-          : null;
-      if (reasoning is String && reasoning.isNotEmpty) {
-        length += reasoning.length;
-        if (length > 48000) throw const FormatException('模型回复超过长度上限');
-        yield (text: reasoning, thinking: true);
-      }
-      if (text is String && text.isNotEmpty) {
-        length += text.length;
-        if (length > 48000) throw const FormatException('模型回复超过长度上限');
-        received = true;
-        yield (text: text, thinking: false);
-      }
-    }
-    if (!received) throw const FormatException('模型没有返回文字。');
-    if (!finished) throw const FormatException('模型连接在回复完成前中断。');
+    yield* _boundedReply(
+      readChatCompletion(platform.modelChat(profile.endpoint, profile.key, {
+        'model': profile.model,
+        'messages': messages,
+        'stream': true,
+      })),
+    );
   }
 
   Stream<ChatChunk> localMediaChat(
@@ -287,12 +386,9 @@ class RemoteClient {
     Pairing pairing,
     Map<String, String> state,
   ) async {
-    final data = await _request(
-      pairing,
-      '/ai/phone-model',
-      state,
-      2 * 1024 * 1024,
-    );
+    final data = pairing.url.scheme == 'http'
+        ? await _encryptedLanRequest(pairing, '/ai/phone-model', state)
+        : await _request(pairing, '/ai/phone-model', state, 2 * 1024 * 1024);
     final revision = data['revision'];
     final selection = data['selection'];
     final catalogRevision = data['catalogRevision'] as String?;
@@ -367,7 +463,10 @@ class RemoteClient {
         'includeReasoning': true,
       },
     );
-    var length = 0;
+    yield* _boundedReply(_desktopFrames(lines));
+  }
+
+  Stream<ChatChunk> _desktopFrames(Stream<String> lines) async* {
     await for (final line in lines) {
       if (line.isEmpty) continue;
       final frame = jsonDecode(line);
@@ -385,11 +484,27 @@ class RemoteClient {
       final thinking = reasoning is String;
       final text = thinking ? reasoning : frame['text'];
       if (text is! String) throw const FormatException('电脑返回的回复格式无效');
-      length += text.length;
-      if (length > 48000) throw const FormatException('模型回复超过长度上限');
       yield (text: text, thinking: thinking);
     }
     throw const FormatException('模型连接已中断');
+  }
+
+  Stream<ChatChunk> _boundedReply(Stream<ChatChunk> stream) async* {
+    var reasoningLength = 0;
+    var answerLength = 0;
+    await for (final chunk in stream) {
+      if (chunk.thinking) {
+        final room = reasoningPreviewLimit - reasoningLength;
+        if (room <= 0) continue;
+        final text = chunk.text.substring(0, min(room, chunk.text.length));
+        reasoningLength += text.length;
+        yield (text: text, thinking: true);
+      } else {
+        answerLength += chunk.text.length;
+        if (answerLength > 48000) throw const FormatException('模型正文超过长度上限');
+        yield chunk;
+      }
+    }
   }
 
   Future<void> cancelChat(Pairing pairing, String requestId) =>

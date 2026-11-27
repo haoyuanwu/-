@@ -295,6 +295,13 @@ final class RobotInteraction: NSObject, FlutterStreamHandler, AVSpeechSynthesize
     completeSpeech(finished)
   }
 
+  func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart started: AVSpeechUtterance) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.utterance === started, let id = self.utteranceID else { return }
+      self.sink?(["type": "speechStarted", "id": id])
+    }
+  }
+
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel cancelled: AVSpeechUtterance) {
     completeSpeech(cancelled)
   }

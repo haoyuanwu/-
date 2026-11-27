@@ -21,10 +21,12 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
-import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
+internal const val RETURN_TO_DESK = "com.reareyes.app.RETURN_TO_DESK"
+
 class FlutterHostActivity : FlutterActivity() {
+    internal val noticeReturnShortcut = NoticeReturnShortcut(this)
     private var interaction: RobotInteractionBridge? = null
     private var mobileChannel: MethodChannel? = null
     private var pendingRear: Boolean? = null
@@ -126,6 +128,7 @@ class FlutterHostActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        noticeReturnShortcut.dismiss()
         Shizuku.removeRequestPermissionResultListener(rearPermission)
         super.onDestroy()
     }
@@ -171,7 +174,16 @@ class FlutterHostActivity : FlutterActivity() {
         startService(Intent(this, EyesService::class.java))
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == RETURN_TO_DESK) {
+            setIntent(intent)
+            mobileChannel?.invokeMethod("returnToDesk", null)
+        }
+    }
+
     override fun onResume() {
+        noticeReturnShortcut.dismiss()
         EyesBus.refreshDesktopStatus()
         super.onResume()
     }
@@ -183,7 +195,7 @@ class FlutterHostActivity : FlutterActivity() {
     }
 
     private fun pairingConfig(): String? = RemoteConnection.load(this)?.let {
-        JSONObject().put("url", it.url).put("token", it.token).toString()
+        RemoteConnection.json(it).toString()
     }
 
     private fun permissionStatus(): Map<String, Boolean?> = buildMap {
@@ -232,6 +244,15 @@ class FlutterHostActivity : FlutterActivity() {
 
     private fun onCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "takeDeskReturn" -> {
+                val pending = intent.action == RETURN_TO_DESK
+                if (pending) intent.action = null
+                result.success(pending)
+            }
+            "eyeWake" -> {
+                EyesBus.sleepSession()?.let { EyesBus.wakeFromSleep(it.revision) }
+                result.success(null)
+            }
             "permissionStatus" -> result.success(permissionStatus())
             "openPermission" -> try {
                 openPermission(call.arguments as? String ?: "")
@@ -247,6 +268,12 @@ class FlutterHostActivity : FlutterActivity() {
                     "state" to EyesBus.state.name, "connections" to sources,
                     "agents" to EyesBus.agentStates().mapValues { it.value.name },
                     "models" to EyesBus.modelConnections(),
+                    "lanPairing" to LanMcpSettings.desktopPairing(this),
+                    "lanModelReady" to LanMcpSettings.desktopReady(this),
+                    "lanSettingsReady" to LanMcpSettings.settingsReady(this),
+                    "desktopKey" to DesktopProfiles.active(this)?.key,
+                    "desktopName" to DesktopProfiles.active(this)?.name,
+                    "lanTailHint" to DesktopProfiles.active(this)?.takeIf { it.remote == null }?.tailHint,
                     "logs" to EyesBus.dumpLog(40),
                     "pairing" to pairingConfig(), "remoteState" to feedback.state?.name,
                     "five" to usage.fiveHour?.usedPercent, "fiveReset" to usage.fiveHour?.resetsAt,
@@ -288,13 +315,22 @@ class FlutterHostActivity : FlutterActivity() {
             "savePairing" -> {
                 val raw = call.arguments as? String
                 try {
-                    RemoteConnection.save(this, raw?.let(RemoteConnection::parse))
+                    val remote = raw?.let(RemoteConnection::parse)
+                    if (remote == null) DesktopProfiles.clearRemote(this)
+                    else DesktopProfiles.remember(this, remote.desktopId, remote.desktopName,
+                        remote = remote, select = true)
                     result.success(null)
                 } catch (_: Exception) {
                     result.error("pairing", "配对配置无效", null)
                 }
             }
-            "sync" -> result.success(EyesBus.requestSync())
+            "sync" -> {
+                val ticket = EyesBus.requestSync()
+                result.success(ticket)
+                if (EyesBus.connectedTransports().firstOrNull() == EyesBus.Transport.LAN) {
+                    Thread({ LanMcpSettings.connectDesktop(applicationContext, ticket) }, "RearEyes-LanSync").start()
+                }
+            }
             "preview" -> {
                 val state = EyeState.entries.firstOrNull { it.name == call.arguments }
                 if (state != null) EyesBus.preview(state) else EyesBus.greet()
@@ -333,6 +369,51 @@ class FlutterHostActivity : FlutterActivity() {
                 }
                 LanMcpSettings.copyConfig(this, endpoint)
                 result.success(null)
+            }
+            "connectLan" -> {
+                Thread({
+                    val connected = LanMcpSettings.connectDesktop(applicationContext)
+                    runOnUiThread { result.success(connected) }
+                }, "RearEyes-LanConnect").start()
+            }
+            "discoverLan" -> {
+                Thread({
+                    val desktops = LanMcpSettings.discover(applicationContext)
+                    runOnUiThread { result.success(desktops) }
+                }, "RearEyes-LanDiscovery").start()
+            }
+            "loadLanSeed" -> result.success(LanMcpSettings.keySeed(this))
+            "saveLanSeed" -> {
+                val seed = call.argument<String>("seed")
+                val public = call.argument<String>("public")
+                result.success(if (seed != null && public != null) LanMcpSettings.saveKeys(this, seed, public) else null)
+            }
+            "saveLanTailscale" -> {
+                val key = call.argument<String>("key")
+                val raw = call.argument<String>("config")
+                val active = DesktopProfiles.active(this)
+                val remote = raw?.let { runCatching { RemoteConnection.parse(it) }.getOrNull() }
+                if (active != null && active.key == key && active.remote == null && remote != null) {
+                    DesktopProfiles.remember(this, active.key, active.name, remote = remote)
+                    result.success(true)
+                } else result.success(false)
+            }
+            "desktops" -> result.success(DesktopProfiles.list(this))
+            "selectDesktop" -> {
+                val key = call.arguments as? String
+                result.success(key != null && DesktopProfiles.select(this, key))
+            }
+            "pairLan" -> {
+                val address = call.argument<String>("address")
+                val code = call.argument<String>("code")
+                if (address == null || code == null) {
+                    result.success(false)
+                    return
+                }
+                Thread({
+                    val paired = LanMcpSettings.pairDesktop(applicationContext, address, code)
+                    runOnUiThread { result.success(paired) }
+                }, "RearEyes-LanPair").start()
             }
             else -> result.notImplemented()
         }

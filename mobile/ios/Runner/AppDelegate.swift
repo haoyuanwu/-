@@ -30,6 +30,12 @@ import UIKit
         self.loadPairing(reply)
       case "savePairing":
         self.savePairing(call.arguments as? String, reply)
+      case "phoneIdentity":
+        let defaults = UserDefaults.standard
+        let key = "reareyes.phoneId"
+        let id = defaults.string(forKey: key) ?? UUID().uuidString.lowercased()
+        defaults.set(id, forKey: key)
+        reply(["id": id, "name": UIDevice.current.model])
       case "sleep":
         if let seconds = call.arguments as? Int, [30, 60, 90, 120, 300, 600].contains(seconds) {
           UserDefaults.standard.set(seconds, forKey: "reareyes.sleepSeconds")

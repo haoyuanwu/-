@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rear_eyes_mobile/chat_reasoning.dart';
+import 'package:rear_eyes_mobile/desk_voice_feedback.dart';
 import 'package:rear_eyes_mobile/interaction.dart';
 import 'package:rear_eyes_mobile/interaction_view.dart';
 import 'package:rear_eyes_mobile/phone_model.dart';
@@ -49,6 +50,8 @@ class _Desktop extends RemoteClient {
   final answers = <StreamController<ChatChunk>>[];
   final requests = <String>[];
   final cancelled = <String>[];
+  final requestConnections = <Pairing>[];
+  final cancelConnections = <Pairing>[];
   var useCloudDefault = false;
 
   @override
@@ -68,6 +71,7 @@ class _Desktop extends RemoteClient {
     String requestId,
   ) {
     requests.add(requestId);
+    requestConnections.add(pairing);
     final answer = StreamController<ChatChunk>();
     answers.add(answer);
     return answer.stream;
@@ -76,6 +80,7 @@ class _Desktop extends RemoteClient {
   @override
   Future<void> cancelChat(Pairing pairing, String requestId) async {
     cancelled.add(requestId);
+    cancelConnections.add(pairing);
   }
 
   @override
@@ -277,9 +282,9 @@ void main() {
 
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test(
+  testWidgets(
     'notification speech announces sender, SMS excerpts and verification codes',
-    () async {
+    (tester) async {
       final messenger =
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       final events = MethodChannel(RobotInteraction.events.name);
@@ -303,7 +308,9 @@ void main() {
       });
       final interaction = RobotInteraction(RemoteClient(), () => null);
       addTearDown(interaction.dispose);
-      await interaction.initialize();
+      final initialization = interaction.initialize();
+      await tester.pump();
+      await initialization;
       interaction.setReadNotices(true);
 
       Future<void> send(Map<String, Object> event) async {
@@ -312,11 +319,13 @@ void main() {
           const StandardMethodCodec().encodeSuccessEnvelope(event),
           (_) {},
         );
-        await Future<void>.delayed(Duration.zero);
+        await tester.pump();
       }
 
       Future<void> notice(String id, Map<String, Object> fields) async {
         await send({'type': 'notification', 'id': id, 'app': '微信', ...fields});
+        await tester.pump(const Duration(milliseconds: 1500));
+        await tester.pump();
       }
 
       await notice('ordinary', {'sender': '小明', 'text': '晚上见！'});
@@ -412,12 +421,214 @@ void main() {
     interaction.notifyListeners();
     await tester.pump();
     final title = find.text('首页新通知');
-    final during = tester.getTopLeft(title).dy;
+    await tester.pump(const Duration(milliseconds: 100));
+    final fade = find.ancestor(
+      of: title,
+      matching: find.byType(FadeTransition),
+    );
+    expect(
+      tester.widget<FadeTransition>(fade.first).opacity.value,
+      inExclusiveRange(0, 1),
+    );
     await tester.pumpAndSettle();
-    expect(tester.getTopLeft(title).dy, lessThan(during));
+    expect(tester.widget<FadeTransition>(fade.first).opacity.value, 1);
     interaction.clearNotice();
     await tester.pumpAndSettle();
     expect(title, findsNothing);
+  });
+
+  testWidgets('consecutive notices share a card, speech and paused expiry', (
+    tester,
+  ) async {
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    final events = MethodChannel(RobotInteraction.events.name);
+    final spoken = <String>[];
+    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+      if (call.method == 'speak') {
+        spoken.add((call.arguments as Map)['text'] as String);
+      }
+      return switch (call.method) {
+        'capabilities' => {'notifications': true, 'speech': true},
+        'notificationAccess' => true,
+        _ => null,
+      };
+    });
+    messenger.setMockMethodCallHandler(events, (_) async => null);
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(RobotInteraction.bridge, null);
+      messenger.setMockMethodCallHandler(events, null);
+    });
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    final pending = interaction.initialize();
+    await tester.pump();
+    await pending;
+    interaction.readNotices = true;
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: NoticeSignal(interaction))),
+    );
+
+    Future<void> emit(String package, String title, String body) =>
+        messenger.handlePlatformMessage(
+          events.name,
+          const StandardMethodCodec().encodeSuccessEnvelope({
+            'type': 'notification',
+            'app': package == 'chat.app' ? '聊天应用' : '其他应用',
+            'package': package,
+            'id': title,
+            'title': title,
+            'text': body,
+          }),
+          (_) {},
+        );
+
+    await emit('chat.app', '第一条标题', '第一条正文');
+    await tester.pump(const Duration(milliseconds: 250));
+    await emit('chat.app', '第二条标题', '第二条正文');
+    await tester.pumpAndSettle();
+
+    expect(interaction.noticeQueue.groups.single.items, hasLength(2));
+    expect(find.text('2 条'), findsOneWidget);
+    expect(find.text('第一条标题'), findsNothing);
+    expect(find.text('第二条标题'), findsOneWidget);
+    expect(spoken, isEmpty);
+
+    await tester.pump(const Duration(milliseconds: 1500));
+    expect(spoken, ['聊天应用有2条新消息。第一条正文。第二条正文']);
+    await emit('other.app', '另一应用通知', '其他应用正文');
+    await tester.pumpAndSettle();
+    expect(interaction.noticeQueue.groups, hasLength(2));
+
+    await tester.tap(find.text('第二条标题'));
+    await tester.pumpAndSettle();
+    expect(find.text('第一条标题'), findsOneWidget);
+    expect(find.text('第一条正文'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 12));
+    expect(interaction.noticeQueue.groups, hasLength(2));
+
+    await tester.tap(find.byTooltip('关闭'));
+    await tester.pumpAndSettle();
+    expect(find.text('第一条标题'), findsNothing);
+    expect(find.text('另一应用通知'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 9));
+    await tester.pumpAndSettle();
+    expect(interaction.noticeQueue.groups, isEmpty);
+  });
+
+  testWidgets('notice stack scrolls only when the cards exceed its height', (
+    tester,
+  ) async {
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomRight,
+            child: SizedBox(
+              width: 270,
+              height: 180,
+              child: NoticeSignal(interaction),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    void add(int number) => interaction.noticeQueue.add((
+      source: '测试应用',
+      title: '提醒 $number',
+      text: '通知正文',
+      verification: false,
+      id: '$number',
+      eventKey: '$number:1',
+      packageName: null,
+    ));
+
+    add(1);
+    await tester.pumpAndSettle();
+    final list = find.byType(Scrollable);
+    final position = tester.state<ScrollableState>(list).position;
+    expect(position.maxScrollExtent, 0);
+    final first = find.text('提醒 1');
+    final firstBaseline = tester.getTopLeft(first).dy;
+    add(2);
+    await tester.pumpAndSettle();
+    expect(tester.getTopLeft(first).dy, lessThan(firstBaseline));
+    for (var number = 3; number <= 7; number++) {
+      add(number);
+    }
+    await tester.pumpAndSettle();
+    expect(interaction.noticeQueue.groups, hasLength(7));
+    expect(position.maxScrollExtent, greaterThan(0));
+    expect(find.text('提醒 7').hitTestable(), findsOneWidget);
+    await tester.drag(list, const Offset(0, 380));
+    await tester.pumpAndSettle();
+    expect(position.pixels, greaterThan(0));
+    expect(first.hitTestable(), findsOneWidget);
+    await tester.pump(const Duration(seconds: 9));
+    await tester.pumpAndSettle();
+    expect(interaction.noticeQueue.groups, isEmpty);
+  });
+
+  testWidgets('swiping the middle notice lowers only the cards above it', (
+    tester,
+  ) async {
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomRight,
+            child: SizedBox(width: 270, child: NoticeSignal(interaction)),
+          ),
+        ),
+      ),
+    );
+
+    for (var i = 1; i <= 3; i++) {
+      interaction.noticeQueue.add((
+        source: '测试应用',
+        title: '提醒 $i',
+        text: '通知正文',
+        verification: false,
+        id: '$i',
+        eventKey: '$i:1',
+        packageName: null,
+      ));
+    }
+    await tester.pumpAndSettle();
+    final top = find.text('提醒 1');
+    final middle = find.text('提醒 2');
+    final bottom = find.text('提醒 3');
+    final topPosition = tester.getTopLeft(top).dy;
+    final middlePosition = tester.getTopLeft(middle).dy;
+    final bottomPosition = tester.getTopLeft(bottom).dy;
+
+    await tester.drag(middle, const Offset(-330, 0));
+    await tester.pumpAndSettle();
+    expect(middle, findsOneWidget);
+
+    await tester.drag(middle, const Offset(330, 0));
+    await tester.pump();
+    final positions = <double>[];
+    for (var frame = 0; frame < 22; frame++) {
+      await tester.pump(const Duration(milliseconds: 16));
+      positions.add(tester.getTopLeft(top).dy);
+      expect(tester.getTopLeft(bottom).dy, closeTo(bottomPosition, .01));
+    }
+    expect(
+      positions.any((y) => y > topPosition && y < middlePosition),
+      isTrue,
+      reason: '$positions',
+    );
+
+    await tester.pumpAndSettle();
+    expect(middle, findsNothing);
+    expect(tester.getTopLeft(top).dy, closeTo(middlePosition, .01));
+    expect(tester.getTopLeft(bottom).dy, closeTo(bottomPosition, .01));
   });
 
   testWidgets(
@@ -499,6 +710,58 @@ void main() {
       expect(find.text('验证码不可用'), findsOneWidget);
     },
   );
+
+  testWidgets('opening the source app closes the expanded notice', (
+    tester,
+  ) async {
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    final calls = <Object?>[];
+    messenger.setMockMethodCallHandler(RobotInteraction.bridge, (call) async {
+      if (call.method == 'openNoticeApp') {
+        calls.add(call.arguments);
+        return calls.length == 1 ? 'permission' : 'opened';
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(RobotInteraction.bridge, null),
+    );
+    final interaction = RobotInteraction(RemoteClient(), () => null);
+    addTearDown(interaction.dispose);
+    final initialization = interaction.initialize();
+    await tester.pump();
+    await initialization;
+    interaction.notice = (
+      source: '测试应用',
+      title: '新提醒',
+      text: '通知内容',
+      verification: false,
+      id: 'test-notice',
+      eventKey: 'test:1',
+      packageName: 'test.app',
+    );
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: NoticeSignal(interaction))),
+    );
+    await tester.tap(find.text('新提醒'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('问 AI'), findsNothing);
+    await tester.tap(find.text('打开 App'));
+    await tester.pumpAndSettle();
+    expect(find.text('开启贴边返回便签'), findsOneWidget);
+    await tester.tap(find.text('直接打开'));
+    await tester.pumpAndSettle();
+
+    expect(calls, [
+      {'id': 'test-notice', 'package': 'test.app', 'withShortcut': true},
+      {'id': 'test-notice', 'package': 'test.app', 'withShortcut': false},
+    ]);
+    expect(find.byTooltip('关闭'), findsNothing);
+    expect(find.text('新提醒'), findsNothing);
+    expect(interaction.notice, isNull);
+  });
 
   testWidgets('long notice stays scrollable with large text in landscape', (
     tester,
@@ -854,6 +1117,53 @@ void main() {
     },
   );
 
+  testWidgets('model errors disappear while the question remains retryable', (
+    tester,
+  ) async {
+    final desktop = _Desktop();
+    final pairing = Pairing.parse(
+      '{"url":"https://desk.example.ts.net","token":"${'a' * 43}"}',
+    );
+    final interaction = RobotInteraction(desktop, () => pairing);
+    addTearDown(interaction.dispose);
+    await interaction.fetchModels();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ListenableBuilder(
+            listenable: interaction,
+            builder: (_, _) => DeskVoiceControl(
+              interaction,
+              onPressed: interaction.send,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await interaction.send('原始问题');
+    const message = '模型未返回可显示的文字。';
+    desktop.answers.single.addError(const FormatException(message));
+    await tester.pump();
+    expect(find.text(message), findsOneWidget);
+    expect(find.byTooltip('重试'), findsOneWidget);
+
+    await tester.pump(const Duration(seconds: 4));
+    expect(find.text(message), findsNothing);
+    expect(find.byTooltip('重试'), findsOneWidget);
+    expect(interaction.draft, '原始问题');
+
+    await tester.tap(find.byTooltip('重试'));
+    await tester.pump();
+    expect(desktop.requests, hasLength(2));
+    await desktop.answers.last.close();
+    await tester.pump();
+    expect(interaction.error, '模型没有返回内容。');
+    await tester.pump(const Duration(seconds: 4));
+    expect(interaction.error, isNull);
+    expect(interaction.canRetryReply, isTrue);
+  });
+
   test('model output streams and cancellation retains the question', () async {
     final desktop = _Desktop();
     final pairing = Pairing.parse(
@@ -884,6 +1194,35 @@ void main() {
     expect(interaction.reply, '新回复。');
     expect(interaction.phase, InteractionPhase.idle);
   });
+
+  test(
+    'desktop model streams and cancels over LAN without Tailscale',
+    () async {
+      final desktop = _Desktop();
+      final lan = Pairing.readLan(
+        '{"url":"http://192.168.1.20:18794",'
+        '"token":"e48040cb-83cd-4c2f-89e1-3d14f360729c"}',
+      )!;
+      final interaction = RobotInteraction(
+        desktop,
+        () => null,
+        lanPairing: () => lan,
+      );
+      addTearDown(interaction.dispose);
+
+      interaction.setDraft('局域网测试');
+      await interaction.send();
+      expect(desktop.requestConnections, [lan]);
+      desktop.answers.single.add((text: '局域网回复。', thinking: false));
+      await Future<void>.delayed(Duration.zero);
+      expect(interaction.reply, '局域网回复。');
+      await interaction.cancelAnswer();
+      expect(desktop.cancelConnections, [lan]);
+      expect(desktop.cancelled, desktop.requests);
+      expect(interaction.canSyncPhoneModel, isFalse);
+      await desktop.answers.single.close();
+    },
+  );
 
   test(
     'standalone cloud profiles can be saved and switched without a pairing',
@@ -949,6 +1288,39 @@ void main() {
       }),
       isNull,
     );
+  });
+
+  test('long reasoning preview still allows the answer through', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      await request.drain<void>();
+      final frames = [
+        {'choices': [{'delta': {'reasoning': 'a' * 50000}}]},
+        {'choices': [{'delta': {'content': '正式回答'}}]},
+      ];
+      request.response.add(
+        utf8.encode(
+          frames.map((frame) => 'data: ${jsonEncode(frame)}').join('\n') +
+              '\ndata: [DONE]\n',
+        ),
+      );
+      await request.response.close();
+    });
+    final profile = PhoneModel(
+      ModelSource.local,
+      'http://127.0.0.1:${server.port}/v1',
+      'fixture',
+      '',
+    );
+    final chunks = await HttpOverrides.runWithHttpOverrides(
+      () => RemoteClient().directChat(profile, [
+        {'role': 'user', 'content': '测试'},
+      ]).toList(),
+      _LoopbackHttpOverrides(),
+    );
+    expect(chunks.first.text.length, 48000);
+    expect(chunks.last, (text: '正式回答', thinking: false));
   });
 
   test('phone model streams a reply from a loopback service', () async {

@@ -3,9 +3,22 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
+import 'package:robot_eyes_models/robot_eyes_models.dart';
 
 const channel = MethodChannel('com.reareyes/mobile');
 bool get isAndroid => Platform.isAndroid;
+
+Future<Map<String, String>?>? _phoneIdentity;
+
+Future<Map<String, String>?> _loadPhoneIdentity() async {
+  try {
+    return await channel.invokeMapMethod<String, String>('phoneIdentity');
+  } on PlatformException {
+    return null;
+  } on MissingPluginException {
+    return null;
+  }
+}
 
 Future<String?> loadPairing() => channel.invokeMethod<String>('loadPairing');
 Future<void> savePairing(String? value) =>
@@ -34,6 +47,19 @@ Future<({int status, String body})> request(
     request.followRedirects = false;
     if (token.isNotEmpty) {
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    }
+    if (Platform.isIOS &&
+        url.scheme == 'https' &&
+        url.host.endsWith('.ts.net') &&
+        url.path == '/status') {
+      final phone = await (_phoneIdentity ??= _loadPhoneIdentity());
+      if (phone?['id'] case final id?) {
+        request.headers.set('X-Robot-Eyes-Phone-Id', id);
+        request.headers.set(
+          'X-Robot-Eyes-Phone-Name',
+          Uri.encodeComponent(phone?['name'] ?? 'iPhone'),
+        );
+      }
     }
     if (data != null) {
       final body = utf8.encode(jsonEncode(data));
@@ -64,6 +90,17 @@ Stream<String> modelChat(Uri url, String token, Map<String, Object> data) {
   StreamSubscription<String>? responseLines;
   var cancelled = false;
 
+  void fail(Object error, StackTrace stack) {
+    if (cancelled) return;
+    controller.addError(
+      error is TimeoutException
+          ? const FormatException('等待模型数据超时，请检查网络或模型服务。')
+          : error,
+      stack,
+    );
+    unawaited(controller.close());
+  }
+
   Future<void> pump() async {
     try {
       final request = await client
@@ -79,7 +116,7 @@ Stream<String> modelChat(Uri url, String token, Map<String, Object> data) {
       request.contentLength = body.length;
       request.add(body);
       final response = await request.close().timeout(
-        const Duration(seconds: 55),
+        modelRelayTimeout,
       );
       if (cancelled) return;
       if (response.statusCode != HttpStatus.ok) {
@@ -90,23 +127,17 @@ Stream<String> modelChat(Uri url, String token, Map<String, Object> data) {
         return;
       }
       responseLines = response
-          .timeout(const Duration(seconds: 60))
+          .timeout(modelRelayTimeout)
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen(
             controller.add,
-            onError: (Object error, StackTrace stack) {
-              controller.addError(error, stack);
-              unawaited(controller.close());
-            },
+            onError: fail,
             onDone: () => unawaited(controller.close()),
             cancelOnError: true,
           );
     } catch (error, stack) {
-      if (!cancelled) {
-        controller.addError(error, stack);
-        unawaited(controller.close());
-      }
+      fail(error, stack);
     }
   }
 

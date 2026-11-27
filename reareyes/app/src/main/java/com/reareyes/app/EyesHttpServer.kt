@@ -1,5 +1,6 @@
 package com.reareyes.app
 
+import android.content.Context
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
@@ -14,7 +15,7 @@ import java.net.URLDecoder
  * GET /ping                                            查询状态
  * GET /log                                             查看日志
  */
-class EyesHttpServer(private val port: Int) : Thread("EyesHttpServer") {
+class EyesHttpServer(private val context: Context, private val port: Int) : Thread("EyesHttpServer") {
 
     @Volatile
     private var sock: ServerSocket? = null
@@ -104,7 +105,19 @@ class EyesHttpServer(private val port: Int) : Thread("EyesHttpServer") {
                             val models = params["models"]?.takeIf { it.length <= 8192 }?.let {
                                 runCatching { EyesBus.readModelConnections(org.json.JSONArray(it)) }.getOrDefault(emptyList())
                             }.orEmpty()
-                            EyesBus.syncFromCodex(params.getValue("ticket"), state, snapshot, source, agents, models)
+                            val desktopId = params["desktopId"]
+                            val active = DesktopProfiles.active(context)
+                            val trusted = if (desktopId != null && source != null) {
+                                val desktop = DesktopProfiles.remember(context, desktopId, params["desktopName"],
+                                    lanKey = params["lanKey"]?.let(LanMcpSettings::validKey), trustedKey = true)
+                                DesktopProfiles.active(context)?.key == desktop.key
+                            } else {
+                                active == null || active.key == "legacy" ||
+                                    active.key.startsWith("remote:") || active.key.startsWith("lan:")
+                            }
+                            if (trusted) {
+                                EyesBus.syncFromCodex(params.getValue("ticket"), state, snapshot, source, agents, models)
+                            }
                             "ok sync\n"
                         } catch (_: IllegalArgumentException) {
                             status = "400 Bad Request"

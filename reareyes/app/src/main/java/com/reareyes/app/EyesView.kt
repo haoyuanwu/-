@@ -10,6 +10,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PathMeasure
 import android.graphics.RadialGradient
+import android.graphics.RectF
 import android.graphics.Shader
 import android.os.SystemClock
 import android.text.TextPaint
@@ -219,7 +220,14 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     private var currentPalette: Palette? = null
     private var eyeFillShader: RadialGradient? = null
     private var strokeShader: LinearGradient? = null
+    private var rimShader: LinearGradient? = null
+    private var browShader: LinearGradient? = null
     private val browPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val browBounds = RectF()
+    private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+    }
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -243,6 +251,31 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     )
     internal var lensAlignment = LensAlignment.load(context)
     internal var calibrationLens: Int? = null
+    private var rearChromeOnly = false
+
+    internal fun showRearChromeOnly() {
+        rearChromeOnly = true
+        background = null
+        contentDescription = null
+        isClickable = false
+    }
+
+    private fun rearLensLane(): Float {
+        if (width < height * 1.35f) return 0f
+        val cutout = rootWindowInsets?.displayCutout?.safeInsetLeft ?: 0
+        return if (cutout > 0) cutout.toFloat() else width * (296f / 976f)
+    }
+
+    internal fun rearEyeInset(): Float {
+        val lane = rearLensLane()
+        if (lane <= 0f) return 0f
+        val sx = width.toFloat() / LensAlignment.WIDTH
+        val scale = min(sx, height.toFloat() / LensAlignment.HEIGHT)
+        val upper = lensAlignment.upper
+        val lower = lensAlignment.lower
+        val ringRight = max(upper.x * sx + upper.radius * scale, lower.x * sx + lower.radius * scale)
+        return max(lane, ringRight) + height * 0.045f
+    }
 
     private val usagePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -298,6 +331,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (rearChromeOnly) return false
         val now = SystemClock.elapsedRealtime()
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -548,18 +582,18 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val week = usage?.week?.remainingPercent(now)
         val h = if (desk) min(height.toFloat(), width / (REAR_FACE_ASPECT + 0.72f)) else height.toFloat()
         val faceTop = (height - h) / 2f
-        val lensLane = if (rear && width >= h * 1.35f) {
-            val cutout = rootWindowInsets?.displayCutout?.safeInsetLeft ?: 0
-            if (cutout > 0) cutout.toFloat() else width * (296f / 976f)
-        } else 0f
-        val usageWidth = if (lensLane > 0f) {
-            val sx = width.toFloat() / LensAlignment.WIDTH
-            val scale = min(sx, h / LensAlignment.HEIGHT)
-            val upper = lensAlignment.upper
-            val lower = lensAlignment.lower
-            val ringRight = max(upper.x * sx + upper.radius * scale, lower.x * sx + lower.radius * scale)
-            max(lensLane, ringRight) + h * 0.045f
-        } else 0f
+        val lensLane = if (rear) rearLensLane() else 0f
+        val usageWidth = if (rear) rearEyeInset() else 0f
+        if (rearChromeOnly) {
+            motionEnabled = ValueAnimator.areAnimatorsEnabled()
+            if (lensLane > 0f && (five != null || week != null || calibrationLens != null)) {
+                drawUsage(canvas, h, five, week)
+            }
+            val status = EyesBus.state.let { if (it == EyeState.SLEEP && sleepSession() == null) EyeState.IDLE else it }
+            drawStatusBadges(canvas, status, time, usageWidth, h, faceTop, rear, desk)
+            postInvalidateOnAnimation()
+            return
+        }
         val faceAspect = if (desk || lensLane > 0f) REAR_FACE_ASPECT else FACE_ASPECT
         val w = min(width - usageWidth, h * faceAspect)
         val faceLeft = usageWidth + (width - usageWidth - w) / 2f
@@ -793,6 +827,16 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         canvas.restoreToCount(pose)
         drawDetails(canvas, expression, status, face.palette, time, w, h, progress)
         canvas.restoreToCount(frame)
+        drawStatusBadges(canvas, status, time, usageWidth, h, faceTop, rear, desk)
+        drawTapParticles(canvas, time)
+        if (rearNotice != null) drawRearNotice(canvas, usageWidth, rearNotice, noticeAge)
+        postInvalidateOnAnimation()
+    }
+
+    private fun drawStatusBadges(
+        canvas: Canvas, status: EyeState, time: Long, usageWidth: Float,
+        h: Float, faceTop: Float, rear: Boolean, desk: Boolean,
+    ) {
         val badgeLeft = if (rear) usageWidth else 0f
         val badgeWidth = width - badgeLeft
         val badges = statusBadges.layout(status, time, badgeWidth, h, desk, showLocalLoading = rear)
@@ -800,7 +844,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         if (badgeDescription != description) {
             badgeDescription = description
             val statusDescription = description?.let { "$it。" }.orEmpty()
-            contentDescription = "电子眼。${statusDescription}轻点让眼睛看过来，长按拖动让视线跟随手指"
+            contentDescription = if (rearChromeOnly) description
+                else "电子眼。${statusDescription}轻点让眼睛看过来，长按拖动让视线跟随手指"
         }
         if (badges != null) {
             val density = resources.displayMetrics.density
@@ -811,9 +856,6 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             }
             statusBadges.draw(canvas, badges, badgeLeft, badgeWidth, badgeY, desk, time, motionEnabled)
         }
-        drawTapParticles(canvas, time)
-        if (rearNotice != null) drawRearNotice(canvas, usageWidth, rearNotice, noticeAge)
-        postInvalidateOnAnimation()
     }
 
     private fun drawListeningBars(canvas: Canvas, time: Long, w: Float, h: Float, progress: Float) {
@@ -1050,7 +1092,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val age = time - morphStart
         val swell = if (motionEnabled) pulse(age, 760L) else 0f
         fun openEye(x: Float, y: Float, diameter: Float, height: Float, blink: Float, browY: Float,
-                            tilt: Float, arch: Float, showBrow: Boolean = true, lowerInset: Float = 0f,
+                            tilt: Float, arch: Float, lowerInset: Float = 0f,
                             cheekLift: Float = 0f): Eye {
             val visible = ((blink - 0.18f) / 0.82f).coerceIn(0f, 1f)
             // 用完整睁眼高度限制实际像素宽度。闭眼只压缩高度，不缩窄横向轮廓。
@@ -1058,7 +1100,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             return Eye(
                 Point(x, y), halfWidth, blend(0.014f, height / 2f, visible),
                 0f, lowerInset * visible, 1f,
-                visible, 0f, brow(x, browY, tilt, arch, if (showBrow) 0.024f else 0f),
+                visible, 0f, brow(x, browY, tilt, arch),
                 cheekLift * visible
             )
         }
@@ -1069,12 +1111,12 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             val y = EYE_CENTER_Y
             return when (expression) {
                 Expression.THINKING -> openEye(x, y, 0.30f, 0.405f, blink,
-                    0.175f, 0f, 0f, showBrow = false,
+                    0.175f, -side * 0.018f, 0f,
                     lowerInset = (pupilGaze.y * 2f).coerceIn(0f, 1f) * 0.022f)
                 Expression.IDLE -> openEye(x, y, 0.275f, 0.432f, blink,
-                    0.145f, 0f, 0f, showBrow = false)
+                    0.145f, -side * 0.018f, 0f)
                 Expression.IDEA -> openEye(x, y - 0.023f, 0.327f,
-                    0.515f + swell * 0.039f, 1f, 0.15f, 0f, 0f, showBrow = false)
+                    0.515f + swell * 0.039f, 1f, 0.092f, -side * 0.018f, 0f)
                 Expression.QUESTION -> {
                     val smallRight = smallEyeOnRight()
                     val smallHere = if (left) 1f - smallRight else smallRight
@@ -1089,13 +1131,13 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                     val crescent = Eye(
                         Point(x, y + 0.07f - swell * 0.037f),
                         0.148f + swell * 0.007f, 0.051f, 0.286f + swell * 0.028f, 0f, 1f, 0f, 0f,
-                        brow(x, 0.153f, 0f, 0.092f, 0f), crescent = 1f
+                        brow(x, 0.153f, 0f, 0.092f), crescent = 1f
                     )
                     val doneAge = time - donePresentedAt
                     val pop = if (motionEnabled && EyesBus.state == EyeState.DONE) smoothStep(doneAge / 105f) *
                         (1f - smoothStep((doneAge - 150L) / 290f)) else 0f
                     crescent.mix(openEye(x, y - 0.016f, 0.32f, 0.49f, 1f,
-                        0.15f, 0f, 0f, showBrow = false), pop)
+                        0.145f, -side * 0.018f, 0f), pop)
                 }
                 Expression.ERROR -> {
                     val shake = if (motionEnabled) sin(age / 26.0).toFloat() *
@@ -1108,7 +1150,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                     Eye(Point(x, y + 0.04f - breath * 0.018f),
                         0.126f + breath * 0.008f, 0.014f + breath * 0.005f,
                         -0.065f - breath * 0.019f, 0f, 1f, 0f, 0f,
-                        brow(x, 0.33f, 0f, 0.019f, 0f))
+                        brow(x, 0.33f, 0f, 0.019f, width = 0f))
                 }
                 Expression.FOCUS -> {
                     val proximity = ((pupilGaze.x * side - 0.045f) / 0.68f).coerceIn(0f, 1f)
@@ -1119,7 +1161,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                     openEye(x, y - raised - 0.055f * voice + side * 0.017f * accent,
                         (0.253f + 0.048f * voice) * (1f - near * 0.14f),
                         (0.401f + 0.145f * voice) * (1f - near * 0.24f),
-                        blink, 0.172f - raised - 0.054f * voice + near * 0.048f,
+                        blink, 0.151f - raised - 0.054f * voice + near * 0.048f,
                         -side * (0.108f - 0.068f * voice) + 0.11f * accent, 0.026f + voice * 0.043f)
                 }
                 Expression.HELLO -> {
@@ -1131,8 +1173,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
                         val hop = if (motionEnabled) pulse(age, 680L) else 0f
                         val wink = if (left && motionEnabled) 1f - 0.89f * pulse(age - 410L, 520L) else 1f
                         openEye(x, y - hop * 0.052f + if (left) 0.020f else 0f, 0.29f,
-                            if (left) 0.403f else 0.458f, wink, 0.145f - hop * 0.04f, 0f, 0.035f,
-                            showBrow = false)
+                            if (left) 0.403f else 0.458f, wink, 0.145f - hop * 0.04f,
+                            -side * 0.018f, 0.035f)
                     }
                 }
             }
@@ -1152,7 +1194,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             ease(SLEEP_PEEK_CLOSE_END - age, SLEEP_PEEK_CLOSE_DURATION)
         )
         val flatEye = closed.copy(bend = blend(closed.bend, 0f, flattening))
-        return flatEye.mix(awake.copy(halfLid = 1f), opening)
+        return flatEye.mix(awake.copy(halfLid = 1f, brow = closed.brow), opening)
     }
 
     private fun pulse(age: Long, duration: Long): Float =
@@ -1240,34 +1282,49 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             drawEyeHalo(canvas, silhouette, eyeFillShader, h)
             canvas.drawPath(silhouette, fillPaint)
 
+            val frame = canvas.save()
+            canvas.clipPath(silhouette)
+            matrix.setScale(1f, 2f * ry)
+            matrix.postTranslate(0f, cy - ry)
+            rimShader?.setLocalMatrix(matrix)
+            rimPaint.shader = rimShader
+            rimPaint.strokeWidth = min(h * 0.012f, ry * 0.22f)
+            canvas.drawPath(silhouette, rimPaint)
             if (eye.pupil > 0.04f) {
-                val frame = canvas.save()
-                canvas.clipPath(silhouette)
                 canvas.translate(gaze.x * rx * 0.24f, gaze.y * ry * 0.22f)
                 val codeBlend = if (codeAge == null) 0f else {
                     (min(codeAge, THINK_CODE_DURATION - codeAge).toFloat() / CODE_TRANSITION_DURATION)
                         .coerceIn(0f, 1f)
                 }
                 if (codeBlend < 1f) {
+                    val intensity = eye.pupil * (1f - codeBlend)
+                    val tint = currentPalette?.top ?: Color.WHITE
                     val normal = canvas.save()
                     canvas.scale(PUPIL_SCALE, PUPIL_SCALE, cx, cy)
                     // 一层层叠亮同一轮廓，让瞳光从柔和的边缘过渡到白色中心。
-                    pupilPaint.color = Color.WHITE
                     for ((index, alpha) in glowStops.withIndex()) {
                         val t = index.toFloat() / glowStops.lastIndex
                         val layer = canvas.save()
                         canvas.scale(blend(0.995f, 0.69f, t), blend(0.99f, 0.65f, t), cx, cy)
-                        pupilPaint.alpha = (alpha * eye.pupil * (1f - codeBlend)).toInt()
+                        pupilPaint.color = mixColor(tint, Color.WHITE, 0.42f + 0.58f * t)
+                        pupilPaint.alpha = (alpha * intensity).toInt()
                         canvas.drawPath(silhouette, pupilPaint)
                         canvas.restoreToCount(layer)
                     }
                     canvas.restoreToCount(normal)
+                    pupilPaint.color = Color.WHITE
+                    pupilPaint.alpha = (172f * intensity).toInt()
+                    canvas.drawOval(cx - rx * 0.41f, cy - ry * 0.4525f,
+                        cx - rx * 0.05f, cy - ry * 0.3475f, pupilPaint)
+                    pupilPaint.alpha = (108f * intensity).toInt()
+                    canvas.drawCircle(cx + rx * 0.045f, cy - ry * 0.40f,
+                        min(rx, ry) * 0.047f, pupilPaint)
                 }
                 if (codeAge != null && codeBlend > 0f) {
                     drawCodePupil(canvas, cx, cy, rx * PUPIL_SCALE, ry * PUPIL_SCALE, codeAge, codeBlend)
                 }
-                canvas.restoreToCount(frame)
             }
+            canvas.restoreToCount(frame)
         }
         if (eye.cross > 0.001f) {
             val x = eye.center.x
@@ -1352,6 +1409,17 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val stops = floatArrayOf(0f, 0.52f, 1f)
         eyeFillShader = RadialGradient(0f, 0f, 1f, colors, stops, Shader.TileMode.CLAMP)
         strokeShader = LinearGradient(0f, 0f, 0.85f, 1f, colors, stops, Shader.TileMode.CLAMP)
+        val detailStops = floatArrayOf(0f, 0.48f, 1f)
+        rimShader = LinearGradient(0f, 0f, 0f, 1f, intArrayOf(
+            withAlpha(mixColor(palette.top, Color.WHITE, 0.65f), 177),
+            withAlpha(palette.top, 48),
+            withAlpha(mixColor(palette.bottom, Color.BLACK, 0.50f), 150)
+        ), detailStops, Shader.TileMode.CLAMP)
+        browShader = LinearGradient(0f, 0f, 0f, 1f, intArrayOf(
+            withAlpha(mixColor(palette.top, Color.WHITE, 0.22f), 244),
+            withAlpha(mixColor(palette.top, palette.middle, 0.60f), 232),
+            withAlpha(mixColor(palette.middle, palette.bottom, 0.64f), 214)
+        ), detailStops, Shader.TileMode.CLAMP)
     }
 
     private fun drawEyeHalo(canvas: Canvas, contour: Path, shader: Shader?, h: Float,
@@ -1372,8 +1440,6 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         val control = brow.control
         val end = brow.end
         val thickness = brow.width * h
-        val outerRadius = thickness * 0.32f
-        val innerRadius = thickness * 0.72f
         val segments = 16
         path.rewind()
 
@@ -1381,7 +1447,8 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         fun edge(index: Int, side: Float): Point {
             val t = index.toFloat() / segments
             val inner = if (innerAtEnd) t else 1f - t
-            val radius = blend(outerRadius, innerRadius, inner) * side
+            val radius = (blend(0.24f, 0.58f, inner) + 0.15f * sin(PI.toFloat() * inner)) *
+                thickness * side
             val a = start.mix(control, t)
             val b = control.mix(end, t)
             val center = a.mix(b, t)
@@ -1423,9 +1490,12 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
         matrix.postTranslate(left - thickness / 2f, top - thickness / 2f)
         strokeShader?.setLocalMatrix(matrix)
         val strength = (brow.width / 0.024f).coerceIn(0f, 1f)
-        drawEyeHalo(canvas, path, strokeShader, h * 0.70f, strength = strength * 0.85f)
-        browPaint.shader = strokeShader
-        browPaint.alpha = 207
+        drawEyeHalo(canvas, path, strokeShader, h * 0.54f, strength = strength * 0.61f)
+        path.computeBounds(browBounds, true)
+        matrix.setScale(1f, browBounds.height())
+        matrix.postTranslate(0f, browBounds.top)
+        browShader?.setLocalMatrix(matrix)
+        browPaint.shader = browShader
         canvas.drawPath(path, browPaint)
     }
 
@@ -1600,6 +1670,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             return t * t * (3f - 2f * t)
         }
         private fun palette(a: Int, b: Int, c: Int) = Palette(a or Color.BLACK, b or Color.BLACK, c or Color.BLACK)
+        private fun withAlpha(color: Int, alpha: Int) = (color and 0xFFFFFF) or (alpha shl 24)
         private fun mixColor(from: Int, to: Int, t: Float) = Color.rgb(
             blend(Color.red(from).toFloat(), Color.red(to).toFloat(), t).toInt(),
             blend(Color.green(from).toFloat(), Color.green(to).toFloat(), t).toInt(),
@@ -1613,6 +1684,7 @@ class EyesView(context: Context, private val display: Presentation = Presentatio
             curve(x1, y1, (x1 + x2) / 2f, (y1 + y2) / 2f, x2, y2, width)
 
         private fun brow(x: Float, y: Float, tilt: Float, arch: Float, width: Float = 0.024f) =
-            curve(x - 0.077f, y - tilt / 2f, x, y - arch, x + 0.077f, y + tilt / 2f, width)
+            curve(x - 0.077f, y - tilt / 2f, x, y - max(0.046f, arch),
+                x + 0.077f, y + tilt / 2f, width)
     }
 }

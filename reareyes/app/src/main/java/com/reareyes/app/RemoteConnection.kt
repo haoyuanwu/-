@@ -1,15 +1,18 @@
 package com.reareyes.app
 
 import android.content.Context
+import android.net.Uri
+import android.os.Build
 import org.json.JSONObject
 import java.io.IOException
 import java.net.URI
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.HttpsURLConnection
 
 internal object RemoteConnection {
-    data class Pairing(val url: String, val token: String)
+    data class Pairing(val url: String, val token: String, val desktopId: String? = null, val desktopName: String? = null)
     data class Feedback(val updatedAt: Long? = null, val state: EyeState? = null, val error: String? = null)
 
     private val tokenPattern = Regex("[A-Za-z0-9_-]{43}")
@@ -20,6 +23,7 @@ internal object RemoteConnection {
     @Volatile
     var feedback = Feedback()
         private set
+    private var lanAttemptAt = 0L
 
     fun screenStarted() { visibleScreens++ }
     fun screenStopped() { visibleScreens-- }
@@ -33,8 +37,12 @@ internal object RemoteConnection {
             (uri.port == -1 || uri.port in 1..65535) && uri.path in listOf("", "/"))
         val token = value.getString("token")
         require(tokenPattern.matches(token))
-        return Pairing(uri.toASCIIString().trimEnd('/'), token)
+        return Pairing(uri.toASCIIString().trimEnd('/'), token,
+            value.optString("desktopId").ifBlank { null }, value.optString("desktopName").ifBlank { null })
     }
+
+    fun json(pairing: Pairing): JSONObject = JSONObject().put("url", pairing.url).put("token", pairing.token)
+        .put("desktopId", pairing.desktopId).put("desktopName", pairing.desktopName)
 
     fun load(context: Context): Pairing? {
         val raw = context.getSharedPreferences(prefs, Context.MODE_PRIVATE).getString("pairing", null)
@@ -45,17 +53,17 @@ internal object RemoteConnection {
         }
     }
 
-    @Synchronized
     fun saveFromUsb(context: Context, pairing: Pairing) {
-        if (load(context) != pairing) save(context, pairing)
+        DesktopProfiles.remember(context, pairing.desktopId, pairing.desktopName, remote = pairing)
     }
 
     @Synchronized
     fun save(context: Context, pairing: Pairing?) {
-        val raw = pairing?.let { JSONObject().put("url", it.url).put("token", it.token).toString() }
+        val raw = pairing?.let { json(it).toString() }
         context.getSharedPreferences(prefs, Context.MODE_PRIVATE)
             .edit().putString("pairing", raw).apply()
         feedback = Feedback()
+        lanAttemptAt = 0L
         EyesBus.clearDesktopSnapshot(EyesBus.Transport.TAILSCALE)
     }
 
@@ -68,7 +76,13 @@ internal object RemoteConnection {
     private fun refresh(context: Context, pairing: Pairing) {
         try {
             val ticket = EyesBus.syncTicket
-            val snapshot = request(pairing, "/status")
+            val snapshot = request(pairing, "/status", phoneId = phoneId(context))
+            if (load(context) == pairing) {
+                val desktop = DesktopProfiles.remember(context, snapshot.optString("desktopId"),
+                    snapshot.optString("desktopName"), remote = pairing,
+                    lanKey = LanMcpSettings.validKey(snapshot.optString("lanKey")), trustedKey = true)
+                if (DesktopProfiles.active(context)?.key != desktop.key) return
+            }
             val state = EyeState.valueOf(snapshot.getString("state"))
             fun usage(name: String): EyesBus.UsageWindow? {
                 val used = snapshot.optInt(name, -1)
@@ -84,12 +98,30 @@ internal object RemoteConnection {
                     feedback = Feedback(updatedAt = System.currentTimeMillis(), state = state)
                 }
             }
+            offerLan(context, pairing)
         } catch (error: Exception) {
             synchronized(this) {
                 if (load(context) == pairing && !Thread.currentThread().isInterrupted) {
                     feedback = feedback.copy(error = describe(error))
                 }
             }
+        }
+    }
+
+    private fun offerLan(context: Context, pairing: Pairing) {
+        if (LanMcpSettings.settingsReady(context)) return
+        val address = LanMcpSettings.endpoints(context).firstOrNull()?.let { URI(it).host } ?: return
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(this) {
+            if (load(context) != pairing || (lanAttemptAt != 0L && now - lanAttemptAt < 30_000L)) return
+            lanAttemptAt = now
+        }
+        try {
+            request(pairing, "/lan/pair", JSONObject().put("address", address)
+                .put("token", LanMcpSettings.token(context)).put("phoneKey", LanMcpSettings.publicKey(context))
+                .put("phoneName", Build.MODEL))
+        } catch (_: Exception) {
+            // Older desktop versions can keep using Tailscale.
         }
     }
 
@@ -107,7 +139,16 @@ internal object RemoteConnection {
         else -> "连接失败，请检查 Tailscale 和电脑服务。"
     }
 
-    private fun request(pairing: Pairing, path: String, body: JSONObject? = null): JSONObject {
+    @Synchronized
+    private fun phoneId(context: Context): String {
+        val settings = context.getSharedPreferences(prefs, Context.MODE_PRIVATE)
+        return settings.getString("phoneId", null) ?: UUID.randomUUID().toString().also {
+            settings.edit().putString("phoneId", it).apply()
+        }
+    }
+
+    private fun request(pairing: Pairing, path: String, body: JSONObject? = null,
+                        phoneId: String? = null): JSONObject {
         val connection = URI(pairing.url + path).toURL().openConnection() as HttpsURLConnection
         try {
             connection.connectTimeout = 4000
@@ -115,6 +156,10 @@ internal object RemoteConnection {
             connection.instanceFollowRedirects = false
             connection.useCaches = false
             connection.setRequestProperty("Authorization", "Bearer " + pairing.token)
+            if (phoneId != null) {
+                connection.setRequestProperty("X-Robot-Eyes-Phone-Id", phoneId)
+                connection.setRequestProperty("X-Robot-Eyes-Phone-Name", Uri.encode(Build.MODEL))
+            }
             if (body != null) {
                 val bytes = body.toString().toByteArray(Charsets.UTF_8)
                 connection.requestMethod = "POST"

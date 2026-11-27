@@ -60,24 +60,13 @@ class ReplyPreview extends StatelessWidget {
             fontSize: 14,
             height: 1.32,
           );
-          var excerpt = text.isEmpty ? '正在思考…' : text;
-          if (reply.isNotEmpty && (interaction.generating || speaking)) {
-            final lines = TextPainter(
-              text: TextSpan(text: excerpt, style: style),
-              textDirection: Directionality.of(context),
-              textScaler: MediaQuery.textScalerOf(context),
-            )..layout(maxWidth: constraints.maxWidth);
-            final metrics = lines.computeLineMetrics();
-            if (metrics.length > 2) {
-              final line = metrics[metrics.length - 2];
-              final offset = Offset(0, line.baseline - line.ascent / 2);
-              final start = lines
-                  .getLineBoundary(lines.getPositionForOffset(offset))
-                  .start;
-              excerpt = excerpt.substring(start);
-            }
-            lines.dispose();
-          }
+          final excerpt = replyExcerpt(
+            context,
+            text.isEmpty ? '正在思考…' : text,
+            style,
+            constraints.maxWidth,
+            tail: reply.isNotEmpty && (interaction.generating || speaking),
+          );
           return Text(
             excerpt,
             maxLines: 2,
@@ -87,6 +76,32 @@ class ReplyPreview extends StatelessWidget {
         },
       ),
     );
+  }
+}
+
+String replyExcerpt(
+  BuildContext context,
+  String text,
+  TextStyle style,
+  double width, {
+  required bool tail,
+}) {
+  if (!tail || text.isEmpty) return text;
+  final layout = TextPainter(
+    text: TextSpan(text: text, style: style),
+    textDirection: Directionality.of(context),
+    textScaler: MediaQuery.textScalerOf(context),
+  )..layout(maxWidth: width);
+  try {
+    final lines = layout.computeLineMetrics();
+    if (lines.length <= 2) return text;
+    final line = lines[lines.length - 2];
+    final offset = Offset(0, line.baseline - line.ascent / 2);
+    return text.substring(
+      layout.getLineBoundary(layout.getPositionForOffset(offset)).start,
+    );
+  } finally {
+    layout.dispose();
   }
 }
 

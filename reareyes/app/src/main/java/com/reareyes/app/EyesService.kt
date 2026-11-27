@@ -47,25 +47,19 @@ class EyesService : Service() {
         }
 
         remotePolling = RemoteConnection.startPolling(applicationContext)
-        server = EyesHttpServer(PORT).also { it.start() }
+        server = EyesHttpServer(applicationContext, PORT).also { it.start() }
         handler.postDelayed(idleCheck, 2000)
         EyesBus.log("service started")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (LanMcpSettings.enabled(this)) {
-            if (mcpServer == null) {
-                try {
-                    mcpServer = LanMcpServer(this).also { it.start() }
-                    EyesBus.log("局域网 MCP 已启动")
-                } catch (_: IOException) {
-                    EyesBus.log("局域网 MCP 启动失败，请检查端口 ${LanMcpSettings.PORT} 是否被占用")
-                }
+        if (mcpServer == null) {
+            try {
+                mcpServer = LanMcpServer(this).also { it.start() }
+                EyesBus.log("手机局域网服务已启动")
+            } catch (_: IOException) {
+                EyesBus.log("手机局域网服务启动失败，请检查端口 ${LanMcpSettings.PORT} 是否被占用")
             }
-        } else {
-            mcpServer?.shutdown()
-            mcpServer = null
-            EyesBus.clearAgentStates()
         }
         return START_STICKY
     }

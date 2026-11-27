@@ -167,7 +167,6 @@ class ModelConnections {
       <HttpClient, StreamIterator<({String text, bool thinking})>>{};
   final _cancelled = <HttpClient>{};
   String? loadError;
-  static const _timeout = Duration(seconds: 45);
   static const _maxBody = 96 * 1024;
   static final _requestId = RegExp(r'^[a-zA-Z0-9_-]{1,64}$');
 
@@ -712,7 +711,7 @@ class ModelConnections {
         }
         return;
       }
-      final request = await client.postUrl(profile.endpoint).timeout(_timeout);
+      final request = await client.postUrl(profile.endpoint).timeout(const Duration(seconds: 8));
       request.followRedirects = false;
       request.headers.contentType = ContentType.json;
       request.headers.set(HttpHeaders.acceptHeader, 'text/event-stream');
@@ -729,7 +728,7 @@ class ModelConnections {
           'stream': true,
         }),
       );
-      final response = await request.close().timeout(_timeout);
+      final response = await request.close().timeout(modelResponseTimeout);
       if (response.statusCode != HttpStatus.ok) {
         throw ModelFailure(switch (response.statusCode) {
           401 || 403 => '模型服务拒绝访问，请检查密钥。',
@@ -739,10 +738,8 @@ class ModelConnections {
         });
       }
       var size = 0;
-      var receivedText = false;
-      var finished = false;
       final lines = response
-          .timeout(_timeout)
+          .timeout(modelResponseTimeout)
           .map((chunk) {
             size += chunk.length;
             if (size > 2 * 1024 * 1024) {
@@ -752,39 +749,13 @@ class ModelConnections {
           })
           .transform(utf8.decoder)
           .transform(const LineSplitter());
-      await for (final line in lines) {
-        if (!line.startsWith('data:')) continue;
-        final data = line.substring(5).trim();
-        if (data == '[DONE]') {
-          finished = true;
-          break;
-        }
-        if (data.isEmpty) continue;
-        final value = jsonDecode(data);
-        if (value is Map && value['error'] != null) {
-          throw const ModelFailure('模型服务返回错误。');
-        }
-        final choices = value is Map ? value['choices'] : null;
-        final choice = choices is List ? choices.firstOrNull : null;
-        if (choice is! Map) continue;
-        finished = finished || choice['finish_reason'] != null;
-        final delta = choice['delta'];
-        final text = delta is Map ? delta['content'] : null;
-        final reasoning = delta is Map
-            ? delta['reasoning_content'] ?? delta['reasoning']
-            : null;
-        if (reasoning is String && reasoning.isNotEmpty) {
-          yield (text: reasoning, thinking: true);
-        }
-        if (text is String && text.isNotEmpty) {
-          receivedText = true;
-          yield (text: text, thinking: false);
-        }
+      await for (final chunk in readChatCompletion(lines)) {
+        yield chunk;
       }
-      if (!receivedText) throw const ModelFailure('模型未返回可显示的文字。');
-      if (!finished) throw const ModelFailure('模型连接在回复完成前中断。');
+    } on ChatCompletionFailure catch (error) {
+      throw ModelFailure(error.message);
     } on TimeoutException {
-      throw const ModelFailure('等待模型回复超时。');
+      throw const ModelFailure('模型服务连续 120 秒未返回数据，已停止等待。');
     } on IOException {
       throw const ModelFailure('无法连接模型服务。');
     } on StateError {

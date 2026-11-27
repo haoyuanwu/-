@@ -39,6 +39,82 @@ class _CatalogOverrides extends HttpOverrides {
 }
 
 void main() {
+  test('desktop relay normalizes reasoning and compatible reply formats', () async {
+    final directory = await Directory.systemTemp.createTemp('model-stream-');
+    addTearDown(() => directory.delete(recursive: true));
+    final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => upstream.close(force: true));
+    var scenario = 0;
+    upstream.listen((request) async {
+      await request.drain<void>();
+      final reply = request.response;
+      if (scenario == 1) {
+        reply.headers.contentType = ContentType.json;
+        reply.write('{"choices":[{"message":{"content":"完整 JSON 正文"},'
+            '"finish_reason":"stop"}]}');
+      } else {
+        reply.headers.contentType = ContentType('text', 'event-stream', charset: 'utf-8');
+        reply.writeln('data: {"choices":[{"delta":{"reasoning_content":"先检查"}}]}');
+        reply.writeln('data: {"choices":[{"delta":{"reasoning_content":"先检查，再回答"}}]}');
+        if (scenario == 2) {
+          reply.writeln('data: {"choices":[{"delta":{},"finish_reason":"length"}]}');
+        } else {
+          reply.writeln('data: {"choices":[{"delta":{"content":'
+              '[{"type":"text","text":"<think>先检查，再回答</think>正式正文"}]}}]}');
+        }
+        reply.writeln('data: [DONE]');
+      }
+      await reply.close();
+    });
+
+    final models = ModelConnections(directory);
+    addTearDown(models.stop);
+    models.save(ModelProfile(
+      id: 'fixture',
+      name: 'Fixture',
+      address: 'http://127.0.0.1:${upstream.port}/v1',
+      model: 'fixture',
+      apiKey: '',
+      kind: 'local',
+    ));
+    final relay = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => relay.close(force: true));
+    relay.listen((request) async {
+      await models.chat(request);
+      await request.response.close();
+    });
+    final client = HttpClient();
+    addTearDown(() => client.close(force: true));
+    Future<List<dynamic>> request() async {
+      final req = await client.post('127.0.0.1', relay.port, '/ai/chat');
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode({
+        'model': 'fixture',
+        'includeReasoning': true,
+        'messages': [{'role': 'user', 'content': '测试'}],
+      }));
+      return (await req.close())
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .map(jsonDecode)
+          .toList();
+    }
+
+    expect(await request(), [
+      {'reasoning': '先检查'},
+      {'reasoning': '，再回答'},
+      {'text': '正式正文'},
+      {'done': true},
+    ]);
+    scenario = 1;
+    expect(await request(), [
+      {'text': '完整 JSON 正文'},
+      {'done': true},
+    ]);
+    scenario = 2;
+    expect((await request()).last, containsPair('error', contains('输出长度上限')));
+  });
+
   test(
     'local service discovers and remembers Ollama-compatible model IDs',
     () async {

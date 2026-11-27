@@ -43,6 +43,15 @@ import rikka.shizuku.Shizuku
  */
 class MainActivity : Activity() {
 
+    internal interface RearEyeFactory {
+        fun createRearEyes(activity: Activity, chrome: EyesView): RearEyeSurface
+    }
+
+    internal interface RearEyeSurface {
+        val view: android.view.View
+        fun close()
+    }
+
     companion object {
         private const val REAR_DISPLAY_ID = 1
         private const val SHIZUKU_REQUEST = 2
@@ -81,7 +90,8 @@ class MainActivity : Activity() {
         val connected = EyesBus.connectedTransports()
         transportLabels.forEach { (source, label) ->
             val status = when (source) {
-                connected.firstOrNull() -> "同步中"
+                connected.firstOrNull() -> if (pendingSync != null && pendingSync != EyesBus.syncedTicket)
+                    "同步中" else "已连接"
                 in connected -> "已连接"
                 EyesBus.Transport.TAILSCALE ->
                     if (RemoteConnection.load(this) == null) "未配对" else "未连接"
@@ -146,6 +156,7 @@ class MainActivity : Activity() {
     }
     private var rearRoot: FrameLayout? = null
     private var rearEyes: EyesView? = null
+    private var sharedRearEyes: RearEyeSurface? = null
     private val rearPreferences by lazy { RearDisplaySettings.preferences(this) }
     private val rearSettingsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         if (showingRear && isOnRearDisplay()) applyRearDisplayPower(true)
@@ -240,6 +251,7 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(rearLaunchTimeout)
         if (rearOnly) window.decorView.viewTreeObserver.removeOnPreDrawListener(rearDisplayPreDraw)
         if (rearSurface?.get() === rearEyes) rearSurface = null
+        sharedRearEyes?.close()
         Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
         super.onDestroy()
     }
@@ -289,7 +301,9 @@ class MainActivity : Activity() {
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        if (!showingRear || !isOnRearDisplay()) return super.dispatchTouchEvent(event)
+        if (!showingRear || sharedRearEyes != null || !isOnRearDisplay()) {
+            return super.dispatchTouchEvent(event)
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> rearPress = RearTouch(event.x, event.y, event.eventTime)
             MotionEvent.ACTION_MOVE -> {
@@ -426,6 +440,8 @@ class MainActivity : Activity() {
             return
         }
         if (EyesBus.onCalibrate === calibrationListener) EyesBus.onCalibrate = null
+        sharedRearEyes?.close()
+        sharedRearEyes = null
         rearRoot = null
         if (rearSurface?.get() === rearEyes) rearSurface = null
         rearEyes = null
@@ -447,6 +463,14 @@ class MainActivity : Activity() {
             val eyes = EyesView(this, EyesView.Presentation.REAR)
             val root = FrameLayout(this).apply {
                 setBackgroundColor(Color.BLACK)
+            }
+            (application as? RearEyeFactory)?.let { factory ->
+                eyes.showRearChromeOnly()
+                sharedRearEyes = factory.createRearEyes(this, eyes).also { surface ->
+                    root.addView(surface.view, FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+                    ))
+                }
             }
             root.addView(eyes, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
@@ -758,7 +782,7 @@ class MainActivity : Activity() {
             .setNegativeButton("取消", null)
             .apply {
                 if (RemoteConnection.load(this@MainActivity) != null) {
-                    setNeutralButton("解除配对") { _, _ -> RemoteConnection.save(this@MainActivity, null) }
+                    setNeutralButton("解除配对") { _, _ -> DesktopProfiles.clearRemote(this@MainActivity) }
                 }
             }
             .create()
@@ -770,7 +794,7 @@ class MainActivity : Activity() {
                 input.error = "请粘贴完整的配对配置。"
                 return@setOnClickListener
             }
-            RemoteConnection.save(this, pairing)
+            DesktopProfiles.remember(this, pairing.desktopId, pairing.desktopName, remote = pairing, select = true)
             dialog.dismiss()
             showRemoteConnection()
         }

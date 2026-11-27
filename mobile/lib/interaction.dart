@@ -7,7 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:robot_eyes_models/robot_eyes_models.dart';
 
-import 'chat_reasoning.dart';
+import 'notice_queue.dart';
 import 'offline_voice.dart';
 import 'phone_model.dart';
 import 'remote.dart';
@@ -31,6 +31,19 @@ typedef PhoneNotice = ({
   String? eventKey,
   String? packageName,
 });
+
+String? _noticeSource(PhoneNotice notice) =>
+    notice.verification ? null : notice.packageName ?? notice.source;
+
+class _NoticeSpeech {
+  _NoticeSpeech(PhoneNotice notice, this.text, {required this.ready})
+    : items = [notice];
+
+  final List<PhoneNotice> items;
+  PhoneNotice get latest => items.last;
+  String? text;
+  bool ready;
+}
 
 const _verificationLabel =
     r'验证码|驗證碼|校验码|認証コード|인증번호|동적\s*코드|\bOTP\b|'
@@ -78,7 +91,13 @@ class NoticeChoice {
 }
 
 class RobotInteraction extends ChangeNotifier {
-  RobotInteraction(this.remote, this.pairing);
+  RobotInteraction(
+    this.remote,
+    this.pairing, {
+    this.lanPairing,
+    this.settingsLan,
+    this.desktopKey,
+  });
 
   static const bridge = MethodChannel('com.reareyes/interaction');
   static const events = EventChannel('com.reareyes/interactionEvents');
@@ -87,6 +106,11 @@ class RobotInteraction extends ChangeNotifier {
 
   final RemoteClient remote;
   final Pairing? Function() pairing;
+  final Pairing? Function()? lanPairing;
+  final Pairing? Function()? settingsLan;
+  final String? Function()? desktopKey;
+  Pairing? get _modelConnection => lanPairing?.call() ?? pairing();
+  Pairing? get _settingsConnection => settingsLan?.call() ?? pairing();
   final _offlineVoice = OfflineVoice();
   AudioPlayer? _voicePlayer;
   StreamSubscription<void>? _voiceCompletion;
@@ -106,20 +130,34 @@ class RobotInteraction extends ChangeNotifier {
   StreamSubscription<ChatChunk>? _answer;
   final _recentTurns = <ChatTurn>[];
   bool _replyCompleted = false;
+  (String?, String)? _dismissedDeskReply;
+
+  bool get deskReplyDismissed =>
+      _dismissedDeskReply == (turnId, turnId == null ? reply : '');
+
+  void dismissDeskReply(String? turn, String reply) {
+    _dismissedDeskReply = (turn, turn == null ? reply : '');
+  }
+
   String? turnId;
   ({Pairing pairing, String id})? _activeRequest;
-  ({PhoneNotice notice, bool initial, String speech})? _unshownNotice;
-  Timer? _noticeTimer;
+  final _unshownNotices =
+      Queue<({PhoneNotice notice, bool initial, String speech, int? receivedAt})>();
+  int? _lastNoticeAt;
+  final noticeQueue = NoticeQueue<PhoneNotice>();
+  Timer? _expressionTimer;
   Timer? _noticeReactionTimer;
   Timer? _speakingTimer;
   Timer? _recordingDeadline;
   Timer? _minimumRecording;
+  Timer? _errorTimer;
   String _earlyTranscript = '';
   bool get _recordingTooShort => _minimumRecording?.isActive ?? true;
   bool _disposed = false;
   bool _initialized = false;
   bool _foreground = true;
   bool _speechPending = false;
+  bool _speechPlaying = false;
   bool _speakingNotice = false;
   String? _speechId;
   int _nextSpeechId = 0;
@@ -136,6 +174,7 @@ class RobotInteraction extends ChangeNotifier {
   bool _sendAfterRecording = false;
   bool _preparingSend = false;
   String? _retryInput;
+  bool _retryFromVoice = false;
   bool _settingsLoaded = false;
   Future<void>? _phoneSyncTask;
   bool _phoneSyncQueued = false;
@@ -176,7 +215,8 @@ class RobotInteraction extends ChangeNotifier {
   String _previousDraft = '';
   String? _activityState;
   String? _historyTarget;
-  ({PhoneNotice notice, String? text})? _pendingNotice;
+  final _pendingNotices = Queue<_NoticeSpeech>();
+  Timer? _noticeSpeechTimer;
   bool _readingNoticeCode = false;
   EyeMood? _expression;
 
@@ -213,12 +253,33 @@ class RobotInteraction extends ChangeNotifier {
   String reasoning = '';
   String? replyModel;
   String? spokenText;
-  String? error;
+  String? _error;
   String? modelError;
   String? sharedText;
-  PhoneNotice? notice;
+  PhoneNotice? get notice => noticeQueue.latest;
+
+  set notice(PhoneNotice? item) {
+    noticeQueue.clear();
+    if (item != null) noticeQueue.add(item);
+  }
+
+  String? get error => _error;
+  set error(String? message) => _setError(message);
+
+  void _setError(String? message, {bool temporary = false}) {
+    _errorTimer?.cancel();
+    _errorTimer = null;
+    _error = message;
+    if (temporary && message != null) {
+      _errorTimer = Timer(const Duration(seconds: 4), () {
+        error = null;
+        notifyListeners();
+      });
+    }
+  }
 
   String? get spokenReply => _speakingNotice ? null : spokenText;
+  bool get speechPlaying => _speechPlaying;
 
   bool get nativeEnabled => _initialized;
   bool get speechEnabled => _speechEnabled;
@@ -238,9 +299,9 @@ class RobotInteraction extends ChangeNotifier {
   bool get conversationActive => listening || generating || spokenReply != null;
   bool get startingRecording => listening && _minimumRecording == null;
   bool get finishingRecording => _recordingDeadline != null;
-  bool get canRetryReply => error != null && _retryInput == draft.trim();
+  bool get canRetryReply => _retryInput == draft.trim();
   bool get phoneModelSyncing => _phoneSyncTask != null;
-  bool get canSyncPhoneModel => _settingsLoaded && pairing() != null;
+  bool get canSyncPhoneModel => _settingsLoaded && _settingsConnection != null;
   bool get needsDesktopCatalogUpdate =>
       _phoneSyncConnected && _phoneCatalogRevision == null;
   String? get phoneModelSyncLabel => !canSyncPhoneModel
@@ -537,24 +598,26 @@ class RobotInteraction extends ChangeNotifier {
           _seenEvents.clear();
           _saveRecentNotices();
         }
-        _pendingNotice = null;
-        _unshownNotice = null;
+        _clearPendingNotices();
+        _unshownNotices.clear();
         clearNotice();
       }
     }
     final pending = await _invoke<List<dynamic>>('pendingEvents');
     if (!_disposed) {
-      if (_unshownNotice case final deferred? when _foreground) {
-        _unshownNotice = null;
+      while (_foreground && _unshownNotices.isNotEmpty) {
+        final deferred = _unshownNotices.removeFirst();
         _showNotice(
           deferred.notice,
           initial: deferred.initial,
           speech: deferred.speech,
+          receivedAt: deferred.receivedAt,
         );
       }
       for (final event in pending ?? const []) {
         _handleEvent(event);
       }
+      _queueNotice();
       notifyListeners();
     }
   }
@@ -568,6 +631,21 @@ class RobotInteraction extends ChangeNotifier {
 
   Future<void> openNotificationSettings() =>
       _invoke<void>('openNotificationSettings');
+
+  bool canOpenNoticeApp(PhoneNotice item) =>
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.android &&
+      item.packageName?.isNotEmpty == true;
+
+  Future<String?> openNoticeApp(PhoneNotice item, {bool withShortcut = true}) =>
+      _invoke<String>('openNoticeApp', {
+        'id': item.id,
+        'package': item.packageName,
+        'withShortcut': withShortcut,
+      });
+
+  Future<bool> openNoticeOverlaySettings() async =>
+      await _invoke<bool>('openNoticeOverlaySettings') ?? false;
 
   Future<String?> noticeCode(PhoneNotice item) async {
     if (!item.verification || item.id == null) return null;
@@ -588,11 +666,11 @@ class RobotInteraction extends ChangeNotifier {
   Future<void> fetchModels() async {
     if (modelSource != ModelSource.desktop) return;
     final scope = ++_catalog;
-    final connection = pairing();
+    final connection = _modelConnection;
     if (connection == null) {
       models = const [];
       loading = false;
-      modelError = '请先配对运行 Robot Eyes 的电脑。';
+      modelError = '请先连接或配对运行 Robot Eyes 的电脑。';
       notifyListeners();
       return;
     }
@@ -605,7 +683,11 @@ class RobotInteraction extends ChangeNotifier {
       models = result;
       if (result.isEmpty) modelError = '请在电脑的「模型连接」添加模型。';
     } catch (_) {
-      if (scope == _catalog) modelError = '无法读取电脑模型，请检查配对和桌面服务。';
+      if (scope == _catalog) {
+        modelError = connection.url.scheme == 'http'
+            ? '无法读取电脑模型，请在首页重连局域网。'
+            : '无法读取电脑模型，请检查配对和桌面服务。';
+      }
     } finally {
       if (scope == _catalog) {
         loading = false;
@@ -712,7 +794,7 @@ class RobotInteraction extends ChangeNotifier {
       try {
         do {
           _phoneSyncQueued = false;
-          final connection = pairing();
+          final connection = _settingsConnection;
           if (_disposed || connection == null) break;
           await _exchangePhoneModel(connection);
         } while (_phoneSyncQueued);
@@ -725,7 +807,15 @@ class RobotInteraction extends ChangeNotifier {
 
   Future<void> _exchangePhoneModel(Pairing connection) async {
     try {
-      final owner = connection.url.toString();
+      final desktop = desktopKey?.call();
+      final owner = desktop ?? connection.url.toString();
+      if (desktop != null &&
+          _phoneSyncOwner != null &&
+          (_phoneSyncOwner == pairing()?.url.toString() ||
+              _phoneSyncOwner == lanPairing?.call()?.url.toString())) {
+        _phoneSyncOwner = desktop;
+        _saveSettings();
+      }
       if (_phoneSyncId == null || owner != _phoneSyncOwner) {
         final firstPairing = _phoneSyncOwner == null;
         _phoneSyncId ??= RemoteClient.messageId();
@@ -767,7 +857,9 @@ class RobotInteraction extends ChangeNotifier {
           'key': direct.key,
         },
       });
-      if (_disposed || pairing()?.encode() != connection.encode()) return;
+      if (_disposed || _settingsConnection?.encode() != connection.encode()) {
+        return;
+      }
       if (_phoneSyncEdit != edit) {
         _phoneSyncQueued = true;
         return;
@@ -852,7 +944,7 @@ class RobotInteraction extends ChangeNotifier {
         notifyListeners();
       }
     } catch (error) {
-      if (!_disposed && pairing()?.encode() == connection.encode()) {
+      if (!_disposed && _settingsConnection?.encode() == connection.encode()) {
         _phoneSyncConnected = false;
         phoneModelSyncError = switch (error) {
           RemoteFailure(status: 404) => '桌面端未提供模型同步，请更新并重启桌面端。',
@@ -970,7 +1062,7 @@ class RobotInteraction extends ChangeNotifier {
   void setReadNotices(bool value) {
     readNotices = value;
     if (!value) {
-      _pendingNotice = null;
+      _clearPendingNotices();
       _utterances.removeWhere((item) => item.notice);
     }
     _saveSettings();
@@ -1017,7 +1109,9 @@ class RobotInteraction extends ChangeNotifier {
     _historyTarget = null;
     _recentTurns.clear();
     _replyCompleted = false;
+    _dismissedDeskReply = null;
     turnId = null;
+    _retryInput = null;
     draft = question = reply = reasoning = '';
     draftMedia = null;
     _activeMedia = null;
@@ -1108,18 +1202,26 @@ class RobotInteraction extends ChangeNotifier {
     final missingTranscript = _sendAfterRecording && longEnough && !heard;
     _sendAfterRecording = false;
     phase = InteractionPhase.idle;
-    error = heard ? null : message ?? (missingTranscript ? '没有听清，请重试。' : null);
+    _setError(
+      heard ? null : message ?? (missingTranscript ? '没有听清，请重试。' : null),
+      temporary: true,
+    );
     if (!heard) draft = _previousDraft;
     _previousDraft = '';
     notifyListeners();
     if (submit) {
-      unawaited(send());
+      unawaited(_send(fromVoice: true));
     } else {
       _queueNotice();
     }
   }
 
-  Future<void> send([String? text]) async {
+  Future<void> send([String? text]) => _send(
+    text: text,
+    fromVoice: text == null && canRetryReply && _retryFromVoice,
+  );
+
+  Future<void> _send({String? text, required bool fromVoice}) async {
     if (listening) {
       await stopRecording(sendAfter: true);
       return;
@@ -1127,7 +1229,7 @@ class RobotInteraction extends ChangeNotifier {
     if (generating || _preparingSend) return;
     final attachment = draftMedia;
     if (attachment != null && !localMediaTypes.contains(attachment.type)) {
-      error = '当前模型不支持此类附件。';
+      _setError('当前模型不支持此类附件。', temporary: fromVoice);
       notifyListeners();
       return;
     }
@@ -1141,12 +1243,14 @@ class RobotInteraction extends ChangeNotifier {
           };
     if (input.isEmpty) return;
     if (input.length > 4000) {
-      error = '问题最多 4000 个字符。';
+      _setError('问题最多 4000 个字符。', temporary: fromVoice);
       notifyListeners();
       return;
     }
     final source = modelSource;
-    final conversation = source == ModelSource.desktop ? pairing() : null;
+    final conversation = source == ModelSource.desktop
+        ? _modelConnection
+        : null;
     final direct = source == ModelSource.desktop ? null : phoneModel;
     final attempt = _request;
     if (conversation != null) {
@@ -1159,7 +1263,7 @@ class RobotInteraction extends ChangeNotifier {
       if (_disposed ||
           attempt != _request ||
           modelSource != source ||
-          pairing()?.encode() != conversation.encode() ||
+          _modelConnection?.encode() != conversation.encode() ||
           listening) {
         return;
       }
@@ -1167,10 +1271,14 @@ class RobotInteraction extends ChangeNotifier {
     final chosen = conversation == null ? null : model;
     if (direct == null &&
         (conversation == null || chosen == null || modelError != null)) {
-      error = source != ModelSource.desktop
-          ? '请在「模型设置」填写连接配置。'
-          : modelError ?? '请先配对电脑并在电脑端设置默认模型。';
+      _setError(
+        source != ModelSource.desktop
+            ? '请在「模型设置」填写连接配置。'
+            : modelError ?? '请先配对电脑并在电脑端设置默认模型。',
+        temporary: fromVoice,
+      );
       _retryInput = input;
+      _retryFromVoice = fromVoice;
       notifyListeners();
       return;
     }
@@ -1258,8 +1366,9 @@ class RobotInteraction extends ChangeNotifier {
         append(parser.finish());
         phase = InteractionPhase.idle;
         if (reply.trim().isEmpty) {
-          error = '模型没有返回内容。';
+          _setError('模型没有返回内容。', temporary: true);
           _retryInput = input;
+          _retryFromVoice = fromVoice;
           _restoreAnswerDraft();
         } else {
           _replyCompleted = true;
@@ -1292,10 +1401,14 @@ class RobotInteraction extends ChangeNotifier {
           unawaited(remote.cancelChat(request.pairing, request.id));
         }
         phase = InteractionPhase.idle;
-        error = failure is FormatException
-            ? failure.message
-            : '模型连接中断，请检查当前模型设置后重试。';
+        _setError(
+          failure is FormatException
+              ? failure.message
+              : '模型连接中断，请检查当前模型设置后重试。',
+          temporary: true,
+        );
         _retryInput = input;
+        _retryFromVoice = fromVoice;
         _restoreAnswerDraft();
         unawaited(_stopSpeech());
         notifyListeners();
@@ -1332,7 +1445,7 @@ class RobotInteraction extends ChangeNotifier {
 
   Future<void> muteCurrent() {
     _muteReply = true;
-    _pendingNotice = null;
+    _clearPendingNotices();
     return _stopSpeech();
   }
 
@@ -1340,6 +1453,7 @@ class RobotInteraction extends ChangeNotifier {
     _utterances.clear();
     final wasSpeaking = _speechPending || spokenText != null;
     _speechPending = false;
+    _speechPlaying = false;
     _speechId = null;
     _speakingNotice = false;
     spokenText = null;
@@ -1433,6 +1547,7 @@ class RobotInteraction extends ChangeNotifier {
           ),
         );
         if (!_disposed && _speechId == id) {
+          _speechStarted(id);
           final byteRate = ByteData.sublistView(wav)
               .getUint32(28, Endian.little);
           final seconds = (wav.length - 44) ~/ byteRate;
@@ -1480,12 +1595,57 @@ class RobotInteraction extends ChangeNotifier {
     unawaited(_releaseVoicePlayer());
     _speakingTimer?.cancel();
     _speechPending = false;
+    _speechPlaying = false;
     _speechId = null;
     _speakingNotice = false;
     spokenText = null;
     _queueNotice();
     _playNext();
     notifyListeners();
+  }
+
+  void _speechStarted(String id) {
+    if (!_speechPending || _speechId != id || _speechPlaying) return;
+    _speechPlaying = true;
+    notifyListeners();
+  }
+
+  void _bufferNoticeSpeech(PhoneNotice notice, String speech) {
+    final source = _noticeSource(notice);
+    final previous = _pendingNotices.lastOrNull;
+    final _NoticeSpeech batch;
+    if (source != null &&
+        previous != null &&
+        !previous.ready &&
+        _noticeSource(previous.latest) == source) {
+      batch = previous;
+      batch.items.add(notice);
+      batch.text = speech;
+    } else {
+      if (previous != null) previous.ready = true;
+      if (_pendingNotices.length >= NoticeQueue.pendingLimit) {
+        _pendingNotices.removeFirst();
+      }
+      batch = _NoticeSpeech(
+        notice,
+        notice.verification ? null : speech,
+        ready: source == null,
+      );
+      _pendingNotices.addLast(batch);
+    }
+    _noticeSpeechTimer?.cancel();
+    if (!batch.ready) {
+      _noticeSpeechTimer = Timer(noticeGroupingWindow, () {
+        batch.ready = true;
+        _queueNotice();
+      });
+    }
+    _queueNotice();
+  }
+
+  void _clearPendingNotices() {
+    _noticeSpeechTimer?.cancel();
+    _pendingNotices.clear();
   }
 
   void _queueNotice() {
@@ -1497,37 +1657,45 @@ class RobotInteraction extends ChangeNotifier {
         _utterances.isNotEmpty) {
       return;
     }
-    final pending = _pendingNotice;
-    if (pending == null) return;
+    final pending = _pendingNotices.firstOrNull;
+    if (pending == null || !pending.ready) return;
     final text = pending.text;
     if (text == null) {
-      if (!_readingNoticeCode) unawaited(_readPendingCode(pending.notice));
+      if (!_readingNoticeCode) unawaited(_readPendingCode(pending));
       return;
     }
-    _pendingNotice = null;
-    _enqueueSpeech(text, notice: true);
+    _pendingNotices.removeFirst();
+    final count = pending.items.length;
+    final announcement = count == 1
+        ? text
+        : '${pending.latest.source}有$count条新消息。'
+              '${pending.items.map(_shortNoticeText).join('。')}';
+    _enqueueSpeech(announcement, notice: true);
   }
 
-  Future<void> _readPendingCode(PhoneNotice notice) async {
+  String _shortNoticeText(PhoneNotice notice) {
+    final text = (notice.text.isEmpty ? notice.title : notice.text)
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    final points = text.runes;
+    return points.length <= 60
+        ? text
+        : '${String.fromCharCodes(points.take(60))}，后面还有内容';
+  }
+
+  Future<void> _readPendingCode(_NoticeSpeech pending) async {
     _readingNoticeCode = true;
-    final pending = _pendingNotice;
-    final code = await noticeCode(notice);
+    final code = await noticeCode(pending.latest);
     _readingNoticeCode = false;
     if (_disposed) return;
-    if (identical(_pendingNotice, pending) && pending != null) {
-      _pendingNotice = (
-        notice: notice,
-        text: code == null
-            ? '收到一条验证消息。'
-            : '收到验证码为，${code.split('').join(' ')}。',
-      );
-    }
+    pending.text = code == null
+        ? '收到一条验证消息。'
+        : '收到验证码为，${code.split('').join(' ')}。';
     _queueNotice();
   }
 
   void clearNotice() {
-    notice = null;
-    _noticeTimer?.cancel();
+    noticeQueue.clear();
     _noticeReactionTimer?.cancel();
     notifyListeners();
   }
@@ -1567,6 +1735,8 @@ class RobotInteraction extends ChangeNotifier {
         if (value['level'] case final num level when level.isFinite) {
           inputLevel = level.toDouble().clamp(0.0, 1.0);
         }
+      case 'speechStarted':
+        if (value['id'] case final String id) _speechStarted(id);
       case 'speechDone':
         if (value['id'] == null || value['id'] == _speechId) _speechDone();
       case 'notification':
@@ -1575,10 +1745,10 @@ class RobotInteraction extends ChangeNotifier {
         for (final mood in EyeMood.values) {
           if (value['expression'] == mood.wire) {
             _expression = mood;
-            _noticeTimer?.cancel();
-            _noticeTimer = Timer(const Duration(seconds: 6), () {
+            _expressionTimer?.cancel();
+            _expressionTimer = Timer(const Duration(seconds: 6), () {
               _expression = null;
-              clearNotice();
+              notifyListeners();
             });
           }
         }
@@ -1656,6 +1826,7 @@ class RobotInteraction extends ChangeNotifier {
     if (_recentNotices.length > 20) _recentNotices.removeLast();
     _saveRecentNotices();
     final initial = event['initial'] == true;
+    final receivedAt = event['timestamp'] is int ? event['timestamp'] as int : null;
     final isSms = event['sms'] == true;
     final speech = verification
         ? ''
@@ -1665,10 +1836,18 @@ class RobotInteraction extends ChangeNotifier {
             isSms: isSms,
           );
     if (!_foreground) {
-      _unshownNotice = (notice: received, initial: initial, speech: speech);
+      if (_unshownNotices.length == NoticeQueue.pendingLimit) {
+        _unshownNotices.removeFirst();
+      }
+      _unshownNotices.addLast((
+        notice: received,
+        initial: initial,
+        speech: speech,
+        receivedAt: receivedAt,
+      ));
       return;
     }
-    _showNotice(received, initial: initial, speech: speech);
+    _showNotice(received, initial: initial, speech: speech, receivedAt: receivedAt);
   }
 
   String _noticeSpeech(
@@ -1700,11 +1879,20 @@ class RobotInteraction extends ChangeNotifier {
     PhoneNotice received, {
     required bool initial,
     required String speech,
+    required int? receivedAt,
   }) {
-    notice = received;
+    final previous = _lastNoticeAt;
+    if (receivedAt != null &&
+        previous != null &&
+        (receivedAt - previous).abs() > noticeGroupingWindow.inMilliseconds) {
+      noticeQueue.endGrouping();
+      final pending = _pendingNotices.lastOrNull;
+      if (pending != null) pending.ready = true;
+    }
+    _lastNoticeAt = receivedAt;
+    noticeQueue.add(received, source: _noticeSource(received));
     _expression = null;
-    _noticeTimer?.cancel();
-    _noticeTimer = Timer(const Duration(seconds: 9), clearNotice);
+    _expressionTimer?.cancel();
     _noticeReactionTimer?.cancel();
     if (!initial && phase == InteractionPhase.idle) {
       _noticeReactionTimer = Timer(
@@ -1712,13 +1900,7 @@ class RobotInteraction extends ChangeNotifier {
         notifyListeners,
       );
     }
-    if (readNotices && !initial) {
-      _pendingNotice = (
-        notice: received,
-        text: received.verification ? null : speech,
-      );
-      _queueNotice();
-    }
+    if (readNotices && !initial) _bufferNoticeSpeech(received, speech);
   }
 
   void updateActivity(EyeMood mood) {
@@ -1738,6 +1920,7 @@ class RobotInteraction extends ChangeNotifier {
 
   @override
   void dispose() {
+    _errorTimer?.cancel();
     _recordingDeadline?.cancel();
     _minimumRecording?.cancel();
     final request = _activeRequest;
@@ -1749,7 +1932,9 @@ class RobotInteraction extends ChangeNotifier {
     _disposed = true;
     unawaited(_releaseVoicePlayer());
     _offlineVoice.dispose();
-    _noticeTimer?.cancel();
+    _clearPendingNotices();
+    noticeQueue.dispose();
+    _expressionTimer?.cancel();
     _noticeReactionTimer?.cancel();
     _speakingTimer?.cancel();
     unawaited(_events?.cancel());

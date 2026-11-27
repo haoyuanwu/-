@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/foundation.dart';
 // ignore: deprecated_member_use
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:robot_eyes_models/lan_crypto.dart';
 
 import 'design.dart';
 import 'desk_voice_feedback.dart';
@@ -15,6 +17,7 @@ import 'interaction_view.dart';
 import 'model_settings_view.dart';
 import 'permission_settings_view.dart';
 import 'phone_model.dart';
+import 'rear_display.dart';
 import 'remote.dart';
 import 'settings_page.dart';
 import 'status_strip.dart';
@@ -31,6 +34,14 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (!kIsWeb) await SystemChrome.setPreferredOrientations(_homeOrientation);
   runApp(const RearEyesMobile());
+}
+
+@pragma('vm:entry-point')
+void rearEyesMain() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(
+    const MaterialApp(debugShowCheckedModeBanner: false, home: RearDisplay()),
+  );
 }
 
 class RearEyesMobile extends StatelessWidget {
@@ -70,7 +81,16 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final client = RemoteClient();
-  late final interaction = RobotInteraction(client, () => pairing);
+  late final interaction = RobotInteraction(
+    client,
+    () => pairing,
+    lanPairing: () =>
+        snapshot.lanModelReady ? Pairing.readLan(snapshot.lanPairing) : null,
+    settingsLan: () => snapshot.lanSettingsReady && client.lanCrypto != null
+        ? Pairing.readLan(snapshot.lanPairing)
+        : null,
+    desktopKey: () => snapshot.desktopKey,
+  );
   final scene = ValueNotifier<(EyeMood, int)>((EyeMood.idle, 0));
   final telemetry = ValueNotifier(Snapshot());
   late final Timer timer;
@@ -81,9 +101,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int sleepSeconds = 90;
   Timer? previewTimer;
   String? syncTicket;
+  String? syncSource;
   String? failure;
   String? syncResult;
   bool syncing = false;
+  bool connectingLan = false;
+  String? lanResult;
+  bool claimingTailscale = false;
+  DateTime? nextLanClaim;
   (String?, double, int)? _rearVoice;
   CloudConflictSummary? _announcedModelConflict;
   int _announcedModelUpdate = 0;
@@ -98,7 +123,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    if (android) native.setMethodCallHandler(_handleNativeEvent);
+    if (android) {
+      native.setMethodCallHandler(_handleNativeEvent);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_returnToDesk());
+      });
+    }
     interaction.addListener(_updateScene);
     unawaited(
       interaction.initialize().then((_) => interaction.syncPhoneModel()),
@@ -112,9 +142,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _handleNativeEvent(MethodCall call) async {
     if (call.method == 'rearDisplayReady') await refresh(force: true);
+    if (call.method == 'returnToDesk') await _returnToDesk();
+  }
+
+  Future<void> _returnToDesk() async {
+    final pending = await native.invokeMethod<bool>('takeDeskReturn');
+    if (mounted && pending == true) unawaited(fullscreen());
   }
 
   Future<void> load() async {
+    if (android) unawaited(_loadLanCrypto());
     try {
       final raw = await platform.loadPairing();
       if (raw != null && mounted) {
@@ -134,6 +171,59 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // Keep the default if browser storage or platform preferences are unavailable.
     }
     await refresh(force: true);
+  }
+
+  Future<void> _loadLanCrypto() async {
+    try {
+      var seed = await native.invokeMethod<String>('loadLanSeed');
+      if (seed == null) {
+        final random = math.Random.secure();
+        final generated = base64UrlEncode(
+          List.generate(32, (_) => random.nextInt(256)),
+        );
+        final crypto = await LanCrypto.fromSeed(generated);
+        seed = await native.invokeMethod<String>('saveLanSeed', {
+          'seed': generated,
+          'public': crypto.publicKey,
+        });
+      }
+      if (seed != null) client.lanCrypto = await LanCrypto.fromSeed(seed);
+    } on PlatformException {
+      // Legacy host builds still support the existing transport.
+    } on MissingPluginException {
+      // Only the Android host participates in LAN pairing.
+    }
+  }
+
+  Future<void> _claimLanTailscale(Snapshot data) async {
+    final hint = data.lanTailHint;
+    final key = data.desktopKey;
+    final lan = Pairing.readLan(data.lanPairing);
+    final now = DateTime.now();
+    if (claimingTailscale ||
+        !data.lanSettingsReady ||
+        client.lanCrypto == null ||
+        hint == null ||
+        key == null ||
+        lan == null ||
+        (nextLanClaim?.isAfter(now) ?? false)) {
+      return;
+    }
+    claimingTailscale = true;
+    nextLanClaim = now.add(const Duration(minutes: 1));
+    try {
+      final value = await client.claimTailscale(lan, hint, key);
+      if (!mounted || snapshot.desktopKey != key) return;
+      await native.invokeMethod<bool>('saveLanTailscale', {
+        'key': key,
+        'config': value.encode(),
+      });
+      await refresh(force: true);
+    } catch (_) {
+      // Retry when the paired desktop is reachable through Tailscale.
+    } finally {
+      claimingTailscale = false;
+    }
   }
 
   @override
@@ -356,7 +446,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
 
       if (!mounted || saved != pairing) return;
-      final manualSync = syncTicket != null && syncTicket == next.ticket;
+      final source = next.links.firstOrNull;
+      final desktopChanged = snapshot.desktopKey != next.desktopKey;
+      final connected = source != null && source != snapshot.links.firstOrNull;
+      final arrived = syncTicket != null && syncTicket == next.ticket;
       setState(() {
         if (!android) {
           if (!snapshot.links.contains('TAILSCALE')) addLog('Tailscale 已连接');
@@ -371,13 +464,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
         snapshot = next;
         telemetry.value = next;
-        if (manualSync) {
+        if (arrived) {
           syncTicket = null;
+          syncSource = null;
           syncResult = syncSummary(next);
         }
         _updateScene();
       });
-      if (saved?.encode() != pairing?.encode()) interaction.resetConnection();
+      if (desktopChanged || saved?.encode() != pairing?.encode()) {
+        nextLanClaim = null;
+        interaction.resetConnection();
+      }
+      if (android) unawaited(_claimLanTailscale(next));
+      if (connected) {
+        if (android && !syncing && !connectingLan) unawaited(refreshNow());
+        if (!android) unawaited(interaction.syncPhoneModel(force: true));
+      }
     } catch (error) {
       if (!mounted || saved != pairing) return;
       setState(() {
@@ -418,17 +520,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   ];
 
   Future<void> refreshNow() async {
-    if (syncing) return;
+    final source = snapshot.links.firstOrNull;
+    if (syncing || source == null) return;
     if (!android && pairing == null) return;
     unawaited(interaction.syncPhoneModel(force: true));
     setState(() {
       syncing = true;
+      syncSource = source;
       syncResult = null;
     });
     try {
       if (android) {
         syncTicket = await native.invokeMethod<String>('sync');
         final asked = syncTicket;
+        if (asked == null) {
+          if (mounted) setState(() => syncResult = '无法触发同步，请重试。');
+          return;
+        }
         for (
           var attempt = 0;
           attempt < 10 && mounted && syncTicket == asked;
@@ -446,13 +554,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       } else {
         await refresh(force: true);
         if (mounted) {
-          setState(() => syncResult = failure ?? syncSummary(snapshot));
+          setState(() {
+            syncSource = null;
+            syncResult = failure ?? syncSummary(snapshot);
+          });
         }
       }
     } on PlatformException {
       if (mounted) setState(() => syncResult = '无法触发同步，请重试。');
     } finally {
-      if (mounted) setState(() => syncing = false);
+      if (mounted) {
+        setState(() {
+          syncing = false;
+          syncTicket = null;
+          syncSource = null;
+        });
+      }
     }
   }
 
@@ -668,6 +785,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+  void _syncEyeWake() {
+    if (android) unawaited(native.invokeMethod<void>('eyeWake'));
+  }
+
   bool _deskOpen = false;
 
   Future<void> fullscreen() async {
@@ -691,6 +812,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               telemetry: telemetry,
               sleepSeconds: sleepSeconds,
               interaction: kIsWeb ? null : interaction,
+              onWake: _syncEyeWake,
             ),
           ),
         );
@@ -724,8 +846,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               state['enabled'] == true
                   ? endpoints.isEmpty
                         ? '等待手机连接到局域网。'
-                        : '选择手机地址，复制配置到桌面端。'
-                  : '在可信局域网开启后，桌面端和 Agent 可以同步状态。',
+                        : '选择地址复制 Agent 的 MCP 接入配置。'
+                  : '开启后，可让局域网内的 Agent 更新电子眼状态。',
             ),
           ),
           for (final endpoint in endpoints)
@@ -759,6 +881,178 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  Future<void> connectLan({bool discover = false}) async {
+    if (connectingLan) return;
+    setState(() {
+      connectingLan = true;
+      lanResult = null;
+    });
+    try {
+      await refresh(force: true);
+      if (!mounted) return;
+      var connected =
+          !discover &&
+          Pairing.readLan(snapshot.lanPairing) != null &&
+          await native.invokeMethod<bool>('connectLan') == true;
+      if (!mounted) return;
+      if (!connected) {
+        final found =
+            await native.invokeListMethod<Map<Object?, Object?>>(
+              'discoverLan',
+            ) ??
+            [];
+        if (!mounted) return;
+        if (found.isEmpty) {
+          setState(
+            () => lanResult = '未找到电脑，请确认两端在同一个 Wi‑Fi 且 Robot Eyes 桌面服务已启动。',
+          );
+          return;
+        }
+        final selected = await showDialog<Map<Object?, Object?>>(
+          context: context,
+          builder: (dialog) => SimpleDialog(
+            title: const Text('选择局域网电脑'),
+            children: [
+              for (final desktop in found)
+                ListTile(
+                  title: Text('${desktop['name']}'),
+                  subtitle: Text('${desktop['address']}'),
+                  onTap: () => Navigator.pop(dialog, desktop),
+                ),
+            ],
+          ),
+        );
+        if (!mounted || selected == null) return;
+        final saved =
+            await native.invokeListMethod<Map<Object?, Object?>>('desktops') ??
+            [];
+        if (!mounted) return;
+        final known = saved
+            .where(
+              (entry) =>
+                  entry['key'] == selected['id'] &&
+                  entry['lan'] == selected['address'],
+            )
+            .firstOrNull;
+        if (known != null &&
+            await native.invokeMethod<bool>('selectDesktop', known['key']) ==
+                true &&
+            await native.invokeMethod<bool>('connectLan') == true) {
+          await refresh(force: true);
+          if (mounted) unawaited(interaction.fetchModels());
+          return;
+        }
+        if (!mounted) return;
+        var code = '';
+        final entered = await showDialog<String>(
+          context: context,
+          builder: (dialog) => StatefulBuilder(
+            builder: (dialog, update) => AlertDialog(
+              title: Text('配对 ${selected['name']}'),
+              content: TextField(
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                maxLength: 8,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: '8 位配对码',
+                  helperText: '在电脑「手机局域网 → 生成配对码」获取',
+                ),
+                onChanged: (value) => update(() => code = value),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialog),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: code.length != 8
+                      ? null
+                      : () => Navigator.pop(dialog, code),
+                  child: const Text('配对'),
+                ),
+              ],
+            ),
+          ),
+        );
+        if (!mounted || entered == null) return;
+        connected =
+            await native.invokeMethod<bool>('pairLan', {
+              'address': selected['address'],
+              'code': entered,
+            }) ==
+            true;
+      }
+      if (!mounted) return;
+      await refresh(force: true);
+      if (connected && mounted) unawaited(interaction.fetchModels());
+      if (mounted) {
+        setState(
+          () => lanResult = connected ? null : '连接失败，请检查桌面服务和配对码，或重新生成配对码。',
+        );
+      }
+    } on PlatformException {
+      if (mounted) setState(() => lanResult = '局域网连接失败，请重试。');
+    } finally {
+      if (mounted) setState(() => connectingLan = false);
+    }
+  }
+
+  Future<void> desktopList() async {
+    final rows =
+        await native.invokeListMethod<Map<Object?, Object?>>('desktops') ?? [];
+    if (!mounted) return;
+    final selection = await showDialog<String>(
+      context: context,
+      builder: (dialog) => SimpleDialog(
+        title: const Text('已配对的电脑'),
+        children: [
+          for (final desktop in rows)
+            ListTile(
+              leading: const Icon(Icons.computer_outlined),
+              title: Text('${desktop['name']}'),
+              subtitle: Text(
+                [
+                  if (desktop['lan'] case final String lan) '局域网 · $lan',
+                  if (desktop['tailscale'] case final String url)
+                    'Tailscale · ${Uri.parse(url).host}',
+                  if (desktop['lan'] == null && desktop['tailscale'] == null)
+                    'USB',
+                ].join('\n'),
+              ),
+              trailing: desktop['active'] == true
+                  ? const Icon(Icons.check, color: cyan)
+                  : null,
+              onTap: () => Navigator.pop(dialog, desktop['key'] as String),
+            ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(dialog, '/lan'),
+            child: const Text('搜索局域网电脑'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(dialog, '/tailscale'),
+            child: const Text('添加 Tailscale 电脑'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || selection == null) return;
+    if (selection == '/lan') {
+      await connectLan(discover: true);
+    } else if (selection == '/tailscale') {
+      await pair();
+    } else if (await native.invokeMethod<bool>('selectDesktop', selection) ==
+        true) {
+      await refresh(force: true);
+      if (!mounted) return;
+      if (snapshot.lanPairing != null) {
+        await native.invokeMethod<bool>('connectLan');
+        await refresh(force: true);
+      }
+      if (mounted) unawaited(interaction.fetchModels());
+    }
   }
 
   Future<void> sleepSettings() async {
@@ -929,6 +1223,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           mood: scene.value.$1,
           revision: scene.value.$2,
           conversationActive: interaction.conversationActive,
+          noticeCue: interaction.noticeReaction,
+          onWake: _syncEyeWake,
           sleepSeconds: sleepSeconds,
           agents: snapshot.agents,
           connected: snapshot.links.isNotEmpty,
@@ -1144,6 +1440,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   );
 
   Widget connectionControls() => homeSection('连接状态', [
+    if (android)
+      statusRow('当前电脑', Icons.computer_outlined, (
+        snapshot.desktopName ?? '未配对',
+        Icons.chevron_right,
+        secondaryInk,
+      ), action: TextButton(onPressed: desktopList, child: const Text('电脑列表'))),
     for (final (source, label, icon) in [
       if (android) ('USB', 'USB', Icons.usb),
       if (android) ('LAN', '局域网', Icons.wifi),
@@ -1152,22 +1454,39 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       statusRow(
         label,
         icon,
-        snapshot.links.firstOrNull == source
+        syncSource == source && snapshot.links.contains(source)
             ? ('同步中', Icons.sync, cyan)
             : snapshot.links.contains(source)
             ? ('已连接', Icons.check_circle_outline, moodColor(EyeMood.done))
             : source == 'TAILSCALE' && pairing == null
             ? ('未配对', Icons.link_off, secondaryInk)
             : ('未连接', Icons.remove_circle_outline, secondaryInk),
+        detail: source == 'LAN' && snapshot.lanModelReady ? '桌面模型已连接' : null,
+        action: source == 'LAN' && !snapshot.links.contains(source)
+            ? TextButton(
+                onPressed: connectingLan ? null : connectLan,
+                style: TextButton.styleFrom(
+                  foregroundColor: cyan,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+                child: Text(
+                  connectingLan
+                      ? '连接中'
+                      : snapshot.lanPairing != null
+                      ? '重连'
+                      : '连接',
+                ),
+              )
+            : null,
       ),
-    if (android || pairing != null) ...[
-      const SizedBox(height: 8),
-      control(
-        syncing ? '正在同步…' : '同步 Codex',
-        syncing ? null : refreshNow,
-        icon: Icons.sync,
+    if (lanResult case final message?)
+      Semantics(
+        liveRegion: true,
+        child: Text(
+          message,
+          style: const TextStyle(fontSize: 12, color: secondaryInk),
+        ),
       ),
-    ],
     if (syncing || syncResult != null || failure != null) ...[
       const SizedBox(height: 8),
       Semantics(
@@ -1185,6 +1504,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     IconData icon,
     (String, IconData, Color) status, {
     String? detail,
+    Widget? action,
   }) {
     final (text, stateIcon, color) = status;
     return Padding(
@@ -1227,6 +1547,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
             ),
           ),
+          if (action != null) ...[const SizedBox(width: 8), action],
         ],
       ),
     );
@@ -1287,7 +1608,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final usage = usageLabels(snapshot);
+    final connected = snapshot.links.isNotEmpty;
+    final usage = connected ? usageLabels(snapshot) : const <String>[];
     return Scaffold(
       body: SafeArea(
         child: Center(
@@ -1301,9 +1623,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 hero,
                 const SizedBox(height: 12),
                 displayActions(),
-                if (usage.isNotEmpty) ...[
+                if (connected) ...[
                   const SizedBox(height: 8),
                   Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
                     spacing: 16,
                     runSpacing: 4,
                     children: [
@@ -1315,6 +1638,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             color: secondaryInk,
                           ),
                         ),
+                      IconButton(
+                        tooltip: '同步 Codex',
+                        onPressed: syncing ? null : refreshNow,
+                        iconSize: 17,
+                        color: cyan,
+                        icon: syncing
+                            ? const SizedBox.square(
+                                dimension: 15,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.sync),
+                      ),
                     ],
                   ),
                 ],
@@ -1361,11 +1698,13 @@ class DeskPage extends StatefulWidget {
     required this.telemetry,
     required this.sleepSeconds,
     this.interaction,
+    this.onWake,
   });
   final ValueListenable<(EyeMood, int)> scene;
   final ValueListenable<Snapshot> telemetry;
   final int sleepSeconds;
   final RobotInteraction? interaction;
+  final VoidCallback? onWake;
 
   @override
   State<DeskPage> createState() => _DeskPageState();
@@ -1375,6 +1714,17 @@ class _DeskPageState extends State<DeskPage> {
   Timer? dimTimer;
   bool visible = false;
   bool _inlineVoice = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final interaction = widget.interaction;
+    if (interaction != null &&
+        !interaction.conversationActive &&
+        interaction.reply.isNotEmpty) {
+      interaction.dismissDeskReply(interaction.turnId, interaction.reply);
+    }
+  }
 
   void _toggleControls() {
     dimTimer?.cancel();
@@ -1422,29 +1772,32 @@ class _DeskPageState extends State<DeskPage> {
                     final interaction = widget.interaction;
                     final listening = interaction?.listening == true;
                     final recognizing = interaction?.finishingRecording == true;
-                    final speaking = interaction?.spokenText != null;
+                    final reading =
+                        interaction?.spokenText != null ||
+                        interaction?.generating == true;
                     final eyeMood = recognizing
                         ? EyeMood.thinking
                         : _inlineVoice &&
                               interaction?.error != null &&
                               !listening
                         ? EyeMood.error
-                        : speaking && !listening
-                        ? EyeMood.hello
+                        : mood == EyeMood.hello && reading
+                        ? EyeMood.idle
                         : mood;
                     return EyeScene(
                       mood: eyeMood,
                       revision: revision,
                       fullScreen: true,
                       onDoubleTap: _toggleControls,
+                      onWake: widget.onWake,
                       noticeCue: interaction?.noticeReaction,
                       voiceLevel: listening && !recognizing
                           ? interaction?.inputLevel
                           : null,
                       speechActivity: interaction?.speechActivity ?? 0,
-                      speaking: speaking && eyeMood == EyeMood.hello,
                       conversationActive:
-                          interaction?.conversationActive == true,
+                          interaction?.conversationActive == true ||
+                          interaction?.speechPlaying == true,
                       sleepSeconds: widget.sleepSeconds,
                       agents: data.agents,
                       connected: data.links.isNotEmpty,
@@ -1463,10 +1816,12 @@ class _DeskPageState extends State<DeskPage> {
                     builder: (_, data, _) => Row(
                       spacing: 12,
                       children: [
-                        if (data.fiveRemaining case final value?)
-                          _UsageRing('5 小时', value, cyan, radius),
-                        if (data.weekRemaining case final value?)
-                          _UsageRing('本周', value, violet, radius),
+                        if (data.links.isNotEmpty) ...[
+                          if (data.fiveRemaining case final value?)
+                            _UsageRing('5 小时', value, cyan, radius),
+                          if (data.weekRemaining case final value?)
+                            _UsageRing('本周', value, violet, radius),
+                        ],
                       ],
                     ),
                   ),
@@ -1479,6 +1834,7 @@ class _DeskPageState extends State<DeskPage> {
                 builder: (context, data, _) {
                   final showUsage =
                       visible &&
+                      data.links.isNotEmpty &&
                       (data.fiveRemaining != null ||
                           data.weekRemaining != null);
                   final quotaLabelHeight = MediaQuery.textScalerOf(context)
@@ -1493,34 +1849,39 @@ class _DeskPageState extends State<DeskPage> {
                     right: insets.right + 16,
                     width: math.min(330, constraints.maxWidth * .50),
                     bottom: insets.bottom + 76,
-                    child: Column(
-                      children: [
-                        Expanded(
-                          child: Align(
-                            alignment: Alignment.topCenter,
-                            child: ConstrainedBox(
-                              constraints: BoxConstraints(
-                                maxHeight: constraints.maxHeight * .48,
-                              ),
-                              child: SingleChildScrollView(
-                                hitTestBehavior: HitTestBehavior.deferToChild,
-                                child: InteractionBubbles(
-                                  interaction,
-                                  showReply: !_inlineVoice,
-                                  includeNotice: false,
+                    child: LayoutBuilder(
+                      builder: (_, bounds) => Column(
+                        children: [
+                          Expanded(
+                            child: Align(
+                              alignment: Alignment.topCenter,
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  maxHeight: constraints.maxHeight * .48,
+                                ),
+                                child: SingleChildScrollView(
+                                  hitTestBehavior: HitTestBehavior.deferToChild,
+                                  child: InteractionBubbles(
+                                    interaction,
+                                    showReply: false,
+                                    includeNotice: false,
+                                  ),
                                 ),
                               ),
                             ),
                           ),
-                        ),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 300),
-                            child: NoticeSignal(interaction),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxWidth: 300,
+                                maxHeight: bounds.maxHeight,
+                              ),
+                              child: NoticeSignal(interaction),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   );
                 },
@@ -1539,7 +1900,6 @@ class _DeskPageState extends State<DeskPage> {
                       listenable: interaction,
                       builder: (context, _) => DeskVoiceControl(
                         interaction,
-                        showCaption: _inlineVoice,
                         onPressed: () {
                           if (!interaction.speechEnabled) {
                             unawaited(openConversation(context, interaction));
@@ -1578,7 +1938,7 @@ class _DeskPageState extends State<DeskPage> {
                     OutlinedButton(
                       onPressed: () => Navigator.pop(context),
                       style: OutlinedButton.styleFrom(
-                        minimumSize: const Size(0, 48),
+                        minimumSize: const Size(0, deskControlHeight),
                         backgroundColor: panelColor,
                         foregroundColor: secondaryInk,
                         side: const BorderSide(color: borderColor),

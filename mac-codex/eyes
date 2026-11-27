@@ -18,6 +18,8 @@ from urllib.request import ProxyHandler, build_opener
 
 APP = "com.reareyes.app"
 PORT = 8788
+COMPLETION_SECONDS = 5
+TERMINAL_SECONDS = 30
 STATES = {"THINKING", "QUESTION", "DONE", "ERROR", "STOPPED", "SLEEP", "IDLE"}
 INPUT_TOOLS = {"request_user_input", "request_user_input_async"}
 QUESTION_REPLY_TAG = "<send_user_message_question_reply>"
@@ -148,6 +150,7 @@ class DesktopSnapshot:
     def __init__(self):
         self.sessions = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
         self.files = {}
+        self.last_completion = 0
 
     def read(self):
         recent = []
@@ -171,10 +174,12 @@ class DesktopSnapshot:
 
         now = time.time()
         records = list(self.files.values())
+        self.last_completion = max(
+            (record.get("completed_at", 0) for record in records), default=0)
         active = [record for record in records if record["state"] == "THINKING"
                   and now - record["modified"] < 900]
         latest = max(records, key=lambda record: record["event_time"], default=None)
-        state = "THINKING" if active else "SLEEP"
+        state = "THINKING" if active else "IDLE"
         if any(record.get("requests") for record in records):
             state = "QUESTION"
         elif not active and latest and now - latest["event_time"] < 30:
@@ -198,7 +203,7 @@ class DesktopSnapshot:
                 size = os.fstat(stream.fileno()).st_size
                 if not record or record["offset"] > size:
                     record = {"offset": 0, "modified": 0, "event_time": 0,
-                              "state": "SLEEP", "usage_time": 0, "usage": {}, "requests": {}}
+                              "state": "IDLE", "usage_time": 0, "usage": {}, "requests": {}}
                     if size > 262144:
                         stream.seek(size - 262144)
                         stream.readline()
@@ -243,6 +248,8 @@ class DesktopSnapshot:
                 elif record.get("failed_turn"):
                     state = "ERROR"
                 record["state"], record["event_time"] = state, timestamp
+                if state == "DONE":
+                    record["completed_at"] = timestamp
                 if kind == "turn_aborted":
                     record["requests"].clear()
                 elif kind in {"task_complete", "turn_complete"}:
@@ -308,7 +315,7 @@ def report_agent_state(name, session, state):
         if state in {"IDLE", "SLEEP"}:
             connection.execute("DELETE FROM agents WHERE name = ? AND session = ?", (name, session))
         else:
-            lifetime = 900 if state in {"QUESTION", "THINKING"} else 30
+            lifetime = 900 if state in {"QUESTION", "THINKING"} else TERMINAL_SECONDS
             connection.execute("INSERT OR REPLACE INTO agents VALUES (?, ?, ?, ?)",
                                (name, session, state, now + lifetime))
 
@@ -316,16 +323,24 @@ def report_agent_state(name, session, state):
 def read_agent_states():
     database = agent_database()
     if not database.exists():
-        return set()
+        return set(), 0
     with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
         # The first report may still be creating the table in its write transaction.
         if not connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'agents'").fetchone():
-            return set()
-        return {row[0] for row in connection.execute("SELECT state FROM agents WHERE expires > ?", (time.time(),))}
+            return set(), 0
+        rows = connection.execute(
+            "SELECT state, MAX(expires) FROM agents WHERE expires > ? GROUP BY state",
+            (time.time(),),
+        )
+        expirations = dict(rows)
+        return set(expirations), expirations.get("DONE", 0) - TERMINAL_SECONDS
 
 
-def combined_state(codex_state, agent_states):
+def combined_state(codex_state, agent_states, completed_at):
     states = agent_states | {codex_state}
+    if ("QUESTION" not in states and "THINKING" in states
+            and time.time() - completed_at < COMPLETION_SECONDS):
+        return "DONE"
     return next((state for state in ("QUESTION", "THINKING", "ERROR", "DONE") if state in states), codex_state)
 
 
@@ -342,8 +357,8 @@ def watch():
                 raise RuntimeError("请更新手机端 Robot Eyes")
             ticket = ticket.removeprefix("sync ")
             state, usage = desktop.read()
-            agents = read_agent_states()
-            state = combined_state(state, agents)
+            agents, agent_completion = read_agent_states()
+            state = combined_state(state, agents, max(desktop.last_completion, agent_completion))
             snapshot = (ticket, state, tuple(usage.items()))
             restore_state = ((state == "QUESTION" or agents) and snapshot == sent
                              and request(url, "/ping") != f"pong {state}")

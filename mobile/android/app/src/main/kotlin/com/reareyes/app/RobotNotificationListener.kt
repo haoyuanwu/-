@@ -81,6 +81,9 @@ class RobotNotificationListener : NotificationListenerService() {
                     icon = RobotInteractionBridge.appLogo(this, sbn.packageName),
                     startedAt = SystemClock.elapsedRealtime(),
                     react = !initial,
+                    packageName = sbn.packageName,
+                    verification = content.verification,
+                    receivedAt = sbn.postTime,
                 ),
             )
         }
@@ -209,6 +212,15 @@ class RobotNotificationListener : NotificationListenerService() {
                 }
             }
             return pending.values.toList().also { pending.clear() }
+        }
+
+        internal fun openIntent(context: Context, id: String, source: String): android.app.PendingIntent? {
+            val listener = current ?: return null
+            if (!isEnabled(context) || listener.seen[id]?.get("package") != source) return null
+            return listener.getActiveNotifications(arrayOf(id)).orEmpty()
+                .firstOrNull { it.key == id && it.packageName == source }
+                ?.notification?.contentIntent
+                ?.takeIf { Build.VERSION.SDK_INT < 31 || it.isActivity }
         }
 
         fun details(context: Context, id: String): String? {

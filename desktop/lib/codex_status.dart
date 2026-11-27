@@ -5,9 +5,12 @@ import 'dart:math';
 class CodexStatus {
   final _sessions = <String, _Session>{};
 
-  Map<String, Object?> read() {
+  DateTime? lastCompletion;
+
+  Map<String, Object?> read({String? codexHome}) {
     final env = Platform.environment;
     final home =
+        codexHome ??
         env['CODEX_HOME'] ??
         '${env[Platform.isWindows ? 'USERPROFILE' : 'HOME']}/.codex';
     final now = DateTime.now();
@@ -49,7 +52,14 @@ class CodexStatus {
     _sessions.removeWhere((path, _) => !activePaths.contains(path));
     final recent = _sessions.values.toList()
       ..sort((a, b) => b.turnAt.compareTo(a.turnAt));
-    var state = recent.isEmpty ? 'IDLE' : 'SLEEP';
+    lastCompletion = recent
+        .map((item) => item.completedAt)
+        .whereType<DateTime>()
+        .fold<DateTime?>(
+          null,
+          (latest, at) => latest == null || at.isAfter(latest) ? at : latest,
+        );
+    var state = 'IDLE';
     if (recent.any(
       (item) =>
           item.pending.isNotEmpty &&
@@ -126,10 +136,11 @@ class CodexStatus {
 class _Session {
   var modified = DateTime.fromMillisecondsSinceEpoch(0);
   var turnAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? completedAt;
   var quotaAt = DateTime.fromMillisecondsSinceEpoch(0);
   var offset = 0;
   var size = 0;
-  var state = 'SLEEP';
+  var state = 'IDLE';
   bool failedTurn = false;
   final pending = <String, String>{};
   final quotas = <String, ({int used, int reset})>{};
@@ -177,6 +188,7 @@ class _Session {
       case 'task_complete':
       case 'turn_complete':
         state = failedTurn ? 'ERROR' : 'DONE';
+        if (!failedTurn) completedAt = at;
         turnAt = at;
         pending.removeWhere((_, name) => name != 'request_user_input_async');
       case 'error':

@@ -2,6 +2,29 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:robot_eyes_models/lan_crypto.dart';
+
+typedef _LanPhone = ({
+  Uri url,
+  String authorization,
+  String? phoneKey,
+  String? name,
+});
+
+typedef PhoneDevice = ({
+  String name,
+  String detail,
+  bool connected,
+  void Function()? forget,
+});
+
+String? readPhoneName(Object? value) {
+  if (value is! String) return null;
+  final name = value.replaceAll(RegExp(r'[\x00-\x1f\x7f]'), ' ').trim();
+  if (name.isEmpty) return null;
+  return String.fromCharCodes(name.runes.take(80));
+}
+
 /// Sends snapshots over the phone's existing ADB and same-subnet MCP listeners.
 class PhoneLinks {
   PhoneLinks(this.directory, this._readRemotePairing, this._onChanged);
@@ -9,7 +32,11 @@ class PhoneLinks {
   final Directory directory;
   final Future<String?> Function() _readRemotePairing;
   final void Function() _onChanged;
-  ({Uri url, String authorization})? _lan;
+  final _lan = <String, _LanPhone>{};
+  final _lanReachable = <String, bool>{};
+  final _lanSeen = <String, DateTime>{};
+  final _remote = <String, String>{};
+  final _remoteSeen = <String, DateTime>{};
   String? _adb;
   ({String serial, int port, bool owned})? _forward;
   ({String serial, String id})? _usbTransport;
@@ -18,57 +45,193 @@ class PhoneLinks {
   bool _inFlight = false;
   Map<String, Object?>? _pendingSnapshot;
   int _generation = 0;
-  int _lanRevision = 0;
-  bool? _lanReachable;
   String? _adbTransport;
 
   File get _lanFile => File('${directory.path}/phone-lan.json');
-  String? get lanAddress => _lan?.url.replace(path: '/mcp').toString();
-  bool? get lanReachable => _lanReachable;
+  File get _remoteFile => File('${directory.path}/phone-tailscale.json');
   String? get adbTransport => _adbTransport;
+  bool lanModelService = false;
+
+  List<PhoneDevice> get lanDevices {
+    final now = DateTime.now();
+    return [
+      for (final phone in _lan.values)
+        (
+          name: phone.name ?? 'Android 手机',
+          detail: phone.url.host,
+          connected:
+              _lanReachable[phone.authorization] == true ||
+              _recentlySeen(_lanSeen[phone.authorization], now),
+          forget: () => _forgetLanPhone(phone.authorization),
+        ),
+    ];
+  }
+
+  List<PhoneDevice> get tailscaleDevices {
+    final now = DateTime.now();
+    return [
+      for (final entry in _remote.entries)
+        (
+          name: entry.value,
+          detail: '设备 ${entry.key.substring(entry.key.length - 6)}',
+          connected: _recentlySeen(_remoteSeen[entry.key], now),
+          forget: null,
+        ),
+    ];
+  }
+
+  bool _recentlySeen(DateTime? seen, DateTime now) =>
+      now.difference(seen ?? _never) < const Duration(seconds: 15);
+
+  static final _never = DateTime.fromMillisecondsSinceEpoch(0);
+  static final _id = RegExp(r'^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$');
+
+  void recordTailscalePhone(String? id, String? name) {
+    if (id == null || !_id.hasMatch(id)) return;
+    final label = readPhoneName(name) ?? _remote[id] ?? '手机';
+    final renamed = _remote[id] != label;
+    final now = DateTime.now();
+    final wasOnline = _recentlySeen(_remoteSeen[id], now);
+    if (renamed) {
+      final next = {..._remote, id: label};
+      try {
+        _save(_remoteFile, next);
+      } on FileSystemException {
+        // Keep serving status even if the device list cannot be persisted.
+      }
+      _remote[id] = label;
+    }
+    _remoteSeen[id] = now;
+    if (renamed || !wasOnline) _onChanged();
+  }
+
+  bool isLanPhone(String? authorization, InternetAddress? address) =>
+      address != null && _lan[authorization]?.url.host == address.address;
+
+  bool hasPhoneToken(String authorization) => _lan.containsKey(authorization);
+  String? keyFor(String? authorization) => _lan[authorization]?.phoneKey;
+
+  void recordLanPhone(String authorization) {
+    final now = DateTime.now();
+    final wasOnline = _recentlySeen(_lanSeen[authorization], now);
+    _lanSeen[authorization] = now;
+    if (!wasOnline && _lanReachable[authorization] != true) _onChanged();
+  }
+
+  bool registerLanPhone(
+    String address,
+    String token, {
+    bool trustedKey = false,
+    String? phoneKey,
+    String? name,
+  }) {
+    final ip = InternetAddress.tryParse(address);
+    if (ip == null || !_privateAddress(ip) || !_id.hasMatch(token)) {
+      return false;
+    }
+    final authorization = 'Bearer $token';
+    final previous = _lan[authorization];
+    _savePhone((
+      url: Uri(scheme: 'http', host: address, port: 8789, path: '/status-sync'),
+      authorization: authorization,
+      phoneKey: trustedKey
+          ? phoneKey ?? previous?.phoneKey
+          : previous?.phoneKey,
+      name: readPhoneName(name) ?? previous?.name,
+    ));
+    return true;
+  }
 
   void stop() {
     _generation++;
     _pendingSnapshot = null;
-    _lanReachable = null;
+    _lanReachable.clear();
+    _lanSeen.clear();
+    _remoteSeen.clear();
     _adbTransport = null;
   }
 
   void load() {
-    _lan = null;
-    if (!_lanFile.existsSync()) return;
-    try {
-      _lan = _parse(_lanFile.readAsStringSync());
-    } on FormatException {
-      _lan = null;
-    }
-  }
-
-  void configureLan(String config) {
-    _saveLan(config);
-    // A manual edit or removal takes precedence until the next USB connection.
-    _usbLanHandled = true;
-  }
-
-  void _saveLan(String config) {
-    if (config.trim().isEmpty) {
-      if (_lanFile.existsSync()) _lanFile.deleteSync();
-      _lan = null;
-    } else {
-      final parsed = _parse(config);
-      directory.createSync(recursive: true);
-      _lanFile.writeAsStringSync(config, flush: true);
-      if (!Platform.isWindows) {
-        Process.runSync('/bin/chmod', ['600', _lanFile.path]);
+    _lan.clear();
+    _remote.clear();
+    if (_lanFile.existsSync()) {
+      try {
+        final data = jsonDecode(_lanFile.readAsStringSync());
+        for (final entry in data is List ? data : [data]) {
+          try {
+            final phone = _parse(entry);
+            _lan[phone.authorization] = phone;
+          } on FormatException {
+            // Keep the other paired phones if one record was damaged.
+          }
+        }
+      } on FormatException {
+        // An unreadable file should not block the service.
       }
-      _lan = parsed;
     }
-    _lanRevision++;
-    _lanReachable = null;
+    if (_remoteFile.existsSync()) {
+      try {
+        final data = jsonDecode(_remoteFile.readAsStringSync());
+        if (data is Map<String, dynamic>) {
+          for (final entry in data.entries) {
+            final name = readPhoneName(entry.value);
+            if (_id.hasMatch(entry.key) && name != null) {
+              _remote[entry.key] = name;
+            }
+          }
+        }
+      } on FormatException {
+        // The phone will be listed again on its next status request.
+      }
+    }
   }
 
-  ({Uri url, String authorization}) _parse(String config) {
-    final data = jsonDecode(config);
+  void _savePhone(_LanPhone phone) {
+    if (_lan[phone.authorization] == phone) return;
+    _saveLan({..._lan, phone.authorization: phone});
+    _lan[phone.authorization] = phone;
+    _lanReachable.remove(phone.authorization);
+    _lanSeen.remove(phone.authorization);
+  }
+
+  void _forgetLanPhone(String authorization) {
+    if (!_lan.containsKey(authorization)) return;
+    _saveLan({..._lan}..remove(authorization));
+    _lan.remove(authorization);
+    _lanReachable.remove(authorization);
+    _lanSeen.remove(authorization);
+    _usbLanHandled = true;
+    _onChanged();
+  }
+
+  void _saveLan(Map<String, _LanPhone> phones) {
+    _save(_lanFile, [
+      for (final row in phones.values)
+        {
+          'mcpServers': {
+            'robot-eyes': {
+              'url': row.url.replace(path: '/mcp').toString(),
+              'headers': {'Authorization': row.authorization},
+            },
+          },
+          'phoneKey': ?row.phoneKey,
+          'phoneName': ?row.name,
+        },
+    ]);
+  }
+
+  void _save(File file, Object data) {
+    directory.createSync(recursive: true);
+    final draft = File('${file.path}.tmp');
+    if (!Platform.isWindows) {
+      draft.createSync();
+      Process.runSync('/bin/chmod', ['600', draft.path]);
+    }
+    draft.writeAsStringSync(jsonEncode(data), flush: true);
+    draft.renameSync(file.path);
+  }
+
+  _LanPhone _parse(Object? data) {
     final servers = data is Map ? data['mcpServers'] : null;
     final phone = servers is Map
         ? servers['robot-eyes'] ?? servers['rear-eyes']
@@ -76,6 +239,7 @@ class PhoneLinks {
     final url = phone is Map ? phone['url'] : null;
     final headers = phone is Map ? phone['headers'] : null;
     final authorization = headers is Map ? headers['Authorization'] : null;
+    final phoneKey = data is Map ? data['phoneKey'] : null;
     final uri = url is String ? Uri.tryParse(url) : null;
     final address = uri == null ? null : InternetAddress.tryParse(uri.host);
     if (uri == null ||
@@ -94,6 +258,8 @@ class PhoneLinks {
     return (
       url: uri.replace(path: '/status-sync'),
       authorization: authorization as String,
+      phoneKey: LanCrypto.validKey(phoneKey) ? phoneKey as String : null,
+      name: readPhoneName(data is Map ? data['phoneName'] : null),
     );
   }
 
@@ -123,22 +289,34 @@ class PhoneLinks {
     }
   }
 
-  Future<bool> _sendLan(Map<String, Object?> snapshot, int generation) async {
-    final lan = _lan;
-    if (lan == null) return false;
-    final revision = _lanRevision;
-    final reachable = await _postSnapshot(snapshot, lan);
-    if (generation != _generation || revision != _lanRevision) return false;
-    if (_lanReachable != reachable) {
-      _lanReachable = reachable;
+  Future<void> _sendLan(Map<String, Object?> snapshot, int generation) async {
+    await Future.wait([
+      for (final phone in _lan.values.toList())
+        _sendLanPhone(phone, snapshot, generation),
+    ]);
+  }
+
+  Future<void> _sendLanPhone(
+    _LanPhone phone,
+    Map<String, Object?> snapshot,
+    int generation,
+  ) async {
+    final reachable = await _postSnapshot({
+      ...snapshot,
+      if (lanModelService) 'modelApi': 1,
+      if (phone.phoneKey != null) 'configSync': true,
+    }, phone);
+    final id = phone.authorization;
+    if (generation != _generation || _lan[id] != phone) return;
+    if (_lanReachable[id] != reachable) {
+      _lanReachable[id] = reachable;
       _onChanged();
     }
-    return reachable;
   }
 
   Future<bool> _postSnapshot(
     Map<String, Object?> snapshot,
-    ({Uri url, String authorization}) lan,
+    _LanPhone lan,
   ) async {
     final client = _client();
     try {
@@ -150,11 +328,19 @@ class PhoneLinks {
       request.contentLength = body.length;
       request.add(body);
       final response = await request.close().timeout(_timeout);
-      await response.drain<void>().timeout(_timeout);
-      return response.statusCode == HttpStatus.ok;
+      if (response.statusCode != HttpStatus.ok) return false;
+      final bytes = <int>[];
+      await for (final chunk in response.timeout(_timeout)) {
+        if (bytes.length + chunk.length > 1024) return false;
+        bytes.addAll(chunk);
+      }
+      final result = jsonDecode(utf8.decode(bytes));
+      return result is Map && result['ok'] == true && result['active'] != false;
     } on IOException {
       return false;
     } on TimeoutException {
+      return false;
+    } on FormatException {
       return false;
     } finally {
       client.close(force: true);
@@ -163,7 +349,7 @@ class PhoneLinks {
 
   Future<void> _sendAdb(
     Map<String, Object?> snapshot,
-    Future<bool> lanConnected,
+    Future<void> lanConnected,
     int generation,
   ) async {
     String? transport;
@@ -189,7 +375,7 @@ class PhoneLinks {
             if (synced) transport = device.kind;
             _updateAdbTransport(transport, generation);
           }),
-          _repairUsbLan(serial, snapshot, lanConnected, generation),
+          _repairUsbLan(serial, snapshot, generation),
           _repairUsbTailscale(serial),
         ]);
       } else {
@@ -243,35 +429,16 @@ class PhoneLinks {
   Future<void> _repairUsbLan(
     String serial,
     Map<String, Object?> snapshot,
-    Future<bool> lanConnected,
     int generation,
   ) async {
-    if (_usbLanHandled) return;
-    if (await lanConnected) {
-      _usbLanHandled = true;
-      return;
-    }
     if (_usbLanHandled || generation != _generation) return;
-    if (await _importUsbLan(serial, generation)) {
-      await _sendLan(snapshot, generation);
-    }
+    final phone = await _importUsbLan(serial, generation);
+    if (phone != null) await _sendLanPhone(phone, snapshot, generation);
   }
 
   Future<void> _repairUsbTailscale(String serial) async {
     if (_usbRemoteHandled) return;
     _usbRemoteHandled = true;
-    try {
-      final result = await _usbCall(serial, 'getLinkStatus');
-      if (result.exitCode == 0 &&
-          (result.stdout as String).trim() ==
-              'Result: Bundle[{tailscale_connected=true}]') {
-        return;
-      }
-    } on IOException {
-      return;
-    } on TimeoutException {
-      return;
-    }
     await _pairOverUsb(serial);
   }
 
@@ -310,6 +477,10 @@ class PhoneLinks {
             'ticket': reply.substring(5),
             'transport': kind,
             'state': '${snapshot['state']}',
+            if (snapshot['desktopId'] case final String id) 'desktopId': id,
+            if (snapshot['desktopName'] case final String name)
+              'desktopName': name,
+            if (snapshot['lanKey'] case final String key) 'lanKey': key,
             if (snapshot['agents'] != null)
               'agents': jsonEncode(snapshot['agents']),
             if (snapshot['models'] != null)
@@ -343,26 +514,34 @@ class PhoneLinks {
     method,
   ]);
 
-  Future<bool> _importUsbLan(String serial, int generation) async {
+  Future<_LanPhone?> _importUsbLan(String serial, int generation) async {
     try {
       final result = await _usbCall(serial, 'getConfig');
       if (_usbLanHandled || generation != _generation || result.exitCode != 0) {
-        return false;
+        return null;
       }
       final encoded = RegExp(
         r'^Result: Bundle\[\{lan_config=([A-Za-z0-9+/=]+)\}\]$',
       ).firstMatch((result.stdout as String).trim())?.group(1);
-      if (encoded == null) return false;
-      _saveLan(utf8.decode(base64Decode(encoded)));
-      return true;
+      if (encoded == null) return null;
+      final config = utf8.decode(base64Decode(encoded));
+      final imported = _parse(jsonDecode(config));
+      final previous = _lan[imported.authorization];
+      final phone = (
+        url: imported.url,
+        authorization: imported.authorization,
+        phoneKey: imported.phoneKey ?? previous?.phoneKey,
+        name: imported.name ?? previous?.name,
+      );
+      _savePhone(phone);
+      _usbLanHandled = true;
+      return phone;
     } on IOException {
-      return false;
+      return null;
     } on TimeoutException {
-      return false;
+      return null;
     } on FormatException {
-      return false;
-    } finally {
-      if (generation == _generation) _usbLanHandled = true;
+      return null;
     }
   }
 

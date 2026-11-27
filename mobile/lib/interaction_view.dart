@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 // ignore: deprecated_member_use
 import 'package:flutter/material.dart';
@@ -9,7 +10,9 @@ import 'package:robot_eyes_models/robot_eyes_models.dart';
 import 'design.dart';
 import 'interaction.dart';
 import 'model_settings_view.dart';
+import 'notice_queue.dart';
 import 'notice_rules_view.dart';
+import 'notice_window.dart';
 import 'reply_frame.dart';
 import 'settings_page.dart';
 
@@ -31,8 +34,9 @@ Future<void> openConversation(
 Future<void> _showNotice(
   BuildContext context,
   RobotInteraction interaction,
-  PhoneNotice item,
-) async {
+  PhoneNotice item, {
+  NoticeGroup<PhoneNotice>? group,
+}) async {
   final navigator = Navigator.of(context, rootNavigator: true);
   final source = context.findRenderObject()! as RenderBox;
   final overlay = navigator.overlay!.context.findRenderObject()! as RenderBox;
@@ -83,7 +87,9 @@ Future<void> _showNotice(
                             return AnimatedBuilder(
                               animation: motion,
                               child: const RepaintBoundary(
-                                child: CustomPaint(painter: _NoticeHudFrame()),
+                                child: CustomPaint(
+                                  painter: NoticeWindowFrame(),
+                                ),
                               ),
                               builder: (context, frame) {
                                 final bounds = reduceMotion
@@ -111,7 +117,18 @@ Future<void> _showNotice(
                           curve: const Interval(.38, 1, curve: Curves.easeOut),
                         ),
                       ),
-                      child: _NoticeDialog(interaction, item),
+                      child: ListenableBuilder(
+                        listenable: interaction.noticeQueue,
+                        builder: (_, _) {
+                          final latest = group?.latest ?? item;
+                          return _NoticeDialog(
+                            interaction,
+                            latest,
+                            older: group?.items.reversed.skip(1) ?? const [],
+                            key: ValueKey(latest),
+                          );
+                        },
+                      ),
                     ),
                   ],
                 ),
@@ -122,19 +139,30 @@ Future<void> _showNotice(
       },
     ),
   );
-  final draft = await navigator.push(route);
-  if (draft == null) return;
-  await route.completed;
-  if (navigator.mounted) {
+  interaction.noticeQueue.pause();
+  String? draft;
+  try {
+    draft = await navigator.push(route);
+    await route.completed;
+  } finally {
+    interaction.noticeQueue.resume();
+  }
+  if (draft != null && navigator.mounted) {
     await openConversation(navigator.context, interaction, draft: draft);
   }
 }
 
 class _NoticeDialog extends StatefulWidget {
-  const _NoticeDialog(this.interaction, this.item);
+  const _NoticeDialog(
+    this.interaction,
+    this.item, {
+    super.key,
+    required this.older,
+  });
 
   final RobotInteraction interaction;
   final PhoneNotice item;
+  final Iterable<PhoneNotice> older;
 
   @override
   State<_NoticeDialog> createState() => _NoticeDialogState();
@@ -144,9 +172,68 @@ class _NoticeDialogState extends State<_NoticeDialog> {
   late final _code = widget.interaction.noticeCode(widget.item);
   late final _logo = widget.interaction.noticeAppIcon(widget.item);
 
+  bool _opening = false;
+  String? _openError;
+
+  Future<void> _openSource() async {
+    setState(() {
+      _opening = true;
+      _openError = null;
+    });
+    final interaction = widget.interaction;
+    final item = widget.item;
+    String? result = await interaction.openNoticeApp(item) ?? 'unavailable';
+    if (!mounted) return;
+    if (result == 'permission') {
+      final authorize = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('开启贴边返回便签'),
+          content: const Text('允许在其他应用上层显示后，点便签即可返回 Robot Eyes 横屏。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('直接打开'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('去授权'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return;
+      if (authorize == true) {
+        final opened = await interaction.openNoticeOverlaySettings();
+        result = opened ? null : 'settingsUnavailable';
+      } else if (authorize == false) {
+        result =
+            await interaction.openNoticeApp(item, withShortcut: false) ??
+            'unavailable';
+      } else {
+        result = null;
+      }
+    }
+    if (!mounted) return;
+    if (result == 'opened') {
+      interaction.noticeQueue.remove(item);
+      if (ModalRoute.of(context)?.isCurrent == true) Navigator.pop(context);
+      return;
+    }
+    setState(() {
+      _opening = false;
+      _openError = switch (result) {
+        'settingsUnavailable' => '无法打开悬浮窗权限设置。',
+        null => null,
+        _ => '无法打开来源 App。',
+      };
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final item = widget.item;
+    final canOpenApp = widget.interaction.canOpenNoticeApp(item);
     const bodyStyle = TextStyle(color: secondaryInk, height: 1.5);
     final close = IconButton(
       tooltip: '关闭',
@@ -207,7 +294,7 @@ class _NoticeDialogState extends State<_NoticeDialog> {
                 : [
                     Row(
                       children: [
-                        _NoticeAppLogo(_logo),
+                        NoticeAppLogo(_logo),
                         Expanded(
                           child: Text(
                             item.source,
@@ -236,7 +323,14 @@ class _NoticeDialogState extends State<_NoticeDialog> {
                       const SizedBox(height: 12),
                       SelectableText(item.text, style: bodyStyle),
                     ],
-                    if (item.text.isNotEmpty) ...[
+                    NoticeMessageHistory(
+                      messages: widget.older.map(
+                        (notice) => (title: notice.title, text: notice.text),
+                      ),
+                    ),
+                    if (_openError case final message?)
+                      Text(message, style: bodyStyle),
+                    if (canOpenApp || item.text.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       Align(
                         alignment: Alignment.centerRight,
@@ -246,8 +340,10 @@ class _NoticeDialogState extends State<_NoticeDialog> {
                             side: const BorderSide(color: borderColor),
                             minimumSize: const Size(48, 48),
                           ),
-                          onPressed: () => Navigator.pop(context, item.text),
-                          child: const Text('问 AI'),
+                          onPressed: canOpenApp
+                              ? (_opening ? null : _openSource)
+                              : () => Navigator.pop(context, item.text),
+                          child: Text(canOpenApp ? '打开 App' : '问 AI'),
                         ),
                       ),
                     ],
@@ -975,20 +1071,19 @@ class InteractionBubbles extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
-    listenable: interaction,
+    listenable: Listenable.merge([interaction, interaction.noticeQueue]),
     builder: (context, _) {
-      final notice = includeNotice ? interaction.notice : null;
+      final hasNotices = includeNotice && interaction.notice != null;
       final shared = interaction.sharedText;
       final showAnswer =
           showReply && (interaction.generating || interaction.reply.isNotEmpty);
-      if (notice == null && shared == null && !showAnswer) {
+      if (!hasNotices && shared == null && !showAnswer) {
         return const SizedBox.shrink();
       }
       return Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (notice != null)
-            _NoticeHud(interaction, notice, key: ValueKey(notice)),
+          if (includeNotice) NoticeSignal(interaction),
           if (showAnswer) ReplyPreview(interaction),
           if (shared != null)
             _bubble(
@@ -1036,85 +1131,24 @@ class NoticeSignal extends StatelessWidget {
   final RobotInteraction interaction;
 
   @override
-  Widget build(BuildContext context) => ListenableBuilder(
-    listenable: interaction,
-    builder: (context, _) {
-      final notice = interaction.notice;
-      final duration = MediaQuery.disableAnimationsOf(context)
-          ? Duration.zero
-          : const Duration(milliseconds: 410);
-      return IgnorePointer(
-        ignoring: notice == null,
-        child: AnimatedSwitcher(
-          duration: duration,
-          reverseDuration: duration == Duration.zero
-              ? Duration.zero
-              : const Duration(milliseconds: 180),
-          layoutBuilder: (current, previous) => Stack(
-            alignment: Alignment.bottomCenter,
-            children: [
-              for (final child in previous) IgnorePointer(child: child),
-              ?current,
-            ],
-          ),
-          transitionBuilder: (child, animation) {
-            final ease = animation.drive(
-              CurveTween(curve: Curves.easeOutCubic),
-            );
-            return SlideTransition(
-              position: Tween(
-                begin: const Offset(.035, .12),
-                end: Offset.zero,
-              ).animate(ease),
-              child: FadeTransition(
-                opacity: ease,
-                child: CustomPaint(
-                  foregroundPainter: _NoticeSweep(animation),
-                  child: child,
-                ),
-              ),
-            );
-          },
-          child: notice == null
-              ? const SizedBox.shrink()
-              : _NoticeHud(interaction, notice, key: ValueKey(notice)),
+  Widget build(BuildContext context) => ConstrainedBox(
+    constraints: BoxConstraints(
+      maxHeight: math.min(320, MediaQuery.sizeOf(context).height * .62),
+    ),
+    child: ListenableBuilder(
+      listenable: interaction.noticeQueue,
+      builder: (context, _) => NoticeStack(
+        items: interaction.noticeQueue.groups,
+        onDismissed: interaction.noticeQueue.removeGroup,
+        itemBuilder: (group) => _NoticeHud(
+          interaction,
+          group.latest,
+          group: group,
+          key: ObjectKey(group),
         ),
-      );
-    },
+      ),
+    ),
   );
-}
-
-class _NoticeSweep extends CustomPainter {
-  _NoticeSweep(this.animation) : super(repaint: animation);
-
-  final Animation<double> animation;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final t = animation.value;
-    if (t <= 0 || t >= 1 || size.isEmpty) return;
-    final x = (size.width + 48) * t - 24;
-    final band = Rect.fromLTRB(x - 24, 0, x + 24, size.height);
-    final strength = 1 - (2 * t - 1).abs();
-    canvas.save();
-    canvas.clipRect((Offset.zero & size).deflate(2));
-    canvas.drawRect(
-      band,
-      Paint()
-        ..shader = LinearGradient(
-          colors: [
-            cyan.withValues(alpha: 0),
-            cyan.withValues(alpha: strength * .20),
-            cyan.withValues(alpha: 0),
-          ],
-        ).createShader(band),
-    );
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(_NoticeSweep oldDelegate) =>
-      animation != oldDelegate.animation;
 }
 
 class _NoticeHud extends StatefulWidget {
@@ -1122,12 +1156,14 @@ class _NoticeHud extends StatefulWidget {
     this.interaction,
     this.notice, {
     this.summaryOnly = false,
+    this.group,
     super.key,
   });
 
   final RobotInteraction interaction;
   final PhoneNotice notice;
   final bool summaryOnly;
+  final NoticeGroup<PhoneNotice>? group;
 
   @override
   State<_NoticeHud> createState() => _NoticeHudState();
@@ -1139,140 +1175,32 @@ class _NoticeHudState extends State<_NoticeHud> {
   @override
   Widget build(BuildContext context) {
     final notice = widget.notice;
+    final count = widget.group?.items.length ?? 1;
     return Semantics(
       liveRegion: !widget.summaryOnly,
-      child: CustomPaint(
-        painter: const _NoticeHudFrame(),
+      child: NoticeCardFrame(
+        count: count,
         child: Material(
           type: MaterialType.transparency,
           child: InkWell(
-            onTap: () => _showNotice(context, widget.interaction, notice),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(13, 10, 15, 11),
-              child: Row(
-                children: [
-                  _NoticeAppLogo(_logo),
-                  Expanded(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          notice.source,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: cyan,
-                            fontSize: 11,
-                            letterSpacing: 1.3,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        Text(
-                          notice.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: primaryInk,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        if (!widget.summaryOnly && notice.text.isNotEmpty)
-                          Text(
-                            notice.text,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: secondaryInk,
-                              fontSize: 12,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
+            onTap: () => _showNotice(
+              context,
+              widget.interaction,
+              notice,
+              group: widget.group,
+            ),
+            child: NoticeCardContent(
+              source: notice.source,
+              title: notice.title,
+              text: widget.summaryOnly ? '' : notice.text,
+              icon: NoticeAppLogo(_logo),
+              count: count,
             ),
           ),
         ),
       ),
     );
   }
-}
-
-class _NoticeAppLogo extends StatelessWidget {
-  const _NoticeAppLogo(this.logo);
-
-  final Future<Uint8List?> logo;
-
-  @override
-  Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
-    future: logo,
-    builder: (context, snapshot) {
-      final bytes = snapshot.data;
-      if (bytes == null) return const SizedBox.shrink();
-      return Padding(
-        padding: const EdgeInsets.only(right: 10),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(6),
-          child: Image.memory(
-            bytes,
-            width: 30,
-            height: 30,
-            excludeFromSemantics: true,
-            errorBuilder: (_, _, _) => const SizedBox.shrink(),
-          ),
-        ),
-      );
-    },
-  );
-}
-
-class _NoticeHudFrame extends CustomPainter {
-  const _NoticeHudFrame();
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final w = size.width;
-    final h = size.height;
-    const corner = 11.0;
-    final frame = Path()
-      ..moveTo(0, corner)
-      ..lineTo(corner, 0)
-      ..lineTo(w, 0)
-      ..lineTo(w, h - corner)
-      ..lineTo(w - corner, h)
-      ..lineTo(0, h)
-      ..close();
-    final paint = Paint()
-      ..shader = const LinearGradient(
-        colors: [Color(0xf0132635), Color(0xf008101c)],
-      ).createShader(Offset.zero & size);
-    canvas.drawPath(frame, paint);
-    paint
-      ..shader = null
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = cyan.withValues(alpha: .34);
-    canvas.drawPath(frame, paint);
-    final corners = Path()
-      ..moveTo(0, 25)
-      ..lineTo(0, corner)
-      ..lineTo(corner, 0)
-      ..lineTo(31, 0)
-      ..moveTo(w - 31, h)
-      ..lineTo(w - corner, h)
-      ..lineTo(w, h - corner)
-      ..lineTo(w, h - 25);
-    paint
-      ..strokeWidth = 1.5
-      ..color = cyan.withValues(alpha: .9);
-    canvas.drawPath(corners, paint);
-  }
-
-  @override
-  bool shouldRepaint(_NoticeHudFrame oldDelegate) => false;
 }
 
 Future<void> _openVoiceSettings(
